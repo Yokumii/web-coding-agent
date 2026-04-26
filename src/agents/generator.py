@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Literal
+
+from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
+from src.config import HarnessConfig
+from src.orchestration.file_comm import FileComm
+from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+GeneratorMode = Literal["generate", "repair"]
+_GENERATE_REQUIRED_READS = (
+    ".harness/sprint_plan.json",
+    ".harness/feature_list.json",
+    ".harness/design_tokens.json",
+    ".harness/accepted_sprints.json",
+)
+_REPAIR_REQUIRED_READS = (
+    ".harness/feedback_round_{feedback_round}.md",
+    ".harness/grade_round_{feedback_round}.json",
+    ".harness/sprint_plan.json",
+    ".harness/design_tokens.json",
+    ".harness/accepted_sprints.json",
+)
+
+
+def _read_previous_grades(file_comm: FileComm, feedback_round: int) -> dict[str, Any]:
+    return file_comm.read_grades(feedback_round) or {}
+
+
+def _extract_repair_targets(
+    grades: dict[str, Any],
+    sprint_context: dict,
+) -> dict[str, list[dict[str, Any]] | list[str]]:
+    sprint_feature_ids = {
+        str(feature_id).strip()
+        for feature_id in sprint_context.get("feature_ids", [])
+        if feature_id
+    }
+    failed_checks: list[dict[str, Any]] = []
+    failed_criteria: list[dict[str, Any]] = []
+    affected_feature_ids: set[str] = set()
+
+    for check in grades.get("ui_checks", []):
+        if not isinstance(check, dict):
+            continue
+        feature_id = str(check.get("feature_id", "")).strip()
+        status = str(check.get("status", "")).strip().lower()
+        critical = check.get("critical") is True
+        if status == "fail" or (status == "partial" and critical):
+            if not feature_id or feature_id in sprint_feature_ids:
+                failed_checks.append(check)
+                if feature_id:
+                    affected_feature_ids.add(feature_id)
+
+    for criterion in grades.get("target_exit_criteria_results", []):
+        if not isinstance(criterion, dict):
+            continue
+        feature_id = str(criterion.get("feature_id", "")).strip()
+        if criterion.get("passed") is False:
+            if not feature_id or feature_id in sprint_feature_ids:
+                failed_criteria.append(criterion)
+                if feature_id:
+                    affected_feature_ids.add(feature_id)
+
+    if not affected_feature_ids:
+        affected_feature_ids = set(sprint_feature_ids)
+
+    return {
+        "failed_checks": failed_checks,
+        "failed_criteria": failed_criteria,
+        "affected_feature_ids": sorted(affected_feature_ids),
+    }
+
+
+def _format_failed_checks(failed_checks: list[dict[str, Any]]) -> str:
+    if not failed_checks:
+        return "- No structured failed UI checks were recorded."
+    return "\n".join(
+        (
+            f"- {check.get('check_id', check.get('id', 'unknown'))} "
+            f"| feature_id={check.get('feature_id', 'unknown')} "
+            f"| critical={check.get('critical', False)} "
+            f"| status={check.get('status', 'unknown')} "
+            f"| task={check.get('task', '')}"
+        )
+        for check in failed_checks
+    )
+
+
+def _format_failed_criteria(failed_criteria: list[dict[str, Any]]) -> str:
+    if not failed_criteria:
+        return "- No structured failed exit criteria were recorded."
+    return "\n".join(
+        (
+            f"- {criterion.get('criterion_id', 'unknown')} "
+            f"| feature_id={criterion.get('feature_id', 'unknown')} "
+            f"| critical={criterion.get('critical', False)} "
+            f"| criterion={criterion.get('criterion', '')}"
+        )
+        for criterion in failed_criteria
+    )
+
+
+def _get_sprint_context(file_comm: FileComm, sprint_num: int) -> dict:
+    sprint_plan = file_comm.read_sprint_plan()
+    if sprint_plan is None:
+        raise RuntimeError("Generator requires .harness/sprint_plan.json, but it was not found.")
+
+    sprints = sprint_plan.get("sprints")
+    if not isinstance(sprints, list):
+        raise RuntimeError("Generator found invalid .harness/sprint_plan.json: sprints must be an array.")
+
+    for sprint in sprints:
+        if isinstance(sprint, dict) and sprint.get("number") == sprint_num:
+            return sprint
+
+    raise RuntimeError(f"Generator could not find sprint {sprint_num} in .harness/sprint_plan.json.")
+
+
+def _get_accepted_sprints(file_comm: FileComm) -> dict:
+    accepted_sprints = file_comm.read_accepted_sprints()
+    if accepted_sprints is None:
+        raise RuntimeError(
+            "Generator requires .harness/accepted_sprints.json, but it was not found."
+        )
+    return accepted_sprints
+
+
+def _build_generate_prompt(
+    *,
+    workdir: Path,
+    round_num: int,
+    sprint_num: int,
+    sprint_context: dict,
+    accepted_sprints: dict,
+) -> str:
+    accepted = accepted_sprints.get("accepted", [])
+    required_reads = "\n".join(f"- {path}" for path in _GENERATE_REQUIRED_READS)
+    feature_ids = ", ".join(sprint_context.get("feature_ids", []))
+    deliverables = "\n".join(f"- {item}" for item in sprint_context.get("deliverables", []))
+    exit_criteria = "\n".join(f"- {item}" for item in sprint_context.get("exit_criteria", []))
+    return (
+        f"Mode: generate\n"
+        f"Round: {round_num}\n"
+        f"Sprint: {sprint_num}\n"
+        f"Sprint Title: {sprint_context.get('title')}\n"
+        f"Sprint Goal: {sprint_context.get('goal')}\n"
+        f"Target Feature IDs: {feature_ids}\n"
+        f"Deliverables:\n{deliverables}\n"
+        f"Exit Criteria:\n{exit_criteria}\n"
+        f"Accepted Sprints: {accepted}\n"
+        f"Required Reads:\n{required_reads}\n\n"
+        f"Implement only sprint {sprint_num}.\n"
+        f"Set up or update the frontend-only project in: {workdir}/frontend\n"
+        f"Do not implement future sprint functionality or unrelated refactors.\n"
+        f"Use paths relative to the workdir when calling tools; do not use absolute paths.\n"
+        f"When done, update `.harness/build_log.md` with round, sprint, mode, implemented features, "
+        f"and a short summary of what was completed.\n"
+        f"Also append a short progress entry to `.harness/progress.md`.\n"
+        f"Workdir: {workdir}"
+    )
+
+
+def _build_repair_prompt(
+    *,
+    file_comm: FileComm,
+    workdir: Path,
+    round_num: int,
+    sprint_num: int,
+    sprint_context: dict,
+    accepted_sprints: dict,
+) -> str:
+    feedback_round = round_num - 1
+    accepted = accepted_sprints.get("accepted", [])
+    previous_grades = _read_previous_grades(file_comm, feedback_round)
+    repair_targets = _extract_repair_targets(previous_grades, sprint_context)
+    required_reads = "\n".join(
+        f"- {path.format(feedback_round=feedback_round)}" for path in _REPAIR_REQUIRED_READS
+    )
+    feature_ids = ", ".join(sprint_context.get("feature_ids", []))
+    affected_feature_ids = ", ".join(repair_targets["affected_feature_ids"]) or "None declared"
+    failed_criteria = _format_failed_criteria(repair_targets["failed_criteria"])
+    failed_checks = _format_failed_checks(repair_targets["failed_checks"])
+    return (
+        f"Mode: repair\n"
+        f"Round: {round_num}\n"
+        f"Sprint: {sprint_num}\n"
+        f"Sprint Title: {sprint_context.get('title')}\n"
+        f"Repair Scope: Fix evaluator-reported issues for the current sprint only\n"
+        f"Target Feature IDs: {feature_ids}\n"
+        f"Affected Feature IDs: {affected_feature_ids}\n"
+        f"Accepted Sprints: {accepted}\n"
+        f"Failed Exit Criteria:\n{failed_criteria}\n"
+        f"Failed UI Checks:\n{failed_checks}\n"
+        f"Required Reads:\n{required_reads}\n\n"
+        f"Fix ONLY the issues needed for sprint acceptance or regression recovery.\n"
+        f"Do not implement new features from future sprints.\n"
+        f"Do not start work for the next sprint.\n"
+        f"Use paths relative to the workdir when calling tools; do not use absolute paths.\n"
+        f"When done, update `.harness/build_log.md` with round, sprint, mode, addressed issues, "
+        f"and a short summary of what was repaired.\n"
+        f"Also append a short progress entry to `.harness/progress.md`.\n"
+        f"Workdir: {workdir}"
+    )
+
+
+def _validate_generator_outputs(file_comm: FileComm, workdir: Path, result_summary: str) -> None:
+    frontend_dir = workdir / "frontend"
+    if frontend_dir.exists():
+        return
+
+    if result_summary and not file_comm.read_build_log():
+        file_comm.write_build_log(result_summary)
+
+    existing_dirs = sorted(
+        path.relative_to(workdir).as_posix()
+        for path in workdir.iterdir()
+        if path.is_dir() and path.name != ".harness"
+    )
+    raise RuntimeError(
+        "Generator completed without creating the expected frontend directory "
+        f"('frontend'). Found directories: {existing_dirs or 'none'}."
+    )
+
+
+async def run_generator(
+    config: HarnessConfig,
+    file_comm: FileComm,
+    workdir: Path,
+    round_num: int,
+    sprint_num: int,
+    mode: GeneratorMode,
+) -> AgentRunStats:
+    """Run generator agent. Returns execution stats."""
+    logger.info(
+        f"[bold green]Generator[/] starting mode={mode} round={round_num} sprint={sprint_num}"
+    )
+
+    sprint_context = _get_sprint_context(file_comm, sprint_num)
+    accepted_sprints = _get_accepted_sprints(file_comm)
+
+    if mode == "generate":
+        user_msg = _build_generate_prompt(
+            workdir=workdir,
+            round_num=round_num,
+            sprint_num=sprint_num,
+            sprint_context=sprint_context,
+            accepted_sprints=accepted_sprints,
+        )
+    else:
+        user_msg = _build_repair_prompt(
+            file_comm=file_comm,
+            workdir=workdir,
+            round_num=round_num,
+            sprint_num=sprint_num,
+            sprint_context=sprint_context,
+            accepted_sprints=accepted_sprints,
+        )
+
+    result, cost, _assistant_text, permission_denials = await run_sdk_agent(
+        prompt=user_msg,
+        config=config,
+        workdir=workdir,
+        model=config.generator_model,
+        system_prompt=GENERATOR_SYSTEM_PROMPT,
+        max_turns=config.generator_max_turns,
+        allow_bash=True,
+        trace_path=file_comm.dir / "traces" / f"generator_round_{round_num}.jsonl",
+    )
+
+    _validate_generator_outputs(file_comm, workdir, (result.result or "").strip())
+
+    if permission_denials:
+        logger.warning(
+            f"[bold green]Generator[/] completed with permission denials: {permission_denials}"
+        )
+
+    logger.info(
+        f"[bold green]Generator[/] mode={mode} round={round_num} sprint={sprint_num} "
+        f"done. Cost: ${cost:.4f}"
+    )
+    return build_agent_run_stats(result)

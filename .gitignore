@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+workdir/
+examples/
+.venv/
+*.egg-info/
+dist/
+build/
+.claude/
+.playwright-mcp/

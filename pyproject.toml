@@ -1,0 +1,18 @@
+[project]
+name = "web-coding-agent"
+version = "0.1.0"
+description = "Multi-agent harness for long-running autonomous coding (Planner → Generator → Evaluator)"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk>=0.1.65",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+harness = "src.main:cli"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
