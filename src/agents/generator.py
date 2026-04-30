@@ -27,10 +27,6 @@ _REPAIR_REQUIRED_READS = (
 )
 
 
-def _read_previous_grades(file_comm: FileComm, feedback_round: int) -> dict[str, Any]:
-    return file_comm.read_grades(feedback_round) or {}
-
-
 def _extract_repair_targets(
     grades: dict[str, Any],
     sprint_context: dict,
@@ -176,7 +172,17 @@ def _build_repair_prompt(
 ) -> str:
     feedback_round = round_num - 1
     accepted = accepted_sprints.get("accepted", [])
-    previous_grades = _read_previous_grades(file_comm, feedback_round)
+    previous_grades = file_comm.read_grades(feedback_round)
+    if previous_grades is None:
+        # Without the previous grade JSON the repair prompt has no failed
+        # checks / criteria to reference and would degrade into a no-direction
+        # generate (see reviews/2026-05-04-full-audit.md, M16). Fail loudly so
+        # the harness can decide whether to fall back to mode=generate or abort.
+        raise RuntimeError(
+            f"Generator repair mode requires .harness/grade_round_{feedback_round}.json "
+            f"from the previous round, but it was not found. The previous round may "
+            f"have crashed before writing grades."
+        )
     repair_targets = _extract_repair_targets(previous_grades, sprint_context)
     required_reads = "\n".join(
         f"- {path.format(feedback_round=feedback_round)}" for path in _REPAIR_REQUIRED_READS
@@ -210,20 +216,30 @@ def _build_repair_prompt(
 
 def _validate_generator_outputs(file_comm: FileComm, workdir: Path, result_summary: str) -> None:
     frontend_dir = workdir / "frontend"
-    if frontend_dir.exists():
+    package_json = frontend_dir / "package.json"
+
+    if frontend_dir.exists() and package_json.exists():
         return
 
     if result_summary and not file_comm.read_build_log():
         file_comm.write_build_log(result_summary)
 
-    existing_dirs = sorted(
-        path.relative_to(workdir).as_posix()
-        for path in workdir.iterdir()
-        if path.is_dir() and path.name != ".harness"
-    )
+    if not frontend_dir.exists():
+        existing_dirs = sorted(
+            path.relative_to(workdir).as_posix()
+            for path in workdir.iterdir()
+            if path.is_dir() and path.name != ".harness"
+        )
+        raise RuntimeError(
+            "Generator completed without creating the expected frontend directory "
+            f"('frontend'). Found directories: {existing_dirs or 'none'}."
+        )
+
     raise RuntimeError(
-        "Generator completed without creating the expected frontend directory "
-        f"('frontend'). Found directories: {existing_dirs or 'none'}."
+        "Generator created 'frontend/' but it is missing 'package.json'. "
+        "An empty frontend directory cannot serve a dev server, so the round "
+        "is treated as a failed build instead of waiting 90s for the dev "
+        "server to time out."
     )
 
 

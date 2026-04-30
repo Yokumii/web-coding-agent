@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk.types import ResultMessage
 
-from src.agents.planner import _normalize_spec_candidate, run_planner
+from src.agents.planner import (
+    _normalize_spec_candidate,
+    _validate_planning_bundle,
+    run_planner,
+)
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 
@@ -319,3 +323,161 @@ def test_normalize_spec_candidate_rejects_chatty_fallback():
     assert _normalize_spec_candidate(
         "I'm encountering technical issues with the file writing.\n\nWould you like me to try again?"
     ) == ""
+
+
+# --- Batch 7 (M12): cross-ref consistency between the three plan files ---
+
+
+def _seed_valid_bundle(file_comm: FileComm) -> None:
+    """Write a self-consistent planning bundle with two features and two sprints."""
+    file_comm.write_spec(_valid_spec_text())
+    file_comm.write_design_tokens(
+        {
+            "theme_name": "editorial counter",
+            "color": {"bg": "#111111"},
+            "typography": {"display": "Space Grotesk"},
+            "spacing": {"base": 8},
+            "radius": {"card": 16},
+            "motion": {"duration_fast": 160},
+            "style_rules": ["bold hierarchy"],
+            "anti_patterns": ["generic cards"],
+        }
+    )
+    file_comm.write_feature_list(
+        {
+            "features": [
+                {
+                    "id": "F001",
+                    "name": "Counter",
+                    "priority": "high",
+                    "depends_on": [],
+                    "description": "Count values.",
+                    "acceptance_criteria": ["Counter increments correctly."],
+                    "status": "planned",
+                    "sprint": 1,
+                },
+                {
+                    "id": "F002",
+                    "name": "Polish",
+                    "priority": "medium",
+                    "depends_on": ["F001"],
+                    "description": "Animate.",
+                    "acceptance_criteria": ["Animation runs."],
+                    "status": "planned",
+                    "sprint": 2,
+                },
+            ]
+        }
+    )
+    file_comm.write_sprint_plan(
+        {
+            "total_sprints": 2,
+            "sprints": [
+                {
+                    "number": 1,
+                    "title": "Core counter",
+                    "goal": "Ship the primary counter flow.",
+                    "feature_ids": ["F001"],
+                    "deliverables": ["Visible counter UI."],
+                    "exit_criteria": ["Counter increments correctly."],
+                },
+                {
+                    "number": 2,
+                    "title": "Polish",
+                    "goal": "Add motion.",
+                    "feature_ids": ["F002"],
+                    "deliverables": ["Animated counter."],
+                    "exit_criteria": ["Animation runs."],
+                },
+            ],
+        }
+    )
+    file_comm.write_ui_verification_plan(
+        {
+            "sprints": [
+                {
+                    "sprint": 1,
+                    "checks": [
+                        {
+                            "id": "UI-001",
+                            "feature_id": "F001",
+                            "task": "Click increment once.",
+                            "expected_result": "Counter changes by one step.",
+                            "critical": True,
+                            "category": "core_interaction",
+                        }
+                    ],
+                },
+                {
+                    "sprint": 2,
+                    "checks": [
+                        {
+                            "id": "UI-002",
+                            "feature_id": "F002",
+                            "task": "Observe animation.",
+                            "expected_result": "Counter animates.",
+                            "critical": False,
+                            "category": "appearance",
+                        }
+                    ],
+                },
+            ]
+        }
+    )
+    file_comm.write_progress("# Progress Log\n\n## planning\n- status: complete")
+
+
+def test_validate_planning_bundle_passes_for_consistent_bundle(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+    sprint_plan = _validate_planning_bundle(file_comm)
+    assert sprint_plan["total_sprints"] == 2
+
+
+def test_validate_planning_bundle_rejects_dangling_sprint_feature_id(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    sprint_plan = file_comm.read_sprint_plan()
+    sprint_plan["sprints"][0]["feature_ids"] = ["F999"]  # not in feature_list
+    file_comm.write_sprint_plan(sprint_plan)
+
+    with pytest.raises(RuntimeError, match="F999"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_validate_planning_bundle_rejects_dangling_ui_check_feature_id(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    plan = file_comm.read_ui_verification_plan()
+    plan["sprints"][0]["checks"][0]["feature_id"] = "F404"
+    file_comm.write_ui_verification_plan(plan)
+
+    with pytest.raises(RuntimeError, match="F404"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_validate_planning_bundle_rejects_feature_assigned_to_unknown_sprint(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    feature_list = file_comm.read_feature_list()
+    feature_list["features"][0]["sprint"] = 99  # outside total_sprints=2
+    file_comm.write_feature_list(feature_list)
+
+    with pytest.raises(RuntimeError, match="sprint"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_validate_planning_bundle_rejects_sprint_plan_missing_a_sprint_number(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    sprint_plan = file_comm.read_sprint_plan()
+    # total_sprints=2 but sprint_plan only declares sprint 1.
+    sprint_plan["sprints"] = [sprint_plan["sprints"][0]]
+    file_comm.write_sprint_plan(sprint_plan)
+
+    with pytest.raises(RuntimeError, match="sprint"):
+        _validate_planning_bundle(file_comm)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,70 @@ from src.prompts.evaluator_vision import EVALUATOR_VISION_SYSTEM_PROMPT
 
 _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
+
+# Patterns that look like API credentials in upstream error bodies. We
+# do NOT want these in trace files or harness logs (audit M11).
+_SECRET_REGEX = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{6,}|Bearer\s+[A-Za-z0-9._\-]+|x-api-key:\s*\S+)",
+    re.IGNORECASE,
+)
+
+
+def _scrub_secrets(text: str, *, limit: int = 512) -> str:
+    """Truncate and redact a string before logging or raising it.
+
+    Used on upstream HTTP error bodies (which some proxies echo request
+    headers back into) and any other detail that may contain bearer
+    tokens or x-api-key values.
+    """
+    truncated = text[:limit]
+    if len(text) > limit:
+        truncated = truncated + "...[truncated]"
+    return _SECRET_REGEX.sub("***", truncated)
+
+
+def _validate_screenshot_path(relative_path: str, workdir: Path) -> Path:
+    """Reject screenshot paths that escape workdir / aren't .png /
+    aren't under .harness/.
+
+    Without this, a manifest written by a compromised visual_capture
+    agent could point at arbitrary files (``.aws/credentials`` etc.)
+    which the vision scorer would then base64-encode and POST to the
+    external vision endpoint (audit H4).
+    """
+    candidate = Path(relative_path)
+    if candidate.is_absolute():
+        raise ValueError(
+            f"vision screenshot path must be relative to workdir: {relative_path!r}"
+        )
+    if ".." in candidate.parts:
+        raise ValueError(
+            f"vision screenshot path escapes workdir: {relative_path!r}"
+        )
+
+    workdir_resolved = workdir.resolve()
+    resolved = (workdir_resolved / candidate).resolve()
+    try:
+        resolved.relative_to(workdir_resolved)
+    except ValueError as exc:
+        raise ValueError(
+            f"vision screenshot path escapes workdir: {relative_path!r}"
+        ) from exc
+
+    if resolved.suffix.lower() != ".png":
+        raise ValueError(
+            f"vision screenshot must have .png extension: {relative_path!r}"
+        )
+
+    harness_dir = workdir_resolved / ".harness"
+    try:
+        resolved.relative_to(harness_dir)
+    except ValueError as exc:
+        raise ValueError(
+            f"vision screenshot must live under .harness/: {relative_path!r}"
+        ) from exc
+
+    return resolved
 
 
 def _normalize_endpoint_type(endpoint_type: str) -> str:
@@ -104,10 +169,19 @@ def _coerce_rating(value: Any, *, minimum: int, maximum: int, fallback: int) -> 
 
 
 def _coerce_score(value: Any, fallback: float) -> float:
-    if isinstance(value, (int, float)):
-        score = float(value)
-        return max(0.0, min(10.0, round(score, 1)))
-    return fallback
+    """Clamp a numeric score into [0, 10] with one decimal of precision.
+
+    Non-numeric / NaN / inf values fall back to ``fallback``. Callers in the
+    vision pipeline pass ``fallback=0.0`` so that malformed responses fail
+    closed (see reviews/2026-05-04-full-audit.md, H5).
+    """
+    # bool is a subclass of int in Python; treat it as non-numeric here.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return fallback
+    score = float(value)
+    if score != score or score in (float("inf"), float("-inf")):  # NaN / inf
+        return fallback
+    return max(0.0, min(10.0, round(score, 1)))
 
 
 def _build_stats_from_http_response(
@@ -139,7 +213,7 @@ def _build_anthropic_content_blocks(
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [{"type": "text", "text": review_context}]
     for relative_path in screenshot_paths:
-        absolute_path = (workdir / relative_path).resolve()
+        absolute_path = _validate_screenshot_path(relative_path, workdir)
         content.append(
             {
                 "type": "image",
@@ -161,7 +235,7 @@ def _build_openai_content_blocks(
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [{"type": "text", "text": review_context}]
     for relative_path in screenshot_paths:
-        absolute_path = (workdir / relative_path).resolve()
+        absolute_path = _validate_screenshot_path(relative_path, workdir)
         content.append(
             {
                 "type": "image_url",
@@ -309,10 +383,12 @@ def _perform_visual_review_request(
         with request.urlopen(http_request, timeout=90) as response:
             response_body = response.read().decode("utf-8")
     except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
+        detail = _scrub_secrets(exc.read().decode("utf-8", errors="replace"))
         raise RuntimeError(f"vision scorer HTTP {exc.code}: {detail}") from exc
     except error.URLError as exc:
-        raise RuntimeError(f"vision scorer connection failed: {exc.reason}") from exc
+        raise RuntimeError(
+            f"vision scorer connection failed: {_scrub_secrets(str(exc.reason))}"
+        ) from exc
 
     duration_ms = int((time.perf_counter() - started) * 1000)
     parsed = json.loads(response_body)
@@ -398,24 +474,26 @@ def normalize_visual_review(
             "notes": str(appearance.get("notes", "")).strip(),
         },
         "criteria_scores": {
+            # Fallbacks are 0.0 (not the per-criterion threshold) so that
+            # missing or malformed responses fail closed in check_grades.
             "design_quality": {
                 "score": _coerce_score(
                     (criteria_scores.get("design_quality") or {}).get("score"),
-                    fallback=6.0,
+                    fallback=0.0,
                 ),
                 "notes": str((criteria_scores.get("design_quality") or {}).get("notes", "")).strip(),
             },
             "originality": {
                 "score": _coerce_score(
                     (criteria_scores.get("originality") or {}).get("score"),
-                    fallback=5.0,
+                    fallback=0.0,
                 ),
                 "notes": str((criteria_scores.get("originality") or {}).get("notes", "")).strip(),
             },
             "craft": {
                 "score": _coerce_score(
                     (criteria_scores.get("craft") or {}).get("score"),
-                    fallback=6.0,
+                    fallback=0.0,
                 ),
                 "notes": str((criteria_scores.get("craft") or {}).get("notes", "")).strip(),
             },

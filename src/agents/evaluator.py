@@ -252,7 +252,7 @@ def _determine_passed(grades: dict[str, Any] | None) -> bool:
     if not grades:
         return False
 
-    if grades.get("sprint_passed") is False:
+    if _parse_tristate(grades.get("sprint_passed")) is False:
         return False
 
     if _has_failed_critical_ui_checks(grades):
@@ -261,21 +261,48 @@ def _determine_passed(grades: dict[str, Any] | None) -> bool:
     if _has_failed_critical_exit_criteria(grades):
         return False
 
-    overall_passed = grades.get("overall_passed")
-    if isinstance(overall_passed, bool):
+    overall_passed = _parse_tristate(grades.get("overall_passed"))
+    if overall_passed is not None:
         return overall_passed and check_grades(grades)
 
     return check_grades(grades)
+
+
+_TRUTHY_STRINGS = frozenset({"true", "yes", "1", "y", "t", "pass", "passed", "ok"})
+_FALSEY_STRINGS = frozenset({"false", "no", "0", "n", "f", "fail", "failed"})
+_FAIL_STATUSES = frozenset({"fail", "failed", "partial"})
+
+
+def _parse_tristate(value: Any) -> bool | None:
+    """Parse a strict tri-state from agent JSON: True / False / unknown.
+
+    Robust to LLMs that occasionally serialize bools as strings ("true",
+    "False", "yes", "no") or as 0/1 ints. Returns ``None`` when the
+    intent is genuinely ambiguous so callers can pick the safe direction.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUTHY_STRINGS:
+            return True
+        if normalized in _FALSEY_STRINGS:
+            return False
+    return None
 
 
 def _has_failed_critical_ui_checks(grades: dict[str, Any]) -> bool:
     for check in grades.get("ui_checks", []):
         if not isinstance(check, dict):
             continue
-        if check.get("critical") is not True:
+        if _parse_tristate(check.get("critical")) is not True:
             continue
         status = str(check.get("status", "")).strip().lower()
-        if status in {"fail", "partial"}:
+        if status in _FAIL_STATUSES:
             return True
     return False
 
@@ -284,11 +311,40 @@ def _has_failed_critical_exit_criteria(grades: dict[str, Any]) -> bool:
     for result in grades.get("target_exit_criteria_results", []):
         if not isinstance(result, dict):
             continue
-        if result.get("critical") is not True:
+        if _parse_tristate(result.get("critical")) is not True:
             continue
-        if result.get("passed") is False:
+        if _parse_tristate(result.get("passed")) is False:
             return True
     return False
+
+
+_GRADE_LIKE_KEYS = ("criteria", "phase_results", "round")
+
+
+def _iter_json_objects(text: str) -> list[dict[str, Any]]:
+    """Yield every top-level JSON object embedded in ``text``.
+
+    Uses ``json.JSONDecoder.raw_decode`` to scan past noise (prose,
+    multiple objects, trailing junk) instead of the older first-``{``/
+    last-``}`` heuristic that fails the moment an LLM writes more than
+    one JSON block in a single message.
+    """
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
+    cursor = 0
+    while cursor < len(text):
+        next_brace = text.find("{", cursor)
+        if next_brace < 0:
+            break
+        try:
+            obj, consumed = decoder.raw_decode(text[next_brace:])
+        except json.JSONDecodeError:
+            cursor = next_brace + 1
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+        cursor = next_brace + consumed
+    return objects
 
 
 def _extract_grades_from_response(response) -> dict[str, Any] | None:
@@ -306,13 +362,14 @@ def _extract_grades_from_response(response) -> dict[str, Any] | None:
     if isinstance(result_text, str) and result_text:
         texts.append(result_text)
 
+    # Look at message-emitted text first (newest content), then result. Within
+    # each text block prefer the LAST grade-shaped object so that an LLM that
+    # writes a draft followed by a final grade gets the final one.
     for text in texts:
-        if "grade_round" not in text or "{" not in text:
+        if "{" not in text:
             continue
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        try:
-            return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            continue
+        candidates = _iter_json_objects(text)
+        for candidate in reversed(candidates):
+            if any(key in candidate for key in _GRADE_LIKE_KEYS):
+                return candidate
     return None

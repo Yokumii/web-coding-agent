@@ -52,8 +52,181 @@ async def test_permission_callback_allows_playwright_mcp(tmp_path: Path):
         workdir=tmp_path,
         allow_bash=False,
         allow_playwright=True,
+        frontend_port=5173,
     )
-    result = await callback("mcp__playwright__browser_navigate", {"url": "http://localhost"}, None)
+    result = await callback(
+        "mcp__playwright__browser_navigate",
+        {"url": "http://127.0.0.1:5173/"},
+        None,
+    )
+    assert result.behavior == "allow"
+
+
+# --- Batch 5 (H3): playwright URL allowlist ---
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_playwright_file_url(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=False,
+        allow_playwright=True,
+        frontend_port=5173,
+    )
+    result = await callback(
+        "mcp__playwright__browser_navigate",
+        {"url": "file:///Users/yokumi/.ssh/id_rsa"},
+        None,
+    )
+    assert result.behavior == "deny"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_playwright_metadata_ip(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=False,
+        allow_playwright=True,
+        frontend_port=5173,
+    )
+    result = await callback(
+        "mcp__playwright__browser_navigate",
+        {"url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"},
+        None,
+    )
+    assert result.behavior == "deny"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_playwright_other_localhost_port(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=False,
+        allow_playwright=True,
+        frontend_port=5173,
+    )
+    result = await callback(
+        "mcp__playwright__browser_navigate",
+        {"url": "http://localhost:9090/"},
+        None,
+    )
+    assert result.behavior == "deny"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_allows_playwright_loopback_with_correct_port(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=False,
+        allow_playwright=True,
+        frontend_port=4173,
+    )
+    result = await callback(
+        "mcp__playwright__browser_navigate",
+        {"url": "http://localhost:4173/dashboard"},
+        None,
+    )
+    assert result.behavior == "allow"
+
+
+# --- Batch 5 (M7): git subcommand allowlist ---
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_git_push(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    result = await callback("Bash", {"command": "git push origin main"}, None)
+    assert result.behavior == "deny"
+    assert "git" in result.message.lower()
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_git_config_global(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    result = await callback("Bash", {"command": "git config --global user.email evil"}, None)
+    assert result.behavior == "deny"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_git_remote_add(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    result = await callback("Bash", {"command": "git remote add x http://attacker/r"}, None)
+    assert result.behavior == "deny"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_allows_git_status(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    result = await callback("Bash", {"command": "git status"}, None)
+    assert result.behavior == "allow"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_git_flag_before_subcommand(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    # `git -c http.extraheader='X: x' status` would smuggle credentials.
+    result = await callback("Bash", {"command": "git -c http.extraheader=evil status"}, None)
+    assert result.behavior == "deny"
+
+
+# --- Batch 5 (M8): find -exec / -delete ---
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_find_exec(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    result = await callback(
+        "Bash",
+        {"command": "find . -name *.py -exec node payload.js {} +"},
+        None,
+    )
+    assert result.behavior == "deny"
+    assert "find" in result.message.lower() or "exec" in result.message.lower()
+
+
+@pytest.mark.anyio
+async def test_permission_callback_denies_find_delete(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    result = await callback("Bash", {"command": "find . -delete"}, None)
+    assert result.behavior == "deny"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_allows_plain_find(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    result = await callback("Bash", {"command": "find frontend -name *.tsx"}, None)
     assert result.behavior == "allow"
 
 

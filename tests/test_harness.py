@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -921,3 +922,486 @@ async def test_fresh_run_clears_stale_harness_artifacts(monkeypatch, tmp_path: P
 
     assert (harness_dir / "spec.md").read_text().startswith("# Fresh Spec")
     assert not (traces_dir / "planner.jsonl").exists()
+
+
+# --- Batch 3 (H8): evaluator failure must cancel the visual_capture sibling ---
+
+
+@pytest.mark.anyio
+async def test_evaluator_failure_cancels_visual_capture_and_closes_stack(
+    monkeypatch, tmp_path: Path
+):
+    """When run_evaluator raises, run_visual_capture must be cancelled
+    (so its Playwright MCP subprocess does not leak) AND the app_stack
+    must still be closed. Previously asyncio.gather left the sibling
+    running until process exit.
+    """
+    visual_was_cancelled = {"value": False}
+    stack = DummyAppStack()
+
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_sprint_plan(
+            {
+                "total_sprints": 1,
+                "sprints": [
+                    {
+                        "number": 1,
+                        "title": "Core flow",
+                        "goal": "Ship the first sprint.",
+                        "feature_ids": ["F001"],
+                        "deliverables": ["Primary UI."],
+                        "exit_criteria": ["Primary flow works."],
+                    }
+                ],
+            }
+        )
+        file_comm.write_accepted_sprints(
+            {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+        )
+        _write_feature_list(file_comm)
+        return 0.1
+
+    async def fake_generator(*args, **kwargs):
+        return 0.2
+
+    async def fake_evaluator(*args, **kwargs):
+        # Yield once so visual_capture can enter its sleep before we raise.
+        await asyncio.sleep(0)
+        raise RuntimeError("evaluator boom")
+
+    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
+        try:
+            await asyncio.sleep(60)  # would otherwise outlive the harness
+            return _visual_manifest(round_num), _stats(0.05)
+        except asyncio.CancelledError:
+            visual_was_cancelled["value"] = True
+            raise
+
+    async def fake_start_app_stack(workdir, harness_dir, config, round_num):
+        return stack
+
+    async def fake_visual_review(**kwargs):
+        return kwargs["grades"], None
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+    monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
+    monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
+    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
+    monkeypatch.setattr(
+        "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
+    )
+    monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
+
+    with pytest.raises(RuntimeError, match="evaluator boom"):
+        await run_harness("build something", tmp_path, HarnessConfig(max_rounds=1))
+
+    assert visual_was_cancelled["value"] is True
+    assert stack.closed is True
+
+
+# --- Batch 4 (H6): resume must trust state when accepted_sprints.json is stale ---
+
+
+@pytest.mark.anyio
+async def test_resume_reconciles_advanced_accepted_sprints_against_build_checkpoint(
+    monkeypatch, tmp_path: Path
+):
+    """Audit H6 scenario.
+
+    With the old (file-first, state-second) write order, a crash between
+    the two writes left ``accepted_sprints.json`` advanced to sprint N+1
+    while ``harness_state.json`` still said ``build_rN`` was the last
+    completed phase. On resume, the harness picked up the stale file and
+    fed sprint N+1 to the evaluator — even though sprint N+1 was never
+    built. The fix writes state first AND reconciles the file from
+    state's view on resume.
+    """
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_sprint_plan(
+        {
+            "total_sprints": 2,
+            "sprints": [
+                {
+                    "number": 1,
+                    "title": "Sprint 1",
+                    "goal": "Ship sprint 1.",
+                    "feature_ids": ["F001"],
+                    "deliverables": ["S1 UI."],
+                    "exit_criteria": ["S1 works."],
+                },
+                {
+                    "number": 2,
+                    "title": "Sprint 2",
+                    "goal": "Ship sprint 2.",
+                    "feature_ids": ["F002"],
+                    "deliverables": ["S2 UI."],
+                    "exit_criteria": ["S2 works."],
+                },
+            ],
+        }
+    )
+    _write_feature_list(file_comm, total=2)
+
+    # accepted_sprints.json is prematurely advanced: claims sprint 1 done.
+    file_comm.write_accepted_sprints(
+        {"accepted": [1], "current_target": 2, "last_evaluated_round": 1}
+    )
+    # State only got as far as build_r1 — evaluate never completed.
+    file_comm.write_state(
+        {
+            "last_completed_phase": "build_r1",
+            "round_num": 1,
+            "prompt": "saved prompt",
+            "costs": {"planner": 0.1, "generator_r1": 0.2},
+            "phase_metrics": {},
+            "current_sprint": 1,
+            "generator_mode": "generate",
+            "accepted_sprints": [],
+            "last_verdict": "awaiting_review",
+        }
+    )
+
+    captured: dict = {}
+
+    async def fake_planner(*args, **kwargs):
+        captured["planner_called"] = True
+        return 0.1
+
+    async def fake_generator(*args, **kwargs):
+        captured["generator_called"] = True
+        return 0.2
+
+    async def fake_evaluator(*args, **kwargs):
+        # accepted_sprints.json must already have been reconciled to
+        # state's view (current_target=1) by the time the evaluator
+        # is asked to score.
+        accepted = FileComm(tmp_path / ".harness").read_accepted_sprints() or {}
+        captured["evaluator_target"] = accepted.get("current_target")
+        return (
+            True,
+            {
+                "round": kwargs["round_num"],
+                "sprint": accepted.get("current_target"),
+                "mode_recommendation": "generate_next_sprint",
+                "overall_passed": True,
+                "criteria": {
+                    "design_quality": {"score": 7.0},
+                    "functionality": {"score": 7.0},
+                    "originality": {"score": 6.0},
+                    "craft": {"score": 7.0},
+                },
+            },
+            0.3,
+        )
+
+    async def fake_start_app_stack(*args, **kwargs):
+        return DummyAppStack()
+
+    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
+        return _visual_manifest(round_num), _stats(0.05)
+
+    async def fake_visual_review(**kwargs):
+        return kwargs["grades"], _stats(0.0)
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+    monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
+    monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
+    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
+    monkeypatch.setattr(
+        "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
+    )
+    monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
+
+    await run_harness(
+        "ignored", tmp_path, HarnessConfig(max_rounds=1), resume=True
+    )
+
+    # Generator must NOT run again (build_r1 was checkpointed).
+    assert "generator_called" not in captured
+    # Planner must NOT run again (we resumed past plan).
+    assert "planner_called" not in captured
+    # Evaluator was asked to score sprint 1 (state SOT), not sprint 2.
+    assert captured["evaluator_target"] == 1
+
+
+@pytest.mark.anyio
+async def test_evaluate_checkpoint_is_written_before_accepted_sprints_file(
+    monkeypatch, tmp_path: Path
+):
+    """Forward-only contract: ``harness_state.json`` must be on disk before
+    ``accepted_sprints.json`` is updated for the new round. If it isn't,
+    a crash in the gap reverts to the H6 bug where the file races ahead
+    of the checkpoint.
+    """
+    file_writes: list[str] = []
+
+    original_write_state = FileComm.write_state
+    original_write_accepted = FileComm.write_accepted_sprints
+
+    def tracking_write_state(self, *args, **kwargs):
+        file_writes.append("state")
+        return original_write_state(self, *args, **kwargs)
+
+    def tracking_write_accepted(self, *args, **kwargs):
+        file_writes.append("accepted_sprints")
+        return original_write_accepted(self, *args, **kwargs)
+
+    monkeypatch.setattr(FileComm, "write_state", tracking_write_state)
+    monkeypatch.setattr(FileComm, "write_accepted_sprints", tracking_write_accepted)
+
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_sprint_plan(
+            {
+                "total_sprints": 1,
+                "sprints": [
+                    {
+                        "number": 1,
+                        "title": "S",
+                        "goal": "g",
+                        "feature_ids": ["F001"],
+                        "deliverables": [],
+                        "exit_criteria": [],
+                    }
+                ],
+            }
+        )
+        file_comm.write_accepted_sprints(
+            {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+        )
+        _write_feature_list(file_comm)
+        return 0.1
+
+    async def fake_generator(*args, **kwargs):
+        return 0.2
+
+    async def fake_evaluator(*args, **kwargs):
+        return (
+            True,
+            {
+                "round": 1,
+                "sprint": 1,
+                "mode_recommendation": "complete",
+                "overall_passed": True,
+                "criteria": {
+                    "design_quality": {"score": 7.0},
+                    "functionality": {"score": 7.0},
+                    "originality": {"score": 6.0},
+                    "craft": {"score": 7.0},
+                },
+            },
+            0.3,
+        )
+
+    async def fake_start_app_stack(*args, **kwargs):
+        return DummyAppStack()
+
+    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
+        return _visual_manifest(round_num), _stats(0.05)
+
+    async def fake_visual_review(**kwargs):
+        return kwargs["grades"], _stats(0.0)
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+    monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
+    monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
+    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
+    monkeypatch.setattr(
+        "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
+    )
+    monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
+
+    await run_harness("build something", tmp_path, HarnessConfig(max_rounds=1))
+
+    # Find the LAST occurrence of each post-evaluate write. The state
+    # for evaluate_r1 must precede the accepted_sprints update for the
+    # post-evaluate transition.
+    last_state_index = max(i for i, w in enumerate(file_writes) if w == "state")
+    last_accepted_index = max(
+        i for i, w in enumerate(file_writes) if w == "accepted_sprints"
+    )
+    assert last_state_index < last_accepted_index, (
+        "post-evaluate state must be checkpointed BEFORE accepted_sprints.json "
+        f"is rewritten; saw writes: {file_writes}"
+    )
+
+
+# --- Batch 6 (M1): budget gate after evaluate three-phase block ---
+
+
+@pytest.mark.anyio
+async def test_budget_check_after_evaluate_stops_subsequent_rounds(
+    monkeypatch, tmp_path: Path
+):
+    """Without an evaluate-phase budget check, the harness could blow
+    far past max_budget_usd in a single round (evaluator + visual_capture
+    + visual_score all add cost). The fix re-runs is_over_budget after
+    those three settle, before the next round begins.
+    """
+    rounds_started: list[int] = []
+    stack = DummyAppStack()
+
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_sprint_plan(
+            {
+                "total_sprints": 5,
+                "sprints": [
+                    {
+                        "number": n,
+                        "title": f"Sprint {n}",
+                        "goal": f"g{n}",
+                        "feature_ids": [f"F{n:03d}"],
+                        "deliverables": [],
+                        "exit_criteria": [],
+                    }
+                    for n in range(1, 6)
+                ],
+            }
+        )
+        file_comm.write_accepted_sprints(
+            {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+        )
+        _write_features(file_comm, [(f"F{n:03d}", n) for n in range(1, 6)])
+        return 0.1
+
+    async def fake_generator(*args, **kwargs):
+        rounds_started.append(kwargs["round_num"])
+        # Build cost is small; the over-budget condition only crosses
+        # the threshold once visual_capture / visual_score are added.
+        return 0.05
+
+    async def fake_evaluator(*args, **kwargs):
+        return (
+            True,
+            {
+                "round": kwargs["round_num"],
+                "sprint": kwargs["round_num"],
+                "mode_recommendation": "generate_next_sprint",
+                "overall_passed": True,
+                "criteria": {
+                    "design_quality": {"score": 7.0},
+                    "functionality": {"score": 7.0},
+                    "originality": {"score": 6.0},
+                    "craft": {"score": 7.0},
+                },
+            },
+            5.0,  # large evaluator cost crosses budget
+        )
+
+    async def fake_start_app_stack(*args, **kwargs):
+        return stack
+
+    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
+        return _visual_manifest(round_num), _stats(0.1)
+
+    async def fake_visual_review(**kwargs):
+        return kwargs["grades"], _stats(0.1)
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+    monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
+    monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
+    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
+    monkeypatch.setattr(
+        "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
+    )
+    monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
+
+    # Budget=1.0, planner 0.1 + generator_r1 0.05 = 0.15 < 1.0,
+    # then evaluator_r1 5.0 crosses to 5.15 — must stop.
+    await run_harness(
+        "build something", tmp_path, HarnessConfig(max_budget_usd=1.0, max_rounds=5)
+    )
+
+    assert rounds_started == [1], (
+        f"Generator must only run for round 1; budget gate after evaluate_r1 "
+        f"should stop subsequent rounds. Saw rounds: {rounds_started}"
+    )
+
+
+# --- Batch 6 (M6): fresh run clears workdir/frontend by default ---
+
+
+@pytest.mark.anyio
+async def test_fresh_run_clears_existing_frontend_dir(monkeypatch, tmp_path: Path):
+    """A fresh prompt with no --resume should not have generator round
+    1 inherit a frontend/ left over from the previous prompt — that
+    causes generate-mode to "repair" code it never saw the spec for.
+    """
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / "stale.txt").write_text("from previous prompt")
+
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_spec(
+            "# Fresh\n\n## Overview\nx\n\n## Technical Stack\ny\n\n## Design Direction\nz\n\n## Features\n## AI Integration\n## Technical Architecture"
+        )
+        return 0.0
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+
+    await run_harness(
+        "fresh prompt", tmp_path, HarnessConfig(max_rounds=0), plan_only=True
+    )
+
+    assert not (tmp_path / "frontend" / "stale.txt").exists()
+
+
+@pytest.mark.anyio
+async def test_keep_frontend_preserves_existing_frontend_dir(monkeypatch, tmp_path: Path):
+    """Power-user opt-out: `--keep-frontend` keeps an existing
+    workdir/frontend/ across fresh runs."""
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / "kept.txt").write_text("preserved")
+
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_spec(
+            "# Fresh\n\n## Overview\nx\n\n## Technical Stack\ny\n\n## Design Direction\nz\n\n## Features\n## AI Integration\n## Technical Architecture"
+        )
+        return 0.0
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+
+    await run_harness(
+        "fresh prompt",
+        tmp_path,
+        HarnessConfig(max_rounds=0),
+        plan_only=True,
+        keep_frontend=True,
+    )
+
+    assert (tmp_path / "frontend" / "kept.txt").read_text() == "preserved"
+
+
+@pytest.mark.anyio
+async def test_resume_does_not_clear_frontend_dir(monkeypatch, tmp_path: Path):
+    """--resume must never touch frontend/ regardless of keep_frontend."""
+    frontend_dir = tmp_path / "frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / "in_progress.txt").write_text("don't delete")
+
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_state(
+        {
+            "last_completed_phase": "plan",
+            "round_num": 0,
+            "prompt": "saved",
+            "costs": {"planner": 0.1},
+            "current_sprint": 1,
+            "accepted_sprints": [],
+            "last_verdict": "planned",
+        }
+    )
+
+    async def fake_planner(*args, **kwargs):
+        raise AssertionError("planner should not run on resume")
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+
+    await run_harness(
+        "ignored",
+        tmp_path,
+        HarnessConfig(max_rounds=0),
+        resume=True,
+    )
+
+    assert (tmp_path / "frontend" / "in_progress.txt").read_text() == "don't delete"

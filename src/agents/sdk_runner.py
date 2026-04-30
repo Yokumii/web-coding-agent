@@ -6,6 +6,7 @@ import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 from claude_agent_sdk import query
 from claude_agent_sdk.types import (
@@ -25,6 +26,7 @@ LOCAL_AGENT_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"}
 LOCAL_AGENT_TOOLS_WITH_BASH = LOCAL_AGENT_TOOLS | {"Bash"}
 PLAYWRIGHT_TOOL_PREFIX = "mcp__playwright__"
 _DISALLOWED_SHELL_SNIPPETS = ("&&", "||", "|", ";", ">", "<", "$(", "`", "\n", "\r")
+# Token check kept for documentation; the real gate is the allowlist below.
 _DISALLOWED_BASH_COMMANDS = {
     "rm",
     "rmdir",
@@ -70,6 +72,44 @@ _ALLOWED_BASH_COMMANDS = {
     "which",
     "yarn",
 }
+
+# git subcommands the harness accepts. Anything that mutates remotes,
+# config, or pulls foreign code is blocked (audit M7).
+_GIT_ALLOWED_SUBCOMMANDS = frozenset({
+    "status",
+    "diff",
+    "log",
+    "show",
+    "add",
+    "commit",
+    "rev-parse",
+    "branch",
+    "ls-files",
+    "stash",
+})
+
+# find flags that turn the binary into an arbitrary executor or a
+# destructive bulk delete (audit M8). `-print0` and `-fls` also stream
+# arbitrary content into outputs we don't want to expose.
+_FORBIDDEN_FIND_FLAGS = frozenset({
+    "-exec",
+    "-execdir",
+    "-delete",
+    "-print0",
+    "-fprint",
+    "-fprintf",
+    "-fprint0",
+    "-fls",
+    "-ok",
+    "-okdir",
+})
+
+# Hosts that the playwright MCP browser may navigate to. Anything else
+# (file://, private network ranges, cloud metadata) is denied to keep
+# a prompt-injected evaluator from doing SSRF or local file reads
+# (audit H3).
+_PLAYWRIGHT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_PLAYWRIGHT_URL_KEYS = frozenset({"url", "urls"})
 
 
 @dataclass(frozen=True)
@@ -264,6 +304,11 @@ def _validate_bash_command(command: str) -> list[str]:
     if executable not in _ALLOWED_BASH_COMMANDS:
         raise ValueError(f"command not in allowlist: {executable}")
 
+    if executable == "git":
+        _validate_git_argv(argv)
+    elif executable == "find":
+        _validate_find_argv(argv)
+
     for token in argv[1:]:
         if token.startswith("~"):
             raise ValueError(f"path shortcuts not allowed in bash command: {token}")
@@ -274,6 +319,27 @@ def _validate_bash_command(command: str) -> list[str]:
             raise ValueError(f"path escapes workdir in bash command: {token}")
 
     return argv
+
+
+def _validate_git_argv(argv: list[str]) -> None:
+    if len(argv) < 2:
+        raise ValueError("git requires a subcommand")
+    # Reject leading flags like `git -c http.extraheader=...` that smuggle
+    # configuration past the subcommand check.
+    if argv[1].startswith("-"):
+        raise ValueError(f"git flags before the subcommand are not allowed: {argv[1]}")
+    subcommand = argv[1]
+    if subcommand not in _GIT_ALLOWED_SUBCOMMANDS:
+        raise ValueError(f"git subcommand not allowed: {subcommand}")
+
+
+def _validate_find_argv(argv: list[str]) -> None:
+    for token in argv[1:]:
+        if token in _FORBIDDEN_FIND_FLAGS:
+            raise ValueError(f"find flag not allowed: {token}")
+        # `-fprint*` family — catch any variant.
+        if token.startswith("-fprint"):
+            raise ValueError(f"find flag not allowed: {token}")
 
 
 def _collect_candidate_paths(value: Any) -> Iterable[str]:
@@ -288,12 +354,48 @@ def _collect_candidate_paths(value: Any) -> Iterable[str]:
             yield from _collect_candidate_paths(item)
 
 
+def _collect_playwright_urls(value: Any, key_path: tuple[str, ...] = ()) -> Iterable[str]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            new_path = key_path + (str(key).lower(),)
+            if isinstance(item, str) and key.lower() in _PLAYWRIGHT_URL_KEYS:
+                yield item
+            elif isinstance(item, list) and key.lower() in _PLAYWRIGHT_URL_KEYS:
+                for entry in item:
+                    if isinstance(entry, str):
+                        yield entry
+            else:
+                yield from _collect_playwright_urls(item, new_path)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _collect_playwright_urls(item, key_path)
+
+
+def _validate_playwright_url(url: str, frontend_port: int) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(
+            f"playwright tool denied: only http(s) URLs allowed, got scheme {parsed.scheme!r}"
+        )
+    host = parsed.hostname
+    if host not in _PLAYWRIGHT_ALLOWED_HOSTS:
+        raise ValueError(
+            f"playwright tool denied: host {host!r} is not on the loopback allowlist"
+        )
+    if parsed.port is not None and parsed.port != frontend_port:
+        raise ValueError(
+            f"playwright tool denied: port {parsed.port} is not the frontend dev server port "
+            f"({frontend_port})"
+        )
+
+
 def make_tool_permission_callback(
     *,
     workdir: Path,
     allow_bash: bool,
     allow_playwright: bool,
     trace_writer: SdkTraceWriter | None = None,
+    frontend_port: int = 5173,
 ):
     async def _can_use_tool(
         tool_name: str,
@@ -303,6 +405,21 @@ def make_tool_permission_callback(
         del context
 
         if allow_playwright and tool_name.startswith(PLAYWRIGHT_TOOL_PREFIX):
+            try:
+                for candidate_url in _collect_playwright_urls(tool_input):
+                    _validate_playwright_url(candidate_url, frontend_port)
+            except ValueError as exc:
+                if trace_writer:
+                    trace_writer.write(
+                        "permission_check",
+                        {
+                            "tool_name": tool_name,
+                            "tool_input": tool_input,
+                            "decision": "deny",
+                            "message": str(exc),
+                        },
+                    )
+                return PermissionResultDeny(message=str(exc))
             if trace_writer:
                 trace_writer.write(
                     "permission_check",
@@ -416,6 +533,7 @@ def build_agent_options(
             allow_bash=allow_bash,
             allow_playwright=allow_playwright,
             trace_writer=trace_writer,
+            frontend_port=config.frontend_port,
         ),
         hooks=hooks,
         mcp_servers=mcp_servers,

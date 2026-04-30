@@ -53,6 +53,7 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
     file_comm = FileComm(tmp_path / ".harness")
     _write_generator_context(file_comm)
     (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
     captured: dict = {}
 
     async def fake_run_sdk_agent(**kwargs):
@@ -146,6 +147,7 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
         },
     )
     (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
     captured: dict = {}
 
     async def fake_run_sdk_agent(**kwargs):
@@ -237,3 +239,91 @@ async def test_generator_raises_when_expected_dirs_are_missing(monkeypatch, tmp_
         )
 
     assert "I created some files elsewhere." in file_comm.read_build_log()
+
+
+# --- Batch 2 (M15): empty frontend dir must not be treated as success ---
+
+
+@pytest.mark.anyio
+async def test_generator_raises_when_frontend_dir_is_empty(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    # Frontend dir exists but contains no package.json — agent exited too early.
+    (tmp_path / "frontend").mkdir()
+
+    async def fake_run_sdk_agent(**kwargs):
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                result="created folder",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    with pytest.raises(RuntimeError, match="package.json"):
+        await run_generator(
+            HarnessConfig(),
+            file_comm,
+            tmp_path,
+            round_num=1,
+            sprint_num=1,
+            mode="generate",
+        )
+
+
+# --- Batch 2 (M16): repair mode must not silently degrade to no-direction generate ---
+
+
+@pytest.mark.anyio
+async def test_generator_repair_raises_when_previous_grade_missing(
+    monkeypatch, tmp_path: Path
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    # NB: grade_round_1.json deliberately not written.
+
+    sdk_called = {"value": False}
+
+    async def fake_run_sdk_agent(**kwargs):
+        sdk_called["value"] = True
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.0,
+                result="should not run",
+            ),
+            0.0,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    with pytest.raises(RuntimeError, match="grade_round_1"):
+        await run_generator(
+            HarnessConfig(),
+            file_comm,
+            tmp_path,
+            round_num=2,
+            sprint_num=1,
+            mode="repair",
+        )
+
+    assert sdk_called["value"] is False, "Repair must not call the SDK when its inputs are missing"

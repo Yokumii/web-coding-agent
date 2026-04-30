@@ -47,6 +47,46 @@ def discover_visual_screenshots(
     return [f".harness/{path.name}" for path in matches]
 
 
+_VISION_OWNED_CRITERIA = ("design_quality", "originality", "craft")
+
+
+def _force_visual_review_failure(
+    grades: dict[str, Any], reason: str
+) -> dict[str, Any]:
+    """Return a deep copy of ``grades`` with vision-owned fields marked as failed.
+
+    Used whenever the dedicated vision scorer cannot deliver a verdict
+    (no screenshots, HTTP error, malformed response). Without this the
+    evaluator-written placeholder grades would silently propagate as a
+    PASS — see reviews/2026-05-04-full-audit.md, H5.
+    """
+    merged = json.loads(json.dumps(grades))
+
+    phase_results = merged.setdefault("phase_results", {})
+    if isinstance(phase_results, dict):
+        phase_results["appearance"] = "fail"
+
+    criteria = merged.setdefault("criteria", {})
+    if isinstance(criteria, dict):
+        for name in _VISION_OWNED_CRITERIA:
+            criteria[name] = {
+                "score": 0.0,
+                "passed": False,
+                "notes": f"vision scorer unavailable: {reason}",
+            }
+
+    appearance = merged.setdefault("appearance_review", {})
+    if isinstance(appearance, dict):
+        appearance.setdefault("screenshots", [])
+        appearance["notes"] = f"Visual review failed: {reason}"
+
+    merged["overall_passed"] = False
+    merged["mode_recommendation"] = "repair"
+    if merged.get("sprint_passed") is True:
+        merged["sprint_passed"] = False
+    return merged
+
+
 async def apply_dedicated_visual_review(
     *,
     config: HarnessConfig,
@@ -61,9 +101,10 @@ async def apply_dedicated_visual_review(
     screenshot_paths = discover_visual_screenshots(file_comm, round_num, manifest, grades)
     if not screenshot_paths:
         logger.warning(
-            f"[bold yellow]Visual review[/] round {round_num} found no screenshots for scoring"
+            f"[bold yellow]Visual review[/] round {round_num} found no screenshots; "
+            f"failing the appearance phase closed"
         )
-        return grades, None
+        return _force_visual_review_failure(grades, "no screenshots available"), None
 
     try:
         review, vision_stats = await run_visual_appearance_review(
@@ -76,9 +117,10 @@ async def apply_dedicated_visual_review(
         )
     except Exception as exc:
         logger.warning(
-            f"[bold yellow]Visual review[/] round {round_num} failed, keeping evaluator placeholders: {exc}"
+            f"[bold yellow]Visual review[/] round {round_num} failed; "
+            f"failing the appearance phase closed: {exc}"
         )
-        return grades, None
+        return _force_visual_review_failure(grades, str(exc)), None
 
     normalized = normalize_visual_review(review, screenshot_paths)
     merged = json.loads(json.dumps(grades))

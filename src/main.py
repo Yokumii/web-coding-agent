@@ -49,9 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model for evaluator agent (default: EVALUATOR_MODEL env or claude-sonnet-4-6)",
     )
     parser.add_argument(
-        "--plan-only",
-        action="store_true",
-        help="Only run the planner, then stop",
+        "--evaluator-vision-model",
+        default=None,
+        help=(
+            "Model for the dedicated visual appearance scorer (default: "
+            "EVALUATOR_VISION_MODEL env, then EVALUATOR_MODEL env, then "
+            "claude-sonnet-4-6)"
+        ),
     )
     parser.add_argument(
         "--playwright-headless",
@@ -59,6 +63,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run Playwright in headless mode",
     )
     parser.add_argument(
+        "--frontend-port",
+        type=int,
+        default=None,
+        help="Port for the frontend dev server (default: FRONTEND_PORT env or 5173)",
+    )
+    parser.add_argument(
+        "--keep-frontend",
+        action="store_true",
+        help=(
+            "Do not clear workdir/frontend/ on a fresh run. By default a fresh "
+            "run (without --resume) wipes the previous prompt's frontend so "
+            "the new generator does not 'repair' unrelated code. Use this to "
+            "iterate on a hand-edited frontend."
+        ),
+    )
+    # --plan-only and --resume are mutually exclusive (audit M4): a
+    # checkpoint resume that respected --plan-only would silently skip
+    # past the planner and run the build/evaluate phases anyway, which
+    # is never what the user wanted.
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Only run the planner, then stop",
+    )
+    mode_group.add_argument(
         "--resume",
         action="store_true",
         help="Resume from last checkpoint in workdir",
@@ -78,6 +108,10 @@ def build_config(args: argparse.Namespace) -> HarnessConfig:
         kwargs["generator_model"] = args.generator_model
     if args.evaluator_model is not None:
         kwargs["evaluator_model"] = args.evaluator_model
+    if args.evaluator_vision_model is not None:
+        kwargs["evaluator_vision_model"] = args.evaluator_vision_model
+    if args.frontend_port is not None:
+        kwargs["frontend_port"] = args.frontend_port
     return HarnessConfig(**kwargs)
 
 
@@ -91,6 +125,7 @@ def cli() -> None:
         args.prompt, workdir, config,
         plan_only=args.plan_only,
         resume=args.resume,
+        keep_frontend=args.keep_frontend,
     ))
 
 

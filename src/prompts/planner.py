@@ -61,16 +61,17 @@ Write the spec as a markdown file with these sections:
 
 ## `design_tokens.json`
 
-Create a structured visual contract with:
+Create a structured visual contract with these keys (types are enforced
+by the harness validator and a single mismatched type aborts the run):
 
-- `theme_name`
-- `color`
-- `typography`
-- `spacing`
-- `radius`
-- `motion`
-- `style_rules`
-- `anti_patterns`
+- `theme_name`: non-empty string
+- `color`: object mapping role → hex / token (e.g. `{"bg": "#111", "fg": "#fff"}`)
+- `typography`: object mapping role → font family / size / weight tokens
+- `spacing`: object mapping name → number / token
+- `radius`: object mapping role → number / token
+- `motion`: object mapping name → duration / easing token (object, not array)
+- `style_rules`: non-empty array of strings (do-this rules)
+- `anti_patterns`: array of strings (don't-do-this rules; may be empty)
 
 The tokens should encode a distinctive identity that a generator can implement consistently.
 

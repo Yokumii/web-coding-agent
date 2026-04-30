@@ -53,7 +53,9 @@ class HarnessConfig:
     generator_max_turns: int = 200
     evaluator_max_turns: int = 120
 
-    frontend_port: int = 5173
+    frontend_port: int = field(
+        default_factory=lambda: int(os.getenv("FRONTEND_PORT", "5173"))
+    )
     backend_port: int = 8000
     playwright_headless: bool = False
 

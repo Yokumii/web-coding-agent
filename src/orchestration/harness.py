@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,8 +32,21 @@ def _save_checkpoint(
     current_sprint: int | None = None,
     generator_mode: str | None = None,
     last_verdict: str | None = None,
+    accepted_sprints_payload: dict[str, Any] | None = None,
 ) -> None:
-    accepted_sprints = file_comm.read_accepted_sprints() or {}
+    """Persist the harness checkpoint.
+
+    ``accepted_sprints_payload`` is the full ``accepted_sprints.json``
+    dict that *should* be on disk after this checkpoint. The harness now
+    writes the checkpoint BEFORE rewriting ``accepted_sprints.json`` so
+    that, if a crash happens between the two writes, resume can
+    reconcile the file from the checkpoint (audit H6). For phases that
+    do not change ``accepted_sprints.json`` (plan / build), pass ``None``
+    and the existing file is read back into the checkpoint.
+    """
+    if accepted_sprints_payload is None:
+        accepted_sprints_payload = file_comm.read_accepted_sprints() or {}
+
     file_comm.write_state({
         "last_completed_phase": phase,
         "round_num": round_num,
@@ -41,7 +55,8 @@ def _save_checkpoint(
         "phase_metrics": phase_metrics or {},
         "current_sprint": current_sprint,
         "generator_mode": generator_mode,
-        "accepted_sprints": accepted_sprints.get("accepted", []),
+        "accepted_sprints": accepted_sprints_payload.get("accepted", []),
+        "accepted_sprints_payload": accepted_sprints_payload,
         "last_verdict": last_verdict,
         "timestamp": datetime.now().isoformat(),
     })
@@ -135,6 +150,29 @@ def _update_accepted_sprints_after_evaluation(
     sprint_num: int,
     recommendation: str,
 ) -> dict:
+    """DEPRECATED — kept for backward compatibility with old call sites.
+
+    New code computes the next state in memory via
+    ``_compute_accepted_sprints_after_evaluation`` so that the checkpoint
+    can be written first and the file second (audit H6).
+    """
+    next_state = _compute_accepted_sprints_after_evaluation(
+        file_comm,
+        round_num=round_num,
+        sprint_num=sprint_num,
+        recommendation=recommendation,
+    )
+    file_comm.write_accepted_sprints(next_state)
+    return next_state
+
+
+def _compute_accepted_sprints_after_evaluation(
+    file_comm: FileComm,
+    *,
+    round_num: int,
+    sprint_num: int,
+    recommendation: str,
+) -> dict:
     accepted_sprints = file_comm.read_accepted_sprints() or {
         "accepted": [],
         "current_target": 1,
@@ -146,21 +184,16 @@ def _update_accepted_sprints_after_evaluation(
         accepted.append(sprint_num)
         accepted.sort()
 
-    next_target = accepted_sprints.get("current_target", 1)
-    if recommendation == "generate_next_sprint":
-        next_target = sprint_num + 1
-    elif recommendation == "complete":
+    if recommendation in {"generate_next_sprint", "complete"}:
         next_target = sprint_num + 1
     else:
         next_target = sprint_num
 
-    updated = {
+    return {
         "accepted": accepted,
         "current_target": next_target,
         "last_evaluated_round": round_num,
     }
-    file_comm.write_accepted_sprints(updated)
-    return updated
 
 
 def _resolve_evaluation_recommendation(
@@ -283,18 +316,65 @@ def _apply_post_evaluation_feature_statuses(
 
 
 def _restore_resume_state(file_comm: FileComm, existing_state: dict[str, Any]) -> None:
-    accepted = existing_state.get("accepted_sprints")
-    if accepted is None or file_comm.read_accepted_sprints() is not None:
+    """Reconcile ``accepted_sprints.json`` with the resumed checkpoint.
+
+    Two cases (audit H6):
+
+    1. Checkpoints written by the new code carry the full
+       ``accepted_sprints_payload``. If the file disagrees with that
+       payload (e.g. crashed mid-write somewhere), the file is rewritten
+       from the checkpoint — the checkpoint is the source of truth.
+
+    2. Legacy / pre-fix checkpoints only have the list of accepted
+       sprint numbers and a ``current_sprint`` field. If the file is
+       missing entirely, restore from those. Additionally, if the file
+       claims to be ahead of the checkpoint's last completed phase
+       (e.g. ``last_completed_phase=build_rN`` but the file already
+       advanced past round N), the file is treated as stale and rewound
+       to match the checkpoint.
+    """
+    payload = existing_state.get("accepted_sprints_payload")
+    file_value = file_comm.read_accepted_sprints()
+
+    if isinstance(payload, dict) and "accepted" in payload:
+        if file_value != payload:
+            file_comm.write_accepted_sprints(payload)
         return
 
-    current_sprint = int(existing_state.get("current_sprint") or 1)
-    file_comm.write_accepted_sprints(
-        {
-            "accepted": accepted,
-            "current_target": current_sprint,
-            "last_evaluated_round": existing_state.get("round_num", 0),
-        }
-    )
+    last_phase = str(existing_state.get("last_completed_phase") or "")
+    state_round = int(existing_state.get("round_num") or 0)
+    state_accepted = existing_state.get("accepted_sprints")
+    state_current_sprint = existing_state.get("current_sprint")
+
+    if (
+        last_phase.startswith("build_r")
+        and isinstance(file_value, dict)
+        and state_current_sprint is not None
+    ):
+        # The file claims this round's evaluate already completed, but the
+        # checkpoint says we only got as far as build. The file got ahead;
+        # rewind it.
+        file_advanced_past_state = (
+            file_value.get("last_evaluated_round", 0) >= state_round
+            or file_value.get("current_target", 0) > int(state_current_sprint)
+        )
+        if file_advanced_past_state:
+            file_comm.write_accepted_sprints({
+                "accepted": list(state_accepted or []),
+                "current_target": int(state_current_sprint),
+                "last_evaluated_round": max(state_round - 1, 0),
+            })
+            return
+
+    if state_accepted is None or file_value is not None:
+        return
+
+    current_sprint = int(state_current_sprint or 1)
+    file_comm.write_accepted_sprints({
+        "accepted": state_accepted,
+        "current_target": current_sprint,
+        "last_evaluated_round": state_round,
+    })
 
 
 def _get_sprint_context(file_comm: FileComm, sprint_num: int) -> dict[str, Any]:
@@ -331,6 +411,7 @@ async def run_harness(
     config: HarnessConfig,
     plan_only: bool = False,
     resume: bool = False,
+    keep_frontend: bool = False,
 ) -> None:
     """Run the full Planner → Generator → Evaluator harness."""
     start = time.time()
@@ -357,6 +438,8 @@ async def run_harness(
         logger.warning("[bold]Resume requested but no checkpoint state was found.[/]")
     else:
         file_comm.reset_run_artifacts()
+        if not keep_frontend:
+            _reset_frontend_dir(workdir)
         logger.info(f"[bold]Harness started[/] — prompt: {user_prompt[:80]}...")
 
     logger.info(f"Workdir: {workdir}")
@@ -476,7 +559,7 @@ async def run_harness(
             evaluate_started_at = time.perf_counter()
             app_stack = await start_app_stack(workdir, harness_dir, config, round_num)
             try:
-                evaluator_result, visual_capture_result = await asyncio.gather(
+                evaluator_result, visual_capture_result = await _gather_or_cancel(
                     run_evaluator(
                         config, file_comm, workdir,
                         round_num=round_num,
@@ -533,7 +616,10 @@ async def run_harness(
             last_verdict = "completed" if recommendation == "complete" else (
                 "accepted_review" if recommendation == "generate_next_sprint" else "failed_review"
             )
-            accepted_sprints = _update_accepted_sprints_after_evaluation(
+            # H6: compute the new accepted_sprints in memory, checkpoint
+            # state with that payload, THEN write the file. If we crash
+            # in the gap, resume reconciles the file from state.
+            next_accepted_sprints = _compute_accepted_sprints_after_evaluation(
                 file_comm,
                 round_num=round_num,
                 sprint_num=sprint_num,
@@ -549,7 +635,20 @@ async def run_harness(
                 current_sprint=sprint_num,
                 generator_mode="repair" if recommendation == "repair" else "generate",
                 last_verdict=last_verdict,
+                accepted_sprints_payload=next_accepted_sprints,
             )
+            file_comm.write_accepted_sprints(next_accepted_sprints)
+            accepted_sprints = next_accepted_sprints
+
+            if cost_tracker.is_over_budget():
+                # Audit M1: evaluate phase fans into evaluator + visual_capture +
+                # visual_score, any of which can spike cost. Without this gate
+                # a single round could run far past max_budget_usd before the
+                # next round's build-phase check noticed.
+                logger.warning(
+                    "[bold red]Budget exceeded after evaluate. Stopping.[/]"
+                )
+                break
 
             if recommendation == "complete":
                 logger.info(f"[bold green]✓ Final sprint accepted in round {round_num}![/]")
@@ -583,3 +682,61 @@ def _print_summary(cost: CostTracker, elapsed: float, rounds: int, success: bool
     logger.info(f"Duration: {elapsed / 60:.1f} min")
     logger.info(f"Rounds: {rounds}")
     logger.info(cost.summary())
+
+
+def _reset_frontend_dir(workdir: Path) -> None:
+    """Wipe ``workdir/frontend/`` before a fresh run.
+
+    Without this, a generator started for a brand new prompt would
+    inherit the previous prompt's frontend and treat it as a baseline
+    to "repair" — see audit M6. ``--keep-frontend`` opts out.
+    """
+    frontend_dir = workdir / "frontend"
+    if not frontend_dir.exists():
+        return
+    if not frontend_dir.is_dir():
+        return
+    shutil.rmtree(frontend_dir)
+    logger.info("[bold]Frontend cleared[/] — pass --keep-frontend to preserve it.")
+
+
+async def _gather_or_cancel(
+    evaluator_coro,
+    visual_capture_coro,
+) -> tuple[Any, Any]:
+    """Run two coroutines concurrently; cancel the sibling on first failure.
+
+    Plain ``asyncio.gather`` propagates the first exception but leaves the
+    other task running until the event loop closes (audit H8): with the
+    visual_capture task still owning a Playwright MCP subprocess, that is
+    a process leak. This helper instead waits for FIRST_EXCEPTION, cancels
+    any pending sibling, awaits its cancellation, then re-raises the
+    original exception so callers see the same error type as before.
+    """
+    evaluator_task = asyncio.create_task(evaluator_coro, name="evaluator")
+    visual_capture_task = asyncio.create_task(visual_capture_coro, name="visual_capture")
+    tasks = {evaluator_task, visual_capture_task}
+
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    except BaseException:
+        # If our wait itself is cancelled (e.g. caller is being cancelled),
+        # propagate cancellation to children before re-raising.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    # Re-raise the first real exception (preserve type, unlike TaskGroup).
+    for task in done:
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+    return evaluator_task.result(), visual_capture_task.result()

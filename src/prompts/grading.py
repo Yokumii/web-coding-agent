@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -52,11 +53,28 @@ CRITERIA: list[GradingCriterion] = [
 
 
 def check_grades(grades: dict) -> bool:
-    """Return True if all criteria pass their thresholds."""
+    """Return True iff every criterion has a real numeric score >= its threshold.
+
+    Robust against malformed agent output: missing keys, non-dict ``criteria``
+    block, non-dict ``score_data``, ``None`` / string / ``bool`` / ``NaN`` /
+    ``inf`` scores all fail closed.
+    """
+    criteria_block = grades.get("criteria") if isinstance(grades, dict) else None
+    if not isinstance(criteria_block, dict):
+        return False
+
     for criterion in CRITERIA:
-        score_data = grades.get("criteria", {}).get(criterion.name)
-        if not score_data:
+        score_data = criteria_block.get(criterion.name)
+        if not isinstance(score_data, dict):
             return False
-        if score_data.get("score", 0) < criterion.threshold:
+        score = score_data.get("score")
+        # bool is a subclass of int in Python; reject it explicitly so that
+        # a stray ``True``/``False`` in the JSON does not satisfy a threshold.
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            return False
+        score_float = float(score)
+        if math.isnan(score_float) or math.isinf(score_float):
+            return False
+        if score_float < criterion.threshold:
             return False
     return True

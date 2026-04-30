@@ -142,12 +142,15 @@ uv run python -m src.main "<prompt>" [options]
 Main options:
 
 - `--workdir`: output directory for the generated app
-- `--plan-only`: only run planner and stop
+- `--plan-only`: only run planner and stop (mutually exclusive with `--resume`)
 - `--max-rounds`: max build/evaluate cycles
-- `--max-budget`: total budget cap in USD
+- `--max-budget`: total budget cap in USD (warns at 80% / 90%, halts at 100%)
 - `--planner-model`: planner model override
 - `--generator-model`: generator model override
 - `--evaluator-model`: evaluator model override
+- `--evaluator-vision-model`: dedicated vision-scorer model override
+- `--frontend-port`: dev server port (default: `FRONTEND_PORT` env or 5173)
+- `--keep-frontend`: do not wipe `workdir/frontend/` on a fresh run
 - `--playwright-headless`: run Playwright MCP headless
 - `--resume`: resume from `.harness/harness_state.json`
 
@@ -248,6 +251,54 @@ The harness currently uses:
 - `src/orchestration/runtime.py`: frontend dev-server process management
 - `src/orchestration/file_comm.py`: shared `.harness/` file bus between agents
 - `src/orchestration/cost_tracker.py`: per-phase cost accounting and budget cap
+
+## Security Model
+
+**The in-process tool gate in `sdk_runner.py` is not a sandbox.** The
+generator runs with Bash access to `node`, `python`, `python3`, `npm`,
+`npx`, `pnpm`, `yarn`, `uv`, `vite`, `tsc`, `pytest`, and `uvicorn`,
+and any one of those is sufficient for arbitrary code execution under
+the user that started the harness — write a script with `Write`, then
+ask for it to be run. The token-level checks in `_validate_bash_command`
+are a *defence in depth against accidents*, not a confinement primitive.
+
+What `sdk_runner.py` *does* enforce, on top of the Claude Agent SDK's
+own `can_use_tool` callback:
+
+- file paths handed to `Read` / `Write` / `Edit` / `MultiEdit` / `Glob`
+  / `Grep` / `LS` must resolve inside `workdir` (no `..`, no absolute
+  paths, no `~` shortcuts);
+- Bash is restricted to a hardcoded executable allowlist;
+- `git` is restricted to `status`, `diff`, `log`, `show`, `add`,
+  `commit`, `rev-parse`, `branch`, `ls-files`, `stash` — no
+  `push`, `clone`, `fetch`, `remote`, `config`, `submodule`, and no
+  flags before the subcommand;
+- `find` rejects `-exec`, `-execdir`, `-delete`, `-fprint*`, `-ok`,
+  `-okdir`, `-print0`, `-fls`;
+- the Playwright MCP browser is only allowed to navigate to
+  `http(s)://{127.0.0.1, localhost, ::1}` on the configured frontend
+  port — `file://`, cloud metadata IPs, and other localhost ports
+  are rejected;
+- the dedicated vision scorer only accepts screenshot paths under
+  `<workdir>/.harness/` with a `.png` suffix;
+- the frontend dev server is launched with a sanitized environment:
+  any var whose name contains `KEY` / `TOKEN` / `SECRET` / `PASSWORD`
+  / `PASSPHRASE` / `CREDENTIAL` or starts with `ANTHROPIC_` /
+  `OPENAI_` / `AWS_` / `AZURE_` / `GOOGLE_` / `GH_` / `GITHUB_` is
+  dropped before `Popen`, so a Vite plugin or generator-written
+  config cannot inline an API key into the bundle.
+
+### Recommended deployment
+
+Treat the harness as you would any other code-running agent: do not
+run it in a workspace that holds credentials, source you do not want
+modified, or workloads that share host with secrets you cannot afford
+to leak. The intended deployment is a disposable container or VM with
+no network access to internal services and no mounted secrets beyond
+the Anthropic API key the harness itself uses. A future iteration may
+add an OS-level confinement layer (Docker, `sandbox-exec`, `bwrap`),
+but until then **no in-process check the harness performs is
+trustworthy against a prompt-injected agent**.
 
 ## Testing
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from src.agents.vision_scorer import (
     _build_anthropic_request,
     _build_chat_completions_url,
@@ -10,6 +12,7 @@ from src.agents.vision_scorer import (
     _extract_anthropic_message_text,
     _extract_openai_message_text,
     _normalize_endpoint_type,
+    _scrub_secrets,
     normalize_visual_review,
 )
 from src.config import HarnessConfig
@@ -117,6 +120,27 @@ def test_extract_anthropic_message_text_reads_text_blocks():
     ) == "{\"ok\": true}"
 
 
+def test_normalize_visual_review_uses_zero_fallback_for_nonnumeric_scores():
+    # Non-numeric / missing scores must collapse to 0.0 so that downstream
+    # check_grades fails closed instead of silently passing at the threshold.
+    normalized = normalize_visual_review(
+        {
+            "phase_result": "pass",
+            "appearance_review": {},
+            "criteria_scores": {
+                "design_quality": {"score": "n/a", "notes": ""},
+                "originality": {"score": None, "notes": ""},
+                "craft": {"score": "bad", "notes": ""},
+            },
+        },
+        [".harness/round_1_home.png"],
+    )
+
+    assert normalized["criteria_scores"]["design_quality"]["score"] == 0.0
+    assert normalized["criteria_scores"]["originality"]["score"] == 0.0
+    assert normalized["criteria_scores"]["craft"]["score"] == 0.0
+
+
 def test_normalize_visual_review_clamps_values_and_preserves_screenshots():
     normalized = normalize_visual_review(
         {
@@ -147,3 +171,101 @@ def test_normalize_visual_review_clamps_values_and_preserves_screenshots():
     assert normalized["criteria_scores"]["design_quality"]["score"] == 10.0
     assert normalized["criteria_scores"]["originality"]["score"] == 0.0
     assert normalized["criteria_scores"]["craft"]["score"] == 6.3
+
+
+# --- Batch 5 (H4): screenshot path validation ---
+
+
+def test_build_anthropic_request_rejects_path_traversal_in_screenshot(tmp_path: Path):
+    (tmp_path / ".harness").mkdir()
+    config = HarnessConfig(
+        evaluator_vision_model="claude",
+        evaluator_vision_api_key="x",
+        evaluator_vision_base_url="https://api.anthropic.com",
+        evaluator_vision_endpoint_type="anthropic",
+    )
+    with pytest.raises(ValueError, match="escapes workdir|outside"):
+        _build_anthropic_request(
+            config=config,
+            workdir=tmp_path,
+            screenshot_paths=["../../../etc/passwd"],
+            review_context="x",
+        )
+
+
+def test_build_anthropic_request_rejects_non_png_extension(tmp_path: Path):
+    harness_dir = tmp_path / ".harness"
+    harness_dir.mkdir()
+    (harness_dir / "credentials").write_bytes(b"data")
+    config = HarnessConfig(
+        evaluator_vision_model="claude",
+        evaluator_vision_api_key="x",
+        evaluator_vision_base_url="https://api.anthropic.com",
+        evaluator_vision_endpoint_type="anthropic",
+    )
+    with pytest.raises(ValueError, match="\\.png"):
+        _build_anthropic_request(
+            config=config,
+            workdir=tmp_path,
+            screenshot_paths=[".harness/credentials"],
+            review_context="x",
+        )
+
+
+def test_build_anthropic_request_rejects_screenshot_outside_harness_dir(tmp_path: Path):
+    (tmp_path / ".harness").mkdir()
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "logo.png").write_bytes(b"png")
+    config = HarnessConfig(
+        evaluator_vision_model="claude",
+        evaluator_vision_api_key="x",
+        evaluator_vision_base_url="https://api.anthropic.com",
+        evaluator_vision_endpoint_type="anthropic",
+    )
+    with pytest.raises(ValueError, match="\\.harness"):
+        _build_anthropic_request(
+            config=config,
+            workdir=tmp_path,
+            screenshot_paths=["frontend/logo.png"],
+            review_context="x",
+        )
+
+
+def test_build_openai_request_also_validates_screenshot_path(tmp_path: Path):
+    (tmp_path / ".harness").mkdir()
+    config = HarnessConfig(
+        evaluator_vision_model="gpt",
+        evaluator_vision_api_key="x",
+        evaluator_vision_base_url="https://api.openai.com",
+        evaluator_vision_endpoint_type="openai",
+    )
+    with pytest.raises(ValueError, match="escapes workdir|outside"):
+        _build_openai_request(
+            config=config,
+            workdir=tmp_path,
+            screenshot_paths=["../../etc/hosts"],
+            review_context="x",
+        )
+
+
+# --- Batch 5 (M11): scrub secrets from upstream error detail ---
+
+
+def test_scrub_secrets_redacts_anthropic_api_key():
+    detail = "Auth failed for x-api-key: sk-ant-abc1234567890_-XYZ"
+    scrubbed = _scrub_secrets(detail)
+    assert "sk-ant-abc1234567890_-XYZ" not in scrubbed
+    assert "***" in scrubbed
+
+
+def test_scrub_secrets_redacts_bearer_token():
+    detail = "Forbidden — Bearer eyJhbGc.payload.sig"
+    scrubbed = _scrub_secrets(detail)
+    assert "eyJhbGc.payload.sig" not in scrubbed
+    assert "***" in scrubbed
+
+
+def test_scrub_secrets_truncates_long_input():
+    detail = "x" * 4096
+    scrubbed = _scrub_secrets(detail, limit=512)
+    assert len(scrubbed) <= 512 + len("...[truncated]")

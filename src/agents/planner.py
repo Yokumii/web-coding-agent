@@ -249,7 +249,88 @@ def _validate_planning_bundle(file_comm: FileComm) -> dict[str, Any]:
     if not progress.strip():
         raise RuntimeError("Planner completed without writing .harness/progress.md.")
 
+    _validate_planning_cross_references(
+        feature_list=feature_list,
+        sprint_plan=sprint_plan,
+        verification_plan=verification_plan,
+    )
+
     return sprint_plan
+
+
+def _validate_planning_cross_references(
+    *,
+    feature_list: dict[str, Any],
+    sprint_plan: dict[str, Any],
+    verification_plan: dict[str, Any],
+) -> None:
+    """Catch dangling references across the three plan files (audit M12).
+
+    A planner that wrote individually-valid files but referenced a
+    feature_id that does not exist in feature_list, or assigned a
+    feature to a sprint number outside ``total_sprints``, would have
+    passed the per-file validators above. The evaluator and generator
+    later degrade silently in that situation (``feature_id="unknown"``,
+    repair with no direction). Catch it at planner boundary instead.
+    """
+    feature_ids: set[str] = {
+        str(feature["id"])
+        for feature in feature_list["features"]
+        if isinstance(feature, dict) and feature.get("id")
+    }
+    total_sprints = int(sprint_plan["total_sprints"])
+    valid_sprint_numbers = set(range(1, total_sprints + 1))
+
+    # 1. feature.sprint must point inside the sprint range.
+    for feature in feature_list["features"]:
+        if not isinstance(feature, dict):
+            continue
+        sprint_num = feature.get("sprint")
+        if not isinstance(sprint_num, int) or sprint_num not in valid_sprint_numbers:
+            raise RuntimeError(
+                f"Planner cross-ref failed: feature {feature.get('id')!r} is "
+                f"assigned to sprint {sprint_num!r} which is outside "
+                f"1..{total_sprints}."
+            )
+
+    # 2. sprint_plan must declare every sprint number 1..total_sprints exactly once.
+    declared_sprint_numbers = [
+        sprint.get("number")
+        for sprint in sprint_plan["sprints"]
+        if isinstance(sprint, dict)
+    ]
+    if sorted(n for n in declared_sprint_numbers if isinstance(n, int)) != sorted(valid_sprint_numbers):
+        raise RuntimeError(
+            "Planner cross-ref failed: sprint_plan.sprints must declare each "
+            f"sprint number 1..{total_sprints} exactly once; got "
+            f"{declared_sprint_numbers}."
+        )
+
+    # 3. sprint.feature_ids ⊆ feature_list.
+    for sprint in sprint_plan["sprints"]:
+        if not isinstance(sprint, dict):
+            continue
+        for feature_id in sprint.get("feature_ids", []) or []:
+            if str(feature_id) not in feature_ids:
+                raise RuntimeError(
+                    f"Planner cross-ref failed: sprint {sprint.get('number')} "
+                    f"references unknown feature_id {feature_id!r}."
+                )
+
+    # 4. ui_verification_plan checks must reference real features.
+    for sprint in verification_plan["sprints"]:
+        if not isinstance(sprint, dict):
+            continue
+        for check in sprint.get("checks", []) or []:
+            if not isinstance(check, dict):
+                continue
+            ref_id = check.get("feature_id")
+            if str(ref_id) not in feature_ids:
+                raise RuntimeError(
+                    f"Planner cross-ref failed: ui_verification_plan check "
+                    f"{check.get('id')!r} references unknown feature_id "
+                    f"{ref_id!r}."
+                )
 
 
 def _initialize_accepted_sprints(file_comm: FileComm, sprint_plan: dict[str, Any]) -> None:

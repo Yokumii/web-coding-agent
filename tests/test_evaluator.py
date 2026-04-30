@@ -313,3 +313,99 @@ def test_determine_passed_rejects_failed_critical_exit_criterion_without_overall
 
     assert _determine_passed(grades) is False
 
+
+# --- Batch 2 (M13): tri-state robustness against agent-written strings ---
+
+
+@pytest.mark.parametrize("critical_value", [True, "true", "True", "TRUE", "yes", 1])
+def test_determine_passed_rejects_truthy_string_critical_with_failing_ui_check(critical_value):
+    grades = _passing_grades(1)
+    grades.pop("overall_passed")
+    grades["ui_checks"][0]["critical"] = critical_value
+    grades["ui_checks"][0]["status"] = "fail"
+
+    assert _determine_passed(grades) is False
+
+
+@pytest.mark.parametrize("passed_value", [False, "false", "False", "no", 0])
+def test_determine_passed_rejects_falsey_string_passed_on_critical_exit_criterion(passed_value):
+    grades = _passing_grades(1)
+    grades.pop("overall_passed")
+    grades["target_exit_criteria_results"][0]["critical"] = True
+    grades["target_exit_criteria_results"][0]["passed"] = passed_value
+
+    assert _determine_passed(grades) is False
+
+
+@pytest.mark.parametrize("overall_value", ["false", "False", "no", 0])
+def test_determine_passed_treats_falsey_string_overall_as_fail(overall_value):
+    grades = _passing_grades(1)
+    grades["overall_passed"] = overall_value
+
+    assert _determine_passed(grades) is False
+
+
+@pytest.mark.parametrize("sprint_value", ["false", "False", "no", 0])
+def test_determine_passed_treats_falsey_string_sprint_passed_as_fail(sprint_value):
+    grades = _passing_grades(1)
+    grades.pop("overall_passed")
+    grades["sprint_passed"] = sprint_value
+
+    assert _determine_passed(grades) is False
+
+
+def test_determine_passed_accepts_status_failed_synonym_on_critical_check():
+    grades = _passing_grades(1)
+    grades.pop("overall_passed")
+    grades["ui_checks"][0]["status"] = "FAILED"
+
+    assert _determine_passed(grades) is False
+
+
+# --- Batch 2 (M14): grade extraction picks the right JSON among multiples ---
+
+
+def test_extract_grades_from_response_picks_grade_among_explanatory_objects():
+    text = (
+        "I had to retry once. Here is my reasoning:\n"
+        '{"explanation": "first attempt failed", "retry": true}\n'
+        "Final grade JSON for grade_round_4.json:\n"
+        '{"round": 4, "criteria": {"design_quality": {"score": 7.0, "passed": true},'
+        ' "functionality": {"score": 8.0, "passed": true},'
+        ' "originality": {"score": 6.0, "passed": true},'
+        ' "craft": {"score": 7.0, "passed": true}},'
+        ' "phase_results": {"render_gate": "pass"}}'
+    )
+    response = SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+
+    extracted = _extract_grades_from_response(response)
+
+    assert extracted is not None
+    assert extracted["round"] == 4
+    assert extracted["criteria"]["design_quality"]["score"] == 7.0
+    # Must NOT have picked the explanatory object.
+    assert "explanation" not in extracted
+
+
+def test_extract_grades_from_response_returns_none_when_only_noise_objects():
+    text = '{"explanation": "no grade yet"}\n{"another": "non-grade"}'
+    response = SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+
+    assert _extract_grades_from_response(response) is None
+
+
+def test_extract_grades_from_response_handles_truncated_trailing_json():
+    # A common LLM failure: max_tokens cuts the JSON mid-write.
+    text = (
+        '{"round": 1, "criteria": {"design_quality": {"score": 7.0, "passed": true},'
+        ' "functionality": {"score": 8.0, "passed": true},'
+        ' "originality": {"score": 6.0, "passed": true},'
+        ' "craft": {"score": 7.0, "passed": true}}}\n'
+        '{"truncated": "missin'  # <- truncated here, no closing
+    )
+    response = SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+
+    extracted = _extract_grades_from_response(response)
+    assert extracted is not None
+    assert extracted["round"] == 1
+

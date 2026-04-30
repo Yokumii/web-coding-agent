@@ -128,7 +128,10 @@ async def start_app_stack(
 
     processes: list[ManagedProcess] = []
     try:
-        ensure_port_available(config.frontend_port)
+        # ensure_port_available may sleep up to several seconds while waiting
+        # for a stale dev server to release the port. Run it in a worker thread
+        # so it does not block the async event loop (M2).
+        await asyncio.to_thread(ensure_port_available, config.frontend_port)
         frontend = start_process(
             name="frontend",
             command=build_frontend_command(frontend_dir, config.frontend_port),
@@ -164,8 +167,7 @@ def start_process(
     log_path: Path,
 ) -> ManagedProcess:
     log_file = log_path.open("w", encoding="utf-8")
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+    env = _build_subprocess_env()
     process = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -174,9 +176,68 @@ def start_process(
         stdout=log_file,
         stderr=subprocess.STDOUT,
         text=True,
+        # New POSIX session so we own the process group and stop_process
+        # can SIGTERM/SIGKILL the whole tree (vite/esbuild/worker children
+        # of `pnpm dev` would otherwise orphan; see audit H7).
+        start_new_session=True,
     )
     logger.info(f"[bold]Starting {name}[/] — {' '.join(command)}")
     return ManagedProcess(name=name, process=process, log_path=log_path, log_file=log_file)
+
+
+# Tokens whose presence anywhere in an env var name should keep that
+# variable out of the dev server's environment (audit H2).
+_SENSITIVE_ENV_TOKENS = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSPHRASE",
+    "CREDENTIAL",
+)
+# Provider-specific prefixes that are always blocked. Anything starting
+# with one of these is treated as sensitive even if the suffix doesn't
+# match the token list (e.g. ANTHROPIC_BASE_URL is not "secret" by name
+# but still tells an attacker which endpoint to talk to).
+_SENSITIVE_ENV_PREFIXES = (
+    "ANTHROPIC_",
+    "OPENAI_",
+    "AWS_",
+    "AZURE_",
+    "GOOGLE_",
+    "GH_",
+    "GITHUB_",
+)
+
+
+def _is_sensitive_env_name(name: str) -> bool:
+    upper = name.upper()
+    if any(token in upper for token in _SENSITIVE_ENV_TOKENS):
+        return True
+    if any(upper.startswith(prefix) for prefix in _SENSITIVE_ENV_PREFIXES):
+        return True
+    return False
+
+
+def _build_subprocess_env() -> dict[str, str]:
+    """Strip secrets out of os.environ before handing it to the dev server.
+
+    A frontend dev server is fully under the generator's control. Vite's
+    define plugin or any third-party plugin can inline ``process.env``
+    into the bundle, after which an evaluator screenshot or
+    visual_capture HTML dump would exfiltrate the secret. We therefore
+    drop any env var whose name looks key/token/secret-shaped (audit
+    H2). The list is a deny-pattern rather than an allowlist because an
+    allowlist breaks legit npm scripts that depend on locale, proxy,
+    editor, or CI signals.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not _is_sensitive_env_name(name)
+    }
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
 
 
 async def wait_for_http(
@@ -219,13 +280,44 @@ def fetch_status_code(url: str) -> int:
 
 
 async def stop_process(managed: ManagedProcess) -> None:
+    process = managed.process
     try:
-        if managed.process.poll() is None:
-            managed.process.terminate()
+        if process.poll() is None:
+            _signal_process_tree(process, signal.SIGTERM)
             try:
-                await asyncio.to_thread(managed.process.wait, 5)
+                await asyncio.to_thread(process.wait, 5)
             except subprocess.TimeoutExpired:
-                managed.process.kill()
-                await asyncio.to_thread(managed.process.wait, 5)
+                _signal_process_tree(process, signal.SIGKILL)
+                await asyncio.to_thread(process.wait, 5)
     finally:
         managed.log_file.close()
+
+
+def _signal_process_tree(process: subprocess.Popen[str], sig: int) -> None:
+    """Signal the leader's whole process group.
+
+    `start_process` launches in a new POSIX session so the process and
+    its descendants share a process group (the leader's PID). Signalling
+    the group cleans up children that `pnpm dev` / `npm run dev`
+    routinely fork (vite, esbuild, workers). Falls back to signalling
+    just the leader if we lost the group somehow.
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+
+    if pgid is not None:
+        try:
+            os.killpg(pgid, sig)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    try:
+        if sig == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
