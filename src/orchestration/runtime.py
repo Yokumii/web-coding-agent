@@ -130,7 +130,7 @@ async def start_app_stack(
     try:
         # ensure_port_available may sleep up to several seconds while waiting
         # for a stale dev server to release the port. Run it in a worker thread
-        # so it does not block the async event loop (M2).
+        # so it does not block the async event loop.
         await asyncio.to_thread(ensure_port_available, config.frontend_port)
         frontend = start_process(
             name="frontend",
@@ -178,7 +178,7 @@ def start_process(
         text=True,
         # New POSIX session so we own the process group and stop_process
         # can SIGTERM/SIGKILL the whole tree (vite/esbuild/worker children
-        # of `pnpm dev` would otherwise orphan; see audit H7).
+        # of `pnpm dev` would otherwise orphan).
         start_new_session=True,
     )
     logger.info(f"[bold]Starting {name}[/] — {' '.join(command)}")
@@ -186,7 +186,7 @@ def start_process(
 
 
 # Tokens whose presence anywhere in an env var name should keep that
-# variable out of the dev server's environment (audit H2).
+# variable out of the dev server's environment.
 _SENSITIVE_ENV_TOKENS = (
     "KEY",
     "TOKEN",
@@ -226,10 +226,10 @@ def _build_subprocess_env() -> dict[str, str]:
     define plugin or any third-party plugin can inline ``process.env``
     into the bundle, after which an evaluator screenshot or
     visual_capture HTML dump would exfiltrate the secret. We therefore
-    drop any env var whose name looks key/token/secret-shaped (audit
-    H2). The list is a deny-pattern rather than an allowlist because an
-    allowlist breaks legit npm scripts that depend on locale, proxy,
-    editor, or CI signals.
+    drop any env var whose name looks key/token/secret-shaped. The list
+    is a deny-pattern rather than an allowlist because an allowlist
+    breaks legit npm scripts that depend on locale, proxy, editor, or
+    CI signals.
     """
     env = {
         name: value

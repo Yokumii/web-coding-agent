@@ -39,7 +39,7 @@ def test_build_config_cli_models_override_environment(monkeypatch):
     assert config.evaluator_model == "evaluator-cli"
 
 
-# --- Batch 6 (M3): frontend port now configurable via env + CLI ---
+# --- frontend port configurable via env + CLI ---
 
 
 def test_build_config_default_frontend_port():
@@ -64,7 +64,7 @@ def test_build_config_frontend_port_cli_overrides_env(monkeypatch):
     assert config.frontend_port == 9999
 
 
-# --- Batch 6 (M4): --plan-only and --resume must be mutually exclusive ---
+# --- --plan-only and --resume must be mutually exclusive ---
 
 
 def test_cli_rejects_plan_only_with_resume():
@@ -74,7 +74,7 @@ def test_cli_rejects_plan_only_with_resume():
         )
 
 
-# --- Batch 8 (L4): expose evaluator_vision_model on the CLI ---
+# --- expose evaluator_vision_model on the CLI ---
 
 
 def test_build_config_evaluator_vision_model_default_uses_evaluator_model(monkeypatch):

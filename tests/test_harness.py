@@ -924,7 +924,7 @@ async def test_fresh_run_clears_stale_harness_artifacts(monkeypatch, tmp_path: P
     assert not (traces_dir / "planner.jsonl").exists()
 
 
-# --- Batch 3 (H8): evaluator failure must cancel the visual_capture sibling ---
+# --- evaluator failure must cancel the visual_capture sibling ---
 
 
 @pytest.mark.anyio
@@ -999,14 +999,15 @@ async def test_evaluator_failure_cancels_visual_capture_and_closes_stack(
     assert stack.closed is True
 
 
-# --- Batch 4 (H6): resume must trust state when accepted_sprints.json is stale ---
+# --- resume must trust state when accepted_sprints.json is stale ---
 
 
 @pytest.mark.anyio
 async def test_resume_reconciles_advanced_accepted_sprints_against_build_checkpoint(
     monkeypatch, tmp_path: Path
 ):
-    """Audit H6 scenario.
+    """Resume must reconcile a stale accepted_sprints.json from the
+    checkpoint state.
 
     With the old (file-first, state-second) write order, a crash between
     the two writes left ``accepted_sprints.json`` advanced to sprint N+1
@@ -1225,7 +1226,7 @@ async def test_evaluate_checkpoint_is_written_before_accepted_sprints_file(
     )
 
 
-# --- Batch 6 (M1): budget gate after evaluate three-phase block ---
+# --- budget gate after evaluate three-phase block ---
 
 
 @pytest.mark.anyio
@@ -1317,7 +1318,7 @@ async def test_budget_check_after_evaluate_stops_subsequent_rounds(
     )
 
 
-# --- Batch 6 (M6): fresh run clears workdir/frontend by default ---
+# --- fresh run clears workdir/frontend by default ---
 
 
 @pytest.mark.anyio

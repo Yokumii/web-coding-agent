@@ -74,7 +74,7 @@ _ALLOWED_BASH_COMMANDS = {
 }
 
 # git subcommands the harness accepts. Anything that mutates remotes,
-# config, or pulls foreign code is blocked (audit M7).
+# config, or pulls foreign code is blocked.
 _GIT_ALLOWED_SUBCOMMANDS = frozenset({
     "status",
     "diff",
@@ -89,7 +89,7 @@ _GIT_ALLOWED_SUBCOMMANDS = frozenset({
 })
 
 # find flags that turn the binary into an arbitrary executor or a
-# destructive bulk delete (audit M8). `-print0` and `-fls` also stream
+# destructive bulk delete. `-print0` and `-fls` also stream
 # arbitrary content into outputs we don't want to expose.
 _FORBIDDEN_FIND_FLAGS = frozenset({
     "-exec",
@@ -106,8 +106,7 @@ _FORBIDDEN_FIND_FLAGS = frozenset({
 
 # Hosts that the playwright MCP browser may navigate to. Anything else
 # (file://, private network ranges, cloud metadata) is denied to keep
-# a prompt-injected evaluator from doing SSRF or local file reads
-# (audit H3).
+# a prompt-injected evaluator from doing SSRF or local file reads.
 _PLAYWRIGHT_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _PLAYWRIGHT_URL_KEYS = frozenset({"url", "urls"})
 

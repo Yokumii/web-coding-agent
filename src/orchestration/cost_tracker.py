@@ -28,8 +28,7 @@ class CostTracker:
         per harness run for a successful phase, so a repeat ``add`` for
         the same key means we are re-running the phase on resume. Using
         replace-semantics avoids double-counting between the cost
-        restored from the previous state file and the fresh re-run cost
-        (audit M5).
+        restored from the previous state file and the fresh re-run cost.
         """
         self.breakdown[agent_name] = cost_usd
         self.total_cost = sum(self.breakdown.values())
@@ -38,7 +37,7 @@ class CostTracker:
     def _maybe_warn_budget(self) -> None:
         """Emit a one-shot warning when total cost crosses 80% / 90%
         of ``max_budget``. ``is_over_budget`` (>=100%) is enforced by
-        the harness loop separately (audit L1).
+        the harness loop separately.
         """
         if self.max_budget <= 0:
             return

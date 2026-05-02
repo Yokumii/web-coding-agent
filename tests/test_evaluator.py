@@ -314,7 +314,7 @@ def test_determine_passed_rejects_failed_critical_exit_criterion_without_overall
     assert _determine_passed(grades) is False
 
 
-# --- Batch 2 (M13): tri-state robustness against agent-written strings ---
+# --- tri-state robustness against agent-written strings ---
 
 
 @pytest.mark.parametrize("critical_value", [True, "true", "True", "TRUE", "yes", 1])
@@ -362,7 +362,7 @@ def test_determine_passed_accepts_status_failed_synonym_on_critical_check():
     assert _determine_passed(grades) is False
 
 
-# --- Batch 2 (M14): grade extraction picks the right JSON among multiples ---
+# --- grade extraction picks the right JSON among multiples ---
 
 
 def test_extract_grades_from_response_picks_grade_among_explanatory_objects():

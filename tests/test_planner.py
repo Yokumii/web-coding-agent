@@ -325,7 +325,7 @@ def test_normalize_spec_candidate_rejects_chatty_fallback():
     ) == ""
 
 
-# --- Batch 7 (M12): cross-ref consistency between the three plan files ---
+# --- cross-ref consistency between the three plan files ---
 
 
 def _seed_valid_bundle(file_comm: FileComm) -> None:

@@ -164,7 +164,7 @@ async def test_start_app_stack_requires_only_frontend(monkeypatch, tmp_path: Pat
     ]
 
 
-# --- Batch 3 (H7): Popen / stop signal the whole process group ---
+# --- Popen / stop signal the whole process group ---
 
 
 def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
@@ -281,7 +281,7 @@ async def test_stop_process_escalates_to_sigkill_after_timeout(monkeypatch, tmp_
     assert ("killpg", 7777, signal.SIGKILL) in sent
 
 
-# --- Batch 5 (H2): dev server env must not leak API keys / tokens ---
+# --- dev server env must not leak API keys / tokens ---
 
 
 def test_start_process_strips_sensitive_env_vars(monkeypatch, tmp_path: Path):

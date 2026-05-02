@@ -241,7 +241,7 @@ async def test_generator_raises_when_expected_dirs_are_missing(monkeypatch, tmp_
     assert "I created some files elsewhere." in file_comm.read_build_log()
 
 
-# --- Batch 2 (M15): empty frontend dir must not be treated as success ---
+# --- empty frontend dir must not be treated as success ---
 
 
 @pytest.mark.anyio
@@ -281,7 +281,7 @@ async def test_generator_raises_when_frontend_dir_is_empty(monkeypatch, tmp_path
         )
 
 
-# --- Batch 2 (M16): repair mode must not silently degrade to no-direction generate ---
+# --- repair mode must not silently degrade to no-direction generate ---
 
 
 @pytest.mark.anyio

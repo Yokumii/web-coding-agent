@@ -18,7 +18,7 @@ _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 
 # Patterns that look like API credentials in upstream error bodies. We
-# do NOT want these in trace files or harness logs (audit M11).
+# do NOT want these in trace files or harness logs.
 _SECRET_REGEX = re.compile(
     r"(sk-[A-Za-z0-9_\-]{6,}|Bearer\s+[A-Za-z0-9._\-]+|x-api-key:\s*\S+)",
     re.IGNORECASE,
@@ -45,7 +45,7 @@ def _validate_screenshot_path(relative_path: str, workdir: Path) -> Path:
     Without this, a manifest written by a compromised visual_capture
     agent could point at arbitrary files (``.aws/credentials`` etc.)
     which the vision scorer would then base64-encode and POST to the
-    external vision endpoint (audit H4).
+    external vision endpoint.
     """
     candidate = Path(relative_path)
     if candidate.is_absolute():
@@ -173,7 +173,7 @@ def _coerce_score(value: Any, fallback: float) -> float:
 
     Non-numeric / NaN / inf values fall back to ``fallback``. Callers in the
     vision pipeline pass ``fallback=0.0`` so that malformed responses fail
-    closed (see reviews/2026-05-04-full-audit.md, H5).
+    closed.
     """
     # bool is a subclass of int in Python; treat it as non-numeric here.
     if isinstance(value, bool) or not isinstance(value, (int, float)):

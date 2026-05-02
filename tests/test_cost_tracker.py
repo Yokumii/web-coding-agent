@@ -1,10 +1,10 @@
 """Tests for the cost tracker.
 
-Added in Batch 4 to cover M5 (audit 2026-05-04): on resume the harness
-re-runs phases that were interrupted, but the previous cost_tracker
-implementation accumulated values per agent name. That meant the cost
-restored from state plus the cost of the re-run got summed, leading to
-double-counted phase costs and a budget gate that gradually loosened.
+On resume the harness re-runs phases that were interrupted, but a prior
+cost_tracker implementation accumulated values per agent name. That
+meant the cost restored from state plus the cost of the re-run got
+summed, leading to double-counted phase costs and a budget gate that
+gradually loosened.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def test_cost_tracker_budget_gate_uses_replaced_total():
     assert tracker.remaining() == pytest.approx(0.8)
 
 
-# --- Batch 8 (L1): warn as we approach the budget cap ---
+# --- warn as we approach the budget cap ---
 
 
 def test_cost_tracker_warns_at_eighty_percent(caplog):

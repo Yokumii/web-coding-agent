@@ -264,7 +264,7 @@ def _validate_planning_cross_references(
     sprint_plan: dict[str, Any],
     verification_plan: dict[str, Any],
 ) -> None:
-    """Catch dangling references across the three plan files (audit M12).
+    """Catch dangling references across the three plan files.
 
     A planner that wrote individually-valid files but referenced a
     feature_id that does not exist in feature_list, or assigned a

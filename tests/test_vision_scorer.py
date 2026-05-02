@@ -173,7 +173,7 @@ def test_normalize_visual_review_clamps_values_and_preserves_screenshots():
     assert normalized["criteria_scores"]["craft"]["score"] == 6.3
 
 
-# --- Batch 5 (H4): screenshot path validation ---
+# --- screenshot path validation ---
 
 
 def test_build_anthropic_request_rejects_path_traversal_in_screenshot(tmp_path: Path):
@@ -248,7 +248,7 @@ def test_build_openai_request_also_validates_screenshot_path(tmp_path: Path):
         )
 
 
-# --- Batch 5 (M11): scrub secrets from upstream error detail ---
+# --- scrub secrets from upstream error detail ---
 
 
 def test_scrub_secrets_redacts_anthropic_api_key():

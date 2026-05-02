@@ -62,7 +62,7 @@ async def test_permission_callback_allows_playwright_mcp(tmp_path: Path):
     assert result.behavior == "allow"
 
 
-# --- Batch 5 (H3): playwright URL allowlist ---
+# --- playwright URL allowlist ---
 
 
 @pytest.mark.anyio
@@ -129,7 +129,7 @@ async def test_permission_callback_allows_playwright_loopback_with_correct_port(
     assert result.behavior == "allow"
 
 
-# --- Batch 5 (M7): git subcommand allowlist ---
+# --- git subcommand allowlist ---
 
 
 @pytest.mark.anyio
@@ -189,7 +189,7 @@ async def test_permission_callback_denies_git_flag_before_subcommand(tmp_path: P
     assert result.behavior == "deny"
 
 
-# --- Batch 5 (M8): find -exec / -delete ---
+# --- find -exec / -delete ---
 
 
 @pytest.mark.anyio

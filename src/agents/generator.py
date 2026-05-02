@@ -176,8 +176,8 @@ def _build_repair_prompt(
     if previous_grades is None:
         # Without the previous grade JSON the repair prompt has no failed
         # checks / criteria to reference and would degrade into a no-direction
-        # generate (see reviews/2026-05-04-full-audit.md, M16). Fail loudly so
-        # the harness can decide whether to fall back to mode=generate or abort.
+        # generate. Fail loudly so the harness can decide whether to fall
+        # back to mode=generate or abort.
         raise RuntimeError(
             f"Generator repair mode requires .harness/grade_round_{feedback_round}.json "
             f"from the previous round, but it was not found. The previous round may "

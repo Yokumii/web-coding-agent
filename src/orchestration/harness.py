@@ -40,7 +40,7 @@ def _save_checkpoint(
     dict that *should* be on disk after this checkpoint. The harness now
     writes the checkpoint BEFORE rewriting ``accepted_sprints.json`` so
     that, if a crash happens between the two writes, resume can
-    reconcile the file from the checkpoint (audit H6). For phases that
+    reconcile the file from the checkpoint. For phases that
     do not change ``accepted_sprints.json`` (plan / build), pass ``None``
     and the existing file is read back into the checkpoint.
     """
@@ -154,7 +154,7 @@ def _update_accepted_sprints_after_evaluation(
 
     New code computes the next state in memory via
     ``_compute_accepted_sprints_after_evaluation`` so that the checkpoint
-    can be written first and the file second (audit H6).
+    can be written first and the file second.
     """
     next_state = _compute_accepted_sprints_after_evaluation(
         file_comm,
@@ -318,7 +318,7 @@ def _apply_post_evaluation_feature_statuses(
 def _restore_resume_state(file_comm: FileComm, existing_state: dict[str, Any]) -> None:
     """Reconcile ``accepted_sprints.json`` with the resumed checkpoint.
 
-    Two cases (audit H6):
+    Two cases:
 
     1. Checkpoints written by the new code carry the full
        ``accepted_sprints_payload``. If the file disagrees with that
@@ -616,7 +616,7 @@ async def run_harness(
             last_verdict = "completed" if recommendation == "complete" else (
                 "accepted_review" if recommendation == "generate_next_sprint" else "failed_review"
             )
-            # H6: compute the new accepted_sprints in memory, checkpoint
+            # Compute the new accepted_sprints in memory, checkpoint
             # state with that payload, THEN write the file. If we crash
             # in the gap, resume reconciles the file from state.
             next_accepted_sprints = _compute_accepted_sprints_after_evaluation(
@@ -641,7 +641,7 @@ async def run_harness(
             accepted_sprints = next_accepted_sprints
 
             if cost_tracker.is_over_budget():
-                # Audit M1: evaluate phase fans into evaluator + visual_capture +
+                # Evaluate phase fans into evaluator + visual_capture +
                 # visual_score, any of which can spike cost. Without this gate
                 # a single round could run far past max_budget_usd before the
                 # next round's build-phase check noticed.
@@ -689,7 +689,7 @@ def _reset_frontend_dir(workdir: Path) -> None:
 
     Without this, a generator started for a brand new prompt would
     inherit the previous prompt's frontend and treat it as a baseline
-    to "repair" — see audit M6. ``--keep-frontend`` opts out.
+    to "repair". ``--keep-frontend`` opts out.
     """
     frontend_dir = workdir / "frontend"
     if not frontend_dir.exists():
@@ -707,7 +707,7 @@ async def _gather_or_cancel(
     """Run two coroutines concurrently; cancel the sibling on first failure.
 
     Plain ``asyncio.gather`` propagates the first exception but leaves the
-    other task running until the event loop closes (audit H8): with the
+    other task running until the event loop closes: with the
     visual_capture task still owning a Playwright MCP subprocess, that is
     a process leak. This helper instead waits for FIRST_EXCEPTION, cancels
     any pending sibling, awaits its cancellation, then re-raises the

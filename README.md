@@ -133,6 +133,55 @@ uv run python -m src.main "Build a bold counter app with increment and decrement
   --playwright-headless
 ```
 
+## Running in Docker
+
+A containerised runner is provided for isolated, reproducible runs. The container enforces an OS-level sandbox on top of the in-process tool gate: non-root user, read-only root filesystem, dropped Linux capabilities, no-new-privileges, pids / memory / cpu limits, and a loopback-only port binding for the dev server.
+
+Requirements: Docker 24+ with the v2 `compose` plugin, and an `ANTHROPIC_API_KEY` in `.env` or the host environment (the container only forwards env vars that are actually set on the host).
+
+Common flows via the `Makefile`:
+
+```bash
+# Build the image (once, cached after).
+make build
+
+# Run the test suite inside the container.
+make test
+
+# Planner-only smoke run; output appears on the host at ./workdir/.harness/.
+make plan-only PROMPT="Build a bold counter app"
+
+# Full build-evaluate cycle, headless Playwright.
+make run PROMPT="Build a bold counter app"
+
+# Point the harness output at a different host directory:
+make run PROMPT="Build a bold counter app" WORKDIR=./e2e-counter
+
+# Drop into a bash shell inside the image (useful for ad-hoc debugging).
+make shell
+
+# Remove the built image.
+make clean
+```
+
+The host path bound to `/app/workdir` inside the container is controlled by the `WORKDIR` make variable (default `./workdir`). Any file the harness writes — the generated `frontend/` tree, planner spec, sprint plan, round grades, traces — appears on the host immediately and is editable while the container is running, which is useful for hand-editing the generated frontend and letting the evaluator re-grade it.
+
+To run without `make`:
+
+```bash
+docker compose run --rm harness "Build a bold counter app" \
+  --workdir /app/workdir --plan-only
+```
+
+Override the workdir by exporting the compose variable first:
+
+```bash
+HARNESS_WORKDIR=./e2e-counter docker compose run --rm harness \
+  "Build a bold counter app" --workdir /app/workdir --playwright-headless
+```
+
+The frontend dev server is published to `127.0.0.1:5173` on the host only, so a browser on the host can visit `http://127.0.0.1:5173` while the container is running but nothing on the LAN can reach it. To use a different port you must change both the `--frontend-port` CLI flag and the `ports:` line in `docker-compose.yml`.
+
 ## CLI
 
 ```bash
@@ -254,51 +303,21 @@ The harness currently uses:
 
 ## Security Model
 
-**The in-process tool gate in `sdk_runner.py` is not a sandbox.** The
-generator runs with Bash access to `node`, `python`, `python3`, `npm`,
-`npx`, `pnpm`, `yarn`, `uv`, `vite`, `tsc`, `pytest`, and `uvicorn`,
-and any one of those is sufficient for arbitrary code execution under
-the user that started the harness — write a script with `Write`, then
-ask for it to be run. The token-level checks in `_validate_bash_command`
-are a *defence in depth against accidents*, not a confinement primitive.
+**The in-process tool gate in `sdk_runner.py` is not a sandbox.** The generator runs with Bash access to `node`, `python`, `python3`, `npm`, `npx`, `pnpm`, `yarn`, `uv`, `vite`, `tsc`, `pytest`, and `uvicorn`, and any one of those is sufficient for arbitrary code execution under the user that started the harness — write a script with `Write`, then ask for it to be run. The token-level checks in `_validate_bash_command` are a *defence in depth against accidents*, not a confinement primitive.
 
-What `sdk_runner.py` *does* enforce, on top of the Claude Agent SDK's
-own `can_use_tool` callback:
+What `sdk_runner.py` *does* enforce, on top of the Claude Agent SDK's own `can_use_tool` callback:
 
-- file paths handed to `Read` / `Write` / `Edit` / `MultiEdit` / `Glob`
-  / `Grep` / `LS` must resolve inside `workdir` (no `..`, no absolute
-  paths, no `~` shortcuts);
+- file paths handed to `Read` / `Write` / `Edit` / `MultiEdit` / `Glob` / `Grep` / `LS` must resolve inside `workdir` (no `..`, no absolute paths, no `~` shortcuts);
 - Bash is restricted to a hardcoded executable allowlist;
-- `git` is restricted to `status`, `diff`, `log`, `show`, `add`,
-  `commit`, `rev-parse`, `branch`, `ls-files`, `stash` — no
-  `push`, `clone`, `fetch`, `remote`, `config`, `submodule`, and no
-  flags before the subcommand;
-- `find` rejects `-exec`, `-execdir`, `-delete`, `-fprint*`, `-ok`,
-  `-okdir`, `-print0`, `-fls`;
-- the Playwright MCP browser is only allowed to navigate to
-  `http(s)://{127.0.0.1, localhost, ::1}` on the configured frontend
-  port — `file://`, cloud metadata IPs, and other localhost ports
-  are rejected;
-- the dedicated vision scorer only accepts screenshot paths under
-  `<workdir>/.harness/` with a `.png` suffix;
-- the frontend dev server is launched with a sanitized environment:
-  any var whose name contains `KEY` / `TOKEN` / `SECRET` / `PASSWORD`
-  / `PASSPHRASE` / `CREDENTIAL` or starts with `ANTHROPIC_` /
-  `OPENAI_` / `AWS_` / `AZURE_` / `GOOGLE_` / `GH_` / `GITHUB_` is
-  dropped before `Popen`, so a Vite plugin or generator-written
-  config cannot inline an API key into the bundle.
+- `git` is restricted to `status`, `diff`, `log`, `show`, `add`, `commit`, `rev-parse`, `branch`, `ls-files`, `stash` — no `push`, `clone`, `fetch`, `remote`, `config`, `submodule`, and no flags before the subcommand;
+- `find` rejects `-exec`, `-execdir`, `-delete`, `-fprint*`, `-ok`, `-okdir`, `-print0`, `-fls`;
+- the Playwright MCP browser is only allowed to navigate to `http(s)://{127.0.0.1, localhost, ::1}` on the configured frontend port — `file://`, cloud metadata IPs, and other localhost ports are rejected;
+- the dedicated vision scorer only accepts screenshot paths under `<workdir>/.harness/` with a `.png` suffix;
+- the frontend dev server is launched with a sanitized environment: any var whose name contains `KEY` / `TOKEN` / `SECRET` / `PASSWORD` / `PASSPHRASE` / `CREDENTIAL` or starts with `ANTHROPIC_` / `OPENAI_` / `AWS_` / `AZURE_` / `GOOGLE_` / `GH_` / `GITHUB_` is dropped before `Popen`, so a Vite plugin or generator-written config cannot inline an API key into the bundle.
 
 ### Recommended deployment
 
-Treat the harness as you would any other code-running agent: do not
-run it in a workspace that holds credentials, source you do not want
-modified, or workloads that share host with secrets you cannot afford
-to leak. The intended deployment is a disposable container or VM with
-no network access to internal services and no mounted secrets beyond
-the Anthropic API key the harness itself uses. A future iteration may
-add an OS-level confinement layer (Docker, `sandbox-exec`, `bwrap`),
-but until then **no in-process check the harness performs is
-trustworthy against a prompt-injected agent**.
+Treat the harness as you would any other code-running agent: do not run it in a workspace that holds credentials, source you do not want modified, or workloads that share host with secrets you cannot afford to leak. The supported isolated deployment is the Docker container described in "Running in Docker" above — it layers an OS-level sandbox (read-only rootfs, cap_drop=ALL, no-new-privileges, pids / memory / cpu limits, loopback-only port binding) on top of the in-process tool gate. Running bare on a developer workstation is still supported for quick iteration, but **no in-process check the harness performs is trustworthy against a prompt-injected agent** — the container is the confinement boundary.
 
 ## Testing
 

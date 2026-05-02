@@ -1,10 +1,9 @@
 """Tests for the dedicated visual review degraded paths.
 
-The original failure mode (see reviews/2026-05-04-full-audit.md, H5):
-when the vision scorer raised or returned no screenshots, the harness
-silently kept evaluator-written placeholder grades, so the run could
-"pass" without any visual scoring at all. The behaviour this test
-suite locks in is:
+The original failure mode: when the vision scorer raised or returned no
+screenshots, the harness silently kept evaluator-written placeholder
+grades, so the run could "pass" without any visual scoring at all. The
+behaviour this test suite locks in is:
 
     vision unavailable  ->  overall_passed=False
                             mode_recommendation="repair"

@@ -58,7 +58,7 @@ def _force_visual_review_failure(
     Used whenever the dedicated vision scorer cannot deliver a verdict
     (no screenshots, HTTP error, malformed response). Without this the
     evaluator-written placeholder grades would silently propagate as a
-    PASS — see reviews/2026-05-04-full-audit.md, H5.
+    PASS.
     """
     merged = json.loads(json.dumps(grades))
 

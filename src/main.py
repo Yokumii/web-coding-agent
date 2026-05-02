@@ -78,10 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
             "iterate on a hand-edited frontend."
         ),
     )
-    # --plan-only and --resume are mutually exclusive (audit M4): a
-    # checkpoint resume that respected --plan-only would silently skip
-    # past the planner and run the build/evaluate phases anyway, which
-    # is never what the user wanted.
+    # --plan-only and --resume are mutually exclusive: a checkpoint
+    # resume that respected --plan-only would silently skip past the
+    # planner and run the build/evaluate phases anyway, which is never
+    # what the user wanted.
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--plan-only",
