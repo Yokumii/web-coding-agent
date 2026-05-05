@@ -538,7 +538,7 @@ async def run_harness(
                     f"[bold green]Generator commit[/] {short} round={round_num} "
                     f"sprint={sprint_num} mode={mode}{empty_marker}"
                 )
-                _build_log_line = (
+                build_log_line = (
                     f"round {round_num:02d}/sprint_{sprint_num} ({mode}): "
                     f"git commit {short}{empty_marker}"
                 )
@@ -547,13 +547,13 @@ async def run_harness(
                     f"[bold yellow]Generator commit failed[/] round={round_num} "
                     f"sprint={sprint_num}: {commit_result.error}"
                 )
-                _build_log_line = (
+                build_log_line = (
                     f"round {round_num:02d}/sprint_{sprint_num} ({mode}): "
                     f"git commit FAILED — {commit_result.error}"
                 )
-            _existing_build_log = file_comm.read_build_log() or ""
+            existing_build_log = file_comm.read_build_log() or ""
             file_comm.write_build_log(
-                (_existing_build_log.rstrip() + "\n" + _build_log_line + "\n").lstrip()
+                (existing_build_log.rstrip() + "\n" + build_log_line + "\n").lstrip()
             )
             _save_checkpoint(
                 file_comm,
