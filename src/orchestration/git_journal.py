@@ -99,6 +99,12 @@ def build_commit_message(
         target: sprint_2
         accepted: [1]
         prior grade: design_quality=7 functionality=5 originality=6 craft=7 passed=False
+
+    Best-effort render: if the grade JSON renames `criteria` or `overall_passed`,
+    or if a criterion's value is not a dict, the prior-grade line silently
+    degrades (empty scores or `passed=None`). The commit still lands; readers
+    relying on this line for forensic info should treat its absence/emptiness
+    as "schema drifted, check `grade_round_*.json`".
     """
     sprint_id = f"sprint_{sprint_num}"
     title = f"round {round_n:02d} / {sprint_id} ({mode}): generator output"
@@ -106,15 +112,16 @@ def build_commit_message(
     body: list[str] = ["", f"target: {sprint_id}"]
     if accepted is not None:
         body.append(f"accepted: {list(accepted)}")
-    if prior_grade is not None:
-        criteria = prior_grade.get("criteria", {}) if isinstance(prior_grade, dict) else {}
+    if isinstance(prior_grade, dict):
+        criteria = prior_grade.get("criteria")
+        if not isinstance(criteria, dict):
+            criteria = {}
         scores = " ".join(
-            f"{name}={(value or {}).get('score')}"
+            f"{name}={(value if isinstance(value, dict) else {}).get('score')}"
             for name, value in criteria.items()
         )
-        passed = prior_grade.get("overall_passed") if isinstance(prior_grade, dict) else None
-        prior_line = f"prior grade: {scores} passed={passed}".rstrip()
-        body.append(prior_line)
+        passed = prior_grade.get("overall_passed")
+        body.append(f"prior grade: {scores} passed={passed}".rstrip())
 
     return title + "\n" + "\n".join(body) + "\n"
 
