@@ -89,3 +89,54 @@ async def test_ensure_repo_does_not_overwrite_existing_gitignore(tmp_path: Path)
 async def test_ensure_repo_raises_when_dir_missing(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         await ensure_repo(tmp_path / "does-not-exist")
+
+
+def test_build_commit_message_generate_round_no_prior_grade():
+    msg = build_commit_message(
+        round_n=1,
+        sprint_num=1,
+        mode="generate",
+        prior_grade=None,
+        accepted=[],
+    )
+    lines = msg.splitlines()
+    assert lines[0] == "round 01 / sprint_1 (generate): generator output"
+    assert "target: sprint_1" in lines
+    assert "accepted: []" in lines
+    assert not any(line.startswith("prior grade:") for line in lines)
+
+
+def test_build_commit_message_repair_round_with_prior_grade():
+    prior = {
+        "criteria": {
+            "design_quality": {"score": 7},
+            "functionality":  {"score": 5},
+            "originality":    {"score": 6},
+            "craft":          {"score": 7},
+        },
+        "overall_passed": False,
+    }
+    msg = build_commit_message(
+        round_n=3,
+        sprint_num=2,
+        mode="repair",
+        prior_grade=prior,
+        accepted=[1],
+    )
+    lines = msg.splitlines()
+    assert lines[0] == "round 03 / sprint_2 (repair): generator output"
+    assert "target: sprint_2" in lines
+    assert "accepted: [1]" in lines
+    assert any(
+        line.startswith("prior grade:")
+        and "design_quality=7" in line
+        and "functionality=5" in line
+        and "passed=False" in line
+        for line in lines
+    )
+
+
+def test_build_commit_message_unknown_mode_still_renders():
+    # We do not validate mode strings here; the orchestrator already does.
+    msg = build_commit_message(round_n=2, sprint_num=4, mode="custom", prior_grade=None, accepted=None)
+    assert "round 02 / sprint_4 (custom): generator output" in msg

@@ -4,6 +4,7 @@ import asyncio
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -87,10 +88,35 @@ def build_commit_message(
     round_n: int,
     sprint_num: int,
     mode: str,
-    prior_grade: dict | None = None,
-    accepted: list | None = None,
+    prior_grade: dict[str, Any] | None = None,
+    accepted: list[int] | None = None,
 ) -> str:
-    raise NotImplementedError
+    """Build the multi-line commit message for a generator round.
+
+    Format:
+        round 03 / sprint_2 (repair): generator output
+
+        target: sprint_2
+        accepted: [1]
+        prior grade: design_quality=7 functionality=5 originality=6 craft=7 passed=False
+    """
+    sprint_id = f"sprint_{sprint_num}"
+    title = f"round {round_n:02d} / {sprint_id} ({mode}): generator output"
+
+    body: list[str] = ["", f"target: {sprint_id}"]
+    if accepted is not None:
+        body.append(f"accepted: {list(accepted)}")
+    if prior_grade is not None:
+        criteria = prior_grade.get("criteria", {}) if isinstance(prior_grade, dict) else {}
+        scores = " ".join(
+            f"{name}={(value or {}).get('score')}"
+            for name, value in criteria.items()
+        )
+        passed = prior_grade.get("overall_passed") if isinstance(prior_grade, dict) else None
+        prior_line = f"prior grade: {scores} passed={passed}".rstrip()
+        body.append(prior_line)
+
+    return title + "\n" + "\n".join(body) + "\n"
 
 
 async def commit_round(
@@ -99,7 +125,7 @@ async def commit_round(
     round_n: int,
     sprint_num: int,
     mode: str,
-    prior_grade: dict | None = None,
-    accepted: list | None = None,
+    prior_grade: dict[str, Any] | None = None,
+    accepted: list[int] | None = None,
 ) -> CommitResult:
     raise NotImplementedError
