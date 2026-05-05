@@ -60,18 +60,23 @@ def test_round_trip_through_disk(tmp_path: Path) -> None:
     assert reloaded.samples[0].bench.ui_accuracy == 0.71
 
 
-def test_pending_samples_skips_completed() -> None:
+def test_pending_samples_skips_completed_includes_running_and_errored() -> None:
     manifest = new_manifest(
         run_id="r", jsonl_source="t.jsonl", strata=None,
-        samples=[_sample("000001"), _sample("000002"), _sample("000003")],
+        samples=[
+            _sample("000001"), _sample("000002"),
+            _sample("000003"), _sample("000004"),
+        ],
     )
     manifest.samples[0].harness.status = "completed"
+    manifest.samples[1].harness.status = "running"
     manifest.samples[2].harness.status = "errored"
+    # samples[3] stays pending
 
     pending = manifest.pending_harness_samples()
 
-    # completed skipped; errored re-attempted; pending taken
-    assert [s.id for s in pending] == ["000002", "000003"]
+    # completed skipped; running/errored/pending all retained
+    assert [s.id for s in pending] == ["000002", "000003", "000004"]
 
 
 def test_reset_running_to_pending(tmp_path: Path) -> None:
@@ -99,7 +104,7 @@ def test_atomic_save_does_not_truncate_on_crash(tmp_path: Path) -> None:
     store.save(manifest)
 
     # Confirm tmp file does not linger
-    tmp_files = list(tmp_path.glob("manifest.json.tmp*"))
+    tmp_files = list(tmp_path.glob("manifest.json.*.tmp"))
     assert tmp_files == []
 
     # File parses cleanly
