@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 harness = "src.main:cli"
+harness-bench = "src.bench.cli:cli"
 
 [dependency-groups]
 dev = [
