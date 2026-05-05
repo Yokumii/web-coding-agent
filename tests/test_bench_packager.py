@@ -133,3 +133,23 @@ def test_package_frontend_raises_when_no_package_json(tmp_path: Path) -> None:
 def test_excluded_dirs_static_set_includes_expected() -> None:
     expected = {"node_modules", ".git", "dist", ".next", ".cache", "coverage", ".harness"}
     assert expected.issubset(EXCLUDED_DIRS)
+
+
+def test_package_frontend_excludes_sensitive_dotfiles(tmp_path: Path) -> None:
+    fe = _make_frontend(tmp_path, "pnpm-lock.yaml")
+    (fe / ".env").write_text("SECRET=abc")
+    (fe / ".npmrc").write_text("//registry.example.com/:_authToken=xyz")
+    (fe / ".DS_Store").write_bytes(b"\x00\x00")
+    # .env.example is a template (no secrets) — should be included
+    (fe / ".env.example").write_text("SECRET=<set me>")
+
+    out_zip = tmp_path / "out.zip"
+    out_json = tmp_path / "out.json"
+    package_frontend(fe, out_zip, out_json, meta={})
+
+    with zipfile.ZipFile(out_zip) as zf:
+        names = set(zf.namelist())
+    assert ".env" not in names
+    assert ".npmrc" not in names
+    assert ".DS_Store" not in names
+    assert ".env.example" in names

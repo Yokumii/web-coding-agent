@@ -11,7 +11,7 @@ EXCLUDED_DIRS: frozenset[str] = frozenset({
     "node_modules", ".git", "dist", ".next", ".cache",
     "coverage", ".harness",
 })
-EXCLUDED_FILE_PATTERNS: tuple[str, ...] = ("*.log",)
+EXCLUDED_FILE_PATTERNS: tuple[str, ...] = ("*.log", ".env", ".npmrc", ".DS_Store")
 
 
 @dataclass(frozen=True)
