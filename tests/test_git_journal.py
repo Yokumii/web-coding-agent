@@ -140,3 +140,81 @@ def test_build_commit_message_unknown_mode_still_renders():
     # We do not validate mode strings here; the orchestrator already does.
     msg = build_commit_message(round_n=2, sprint_num=4, mode="custom", prior_grade=None, accepted=None)
     assert "round 02 / sprint_4 (custom): generator output" in msg
+
+
+async def _git_log_subjects(repo: Path) -> list[str]:
+    rc, out, err = await _run_git_for_test(repo, "log", "--format=%s")
+    assert rc == 0, err
+    return [line for line in out.splitlines() if line]
+
+
+async def _run_git_for_test(repo: Path, *args: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
+        cwd=str(repo),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    return proc.returncode or 0, stdout_b.decode(), stderr_b.decode()
+
+
+@pytest.mark.anyio
+async def test_commit_round_happy_path_creates_commit(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<h1>r1</h1>")
+
+    result = await commit_round(
+        frontend, round_n=1, sprint_num=1, mode="generate", prior_grade=None, accepted=[],
+    )
+
+    assert result.success is True
+    assert result.commit_hash is not None and len(result.commit_hash) == 40
+    assert "round 01 / sprint_1 (generate)" in result.message
+    assert result.was_empty is False
+
+    subjects = await _git_log_subjects(frontend)
+    assert subjects[0].startswith("round 01 / sprint_1 (generate)")
+
+
+@pytest.mark.anyio
+async def test_commit_round_allows_empty_when_no_changes(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<h1>r1</h1>")
+
+    first = await commit_round(frontend, round_n=1, sprint_num=1, mode="generate")
+    assert first.success and first.was_empty is False
+
+    # No file changes between rounds — must still produce an empty commit.
+    second = await commit_round(frontend, round_n=2, sprint_num=1, mode="repair")
+    assert second.success is True
+    assert second.was_empty is True
+
+    subjects = await _git_log_subjects(frontend)
+    assert subjects[0].startswith("round 02 / sprint_1 (repair)")
+    assert subjects[1].startswith("round 01 / sprint_1 (generate)")
+
+
+@pytest.mark.anyio
+async def test_commit_round_returns_failure_when_dir_missing(tmp_path: Path):
+    result = await commit_round(
+        tmp_path / "no-such", round_n=1, sprint_num=1, mode="generate",
+    )
+    assert result.success is False
+    assert result.commit_hash is None
+    assert "frontend dir missing" in (result.error or "")
+
+
+@pytest.mark.anyio
+async def test_commit_round_returns_failure_when_git_unavailable(monkeypatch, tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+
+    monkeypatch.setattr("src.orchestration.git_journal.is_git_available", lambda: False)
+
+    result = await commit_round(frontend, round_n=1, sprint_num=1, mode="generate")
+    assert result.success is False
+    assert result.error == "git not on PATH"
+    assert not (frontend / ".git").exists()

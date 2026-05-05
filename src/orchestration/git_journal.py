@@ -135,4 +135,67 @@ async def commit_round(
     prior_grade: dict[str, Any] | None = None,
     accepted: list[int] | None = None,
 ) -> CommitResult:
-    raise NotImplementedError
+    """Stage everything in `frontend_dir` and commit, allowing empty commits.
+
+    Returns a CommitResult — never raises. On any failure path
+    (`git` not on PATH, dir missing, init failure, commit failure)
+    `success=False` and `error` carries the reason.
+    """
+    message = build_commit_message(
+        round_n=round_n,
+        sprint_num=sprint_num,
+        mode=mode,
+        prior_grade=prior_grade,
+        accepted=accepted,
+    )
+
+    if not is_git_available():
+        return CommitResult(success=False, commit_hash=None, message=message, error="git not on PATH")
+
+    if not frontend_dir.exists():
+        return CommitResult(
+            success=False,
+            commit_hash=None,
+            message=message,
+            error=f"frontend dir missing: {frontend_dir}",
+        )
+
+    try:
+        await ensure_repo(frontend_dir)
+    except Exception as exc:  # noqa: BLE001 — we deliberately swallow into CommitResult
+        return CommitResult(
+            success=False, commit_hash=None, message=message, error=f"ensure_repo failed: {exc}"
+        )
+
+    rc, _out, err = await _run_git("add", "-A", cwd=frontend_dir)
+    if rc != 0:
+        return CommitResult(
+            success=False, commit_hash=None, message=message, error=f"git add failed: {err.strip()}"
+        )
+
+    rc, status_out, _err = await _run_git("status", "--porcelain", cwd=frontend_dir)
+    was_empty = (rc == 0 and not status_out.strip())
+
+    rc, _out, err = await _run_git(
+        "-c", "commit.gpgsign=false",
+        "commit", "--allow-empty", "-m", message,
+        cwd=frontend_dir,
+    )
+    if rc != 0:
+        return CommitResult(
+            success=False,
+            commit_hash=None,
+            message=message,
+            error=f"git commit failed: {err.strip()}",
+            was_empty=was_empty,
+        )
+
+    rc, hash_out, _err = await _run_git("rev-parse", "HEAD", cwd=frontend_dir)
+    commit_hash = hash_out.strip() if rc == 0 else None
+
+    return CommitResult(
+        success=True,
+        commit_hash=commit_hash,
+        message=message,
+        was_empty=was_empty,
+    )
