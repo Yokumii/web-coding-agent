@@ -94,15 +94,42 @@ def check_dependencies(webgen_dir: Path) -> list[str]:
     missing: list[str] = []
     if shutil.which("node") is None:
         missing.append("node")
-    if shutil.which("npx") is None:
-        missing.append("npx")
     if shutil.which("pm2") is None and shutil.which("npx") is None:
         missing.append("pm2 (or npx for `npx pm2`)")
     if shutil.which("uv") is None:
         missing.append("uv")
+    if sys.platform == "darwin" and shutil.which("lsof") is None:
+        missing.append("lsof (macOS — harness/runtime.py needs it)")
     if not (webgen_dir / "uv.lock").is_file():
         missing.append(f"WebGen-Bench checkout at {webgen_dir}")
     return missing
+
+
+def _validate_vlm_endpoint(args: argparse.Namespace) -> str | None:
+    """Return error message if VLM config will not work with webgen, else None.
+
+    webgen requires an OpenAI-compatible chat completions endpoint. If harness's
+    EVALUATOR_VISION_ENDPOINT_TYPE is set to anything other than 'openai' (default
+    'anthropic') and the user hasn't supplied --vlm-base-url override, abort.
+    """
+    if args.vlm_base_url:
+        return None
+    endpoint_type = os.environ.get(
+        "EVALUATOR_VISION_ENDPOINT_TYPE", "anthropic"
+    ).strip().lower()
+    if endpoint_type and endpoint_type != "openai":
+        return (
+            f"EVALUATOR_VISION_ENDPOINT_TYPE={endpoint_type!r} is not "
+            "OpenAI-compatible. webgen requires an OpenAI-compatible chat "
+            "completions endpoint. Pass --vlm-base-url (and possibly "
+            "--vlm-api-key/--vlm-model) explicitly."
+        )
+    return None
+
+
+def _ensure_pm2_log_dir() -> None:
+    """Auto-create ~/.pm2/logs (pm2 fails if the directory is missing)."""
+    Path("~/.pm2/logs").expanduser().mkdir(parents=True, exist_ok=True)
 
 
 def run_webgen(
@@ -124,14 +151,33 @@ def run_webgen(
               file=sys.stderr)
         return 2
 
+    vlm_err = _validate_vlm_endpoint(args)
+    if vlm_err is not None:
+        print(f"[harness-bench] {vlm_err}", file=sys.stderr)
+        return 2
+
+    _ensure_pm2_log_dir()
+
     manifest_path = runs_dir / "manifest.json"
     sampled_path = runs_dir / "sampled.jsonl"
     store = ManifestStore(manifest_path)
 
-    if args.resume and manifest_path.is_file():
+    if args.resume:
+        if not manifest_path.is_file():
+            print(
+                f"[harness-bench] --resume given but no manifest at {manifest_path}",
+                file=sys.stderr,
+            )
+            return 2
         manifest = store.load()
         store.reset_running_to_pending(manifest)
         sample_raws = _load_raw_index(sampled_path)
+        if not sample_raws:
+            print(
+                f"[harness-bench] --resume: sampled.jsonl missing or empty at {sampled_path}",
+                file=sys.stderr,
+            )
+            return 2
     else:
         all_samples = load_jsonl(Path(args.jsonl))
         picked = _pick_samples(all_samples, args)

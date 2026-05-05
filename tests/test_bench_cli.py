@@ -103,6 +103,8 @@ def test_run_webgen_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("src.bench.cli.run_eval_appearance", fake_eval_appearance)
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
     args = parser.parse_args([
@@ -155,6 +157,8 @@ def test_run_webgen_zip_named_by_position_not_sample_id(tmp_path: Path, monkeypa
     monkeypatch.setattr("src.bench.cli.run_eval_appearance", lambda **kw: 0)
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
     args = parser.parse_args([
@@ -227,6 +231,8 @@ def test_run_webgen_resume_skips_completed(tmp_path: Path, monkeypatch) -> None:
                         lambda **kw: 0)
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
     args = parser.parse_args([
@@ -260,6 +266,8 @@ def test_run_webgen_skip_harness_only_packages_and_evaluates(tmp_path: Path, mon
                         lambda **kw: (calls.__setitem__("app", calls["app"] + 1) or 0))
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
     args = parser.parse_args([
@@ -283,6 +291,76 @@ def test_run_webgen_aborts_on_missing_dependency(tmp_path: Path, monkeypatch) ->
     args = parser.parse_args([
         "webgen", "--jsonl", str(jsonl),
         "--runs-dir", str(tmp_path / "runs" / "r1"), "--all",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc != 0
+
+
+def test_run_webgen_aborts_when_vlm_endpoint_not_openai(tmp_path: Path, monkeypatch) -> None:
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001"])
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "anthropic")
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl),
+        "--runs-dir", str(tmp_path / "runs" / "r1"), "--all",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc != 0
+
+
+def test_run_webgen_vlm_endpoint_check_passes_with_explicit_base_url(tmp_path: Path, monkeypatch) -> None:
+    """If user passes --vlm-base-url, the endpoint type check is skipped."""
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001"])
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "anthropic")
+
+    # Stub everything else
+    def fake_run_harness(sample, *, run_dir, project_root, extra_args, log_dir):
+        from src.bench.manifest import HarnessRecord
+        sub = run_dir / "samples" / sample.id
+        (sub / "frontend").mkdir(parents=True)
+        (sub / "frontend" / "package.json").write_text(
+            json.dumps({"scripts": {"dev": "vite"}})
+        )
+        return HarnessRecord(status="completed", workdir=f"samples/{sample.id}",
+                             last_verdict="completed", rounds=1, cost_usd=1.0)
+
+    monkeypatch.setattr("src.bench.cli.run_harness_for_sample", fake_run_harness)
+    monkeypatch.setattr("src.bench.cli.run_ui_eval", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.run_eval_appearance", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl),
+        "--runs-dir", str(tmp_path / "runs" / "r1"), "--all",
+        "--vlm-base-url", "https://my-openai-compat.example/v1",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc == 0
+
+
+def test_run_webgen_resume_without_manifest_errors(tmp_path: Path, monkeypatch) -> None:
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001"])
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl),
+        "--runs-dir", str(tmp_path / "runs" / "r1"), "--all",
+        "--resume",
     ])
     rc = run_webgen(args, project_root=tmp_path,
                     webgen_dir=tmp_path / "webgen-fake")
