@@ -118,6 +118,7 @@ async def test_planner_uses_result_text_as_spec_fallback_and_initializes_accepte
                 num_turns=1,
                 session_id="session",
                 total_cost_usd=0.1,
+                usage={"input_tokens": 100_000},
                 result=_valid_spec_text(),
             ),
             0.1,
@@ -127,9 +128,16 @@ async def test_planner_uses_result_text_as_spec_fallback_and_initializes_accepte
 
     monkeypatch.setattr("src.agents.planner.run_sdk_agent", fake_run_sdk_agent)
 
-    stats = await run_planner(HarnessConfig(), "build a counter app", file_comm, tmp_path)
+    stats = await run_planner(
+        HarnessConfig(planner_model="claude-sonnet-4-6"),
+        "build a counter app",
+        file_comm,
+        tmp_path,
+    )
 
-    assert stats.cost_usd == 0.1
+    # claude-sonnet-4-6 at $3 per 1M input tokens
+    # → 100_000 * 3 / 1e6 = $0.30.
+    assert stats.cost_usd == 0.3
     assert stats.duration_ms == 1
     assert file_comm.read_spec().startswith("# Counter App - Track Every Tap")
     assert file_comm.read_accepted_sprints() == {

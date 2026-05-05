@@ -323,11 +323,18 @@ def test_build_agent_run_stats_extracts_usage_and_serializes_wall_time():
                 "cache_read_input_tokens": 75,
             },
             model_usage={"cache_creation_input_tokens": 33},
-        )
+        ),
+        model="claude-sonnet-4-6",
     ).with_wall_duration(1800)
 
+    # Cost is now computed from the local pricing table — Claude
+    # Sonnet 4-6 at $3 / $15 / $0.30 / $3.75 per 1M tokens.
+    expected_cost = round(
+        (1200 * 3.0 + 340 * 15.0 + 75 * 0.30 + 33 * 3.75) / 1_000_000.0,
+        6,
+    )
     assert stats == AgentRunStats(
-        cost_usd=1.5,
+        cost_usd=expected_cost,
         duration_ms=1250,
         duration_api_ms=900,
         token_usage={
@@ -345,6 +352,28 @@ def test_build_agent_run_stats_extracts_usage_and_serializes_wall_time():
         wall_duration_ms=1800,
     )
     assert stats.to_dict()["wall_duration_ms"] == 1800
+
+
+def test_build_agent_run_stats_ignores_sdk_total_cost_usd():
+    """The CLI's ``total_cost_usd`` is intentionally ignored even when
+    set — the local pricing table is the single source of truth so a
+    GLM/OpenAI proxy can't bypass the budget gate by reporting 0."""
+    stats = build_agent_run_stats(
+        ResultMessage(
+            subtype="result",
+            duration_ms=10,
+            duration_api_ms=10,
+            is_error=False,
+            num_turns=1,
+            session_id="session",
+            total_cost_usd=999.0,  # CLI claims a huge cost
+            usage={"input_tokens": 100, "output_tokens": 100},
+        ),
+        model="claude-sonnet-4-6",
+    )
+    expected = round((100 * 3.0 + 100 * 15.0) / 1_000_000.0, 6)
+    assert stats.cost_usd == expected
+    assert stats.cost_usd != 999.0
 
 
 @pytest.mark.anyio
@@ -365,7 +394,10 @@ async def test_run_sdk_agent_returns_cost(monkeypatch, tmp_path: Path):
             is_error=False,
             num_turns=1,
             session_id="session",
+            # Deliberately a huge cost reported by the CLI; the harness
+            # must compute cost from the local pricing table instead.
             total_cost_usd=1.5,
+            usage={"input_tokens": 1_000_000},
             result="done",
         )
 
@@ -384,7 +416,11 @@ async def test_run_sdk_agent_returns_cost(monkeypatch, tmp_path: Path):
     )
 
     assert result.result == "done"
-    assert cost == 1.5
+    # glm-5.1 at $0.30 / 1M input tokens → 1_000_000 * 0.30 / 1e6 = $0.30.
+    # The SDK's total_cost_usd (1.5) is intentionally ignored so a proxy
+    # to a non-Claude backend can't bypass the budget gate.
+    assert cost == 0.3
+    assert cost != 1.5
     assert assistant_text == "assistant text"
     assert permission_denials == []
     lines = trace_path.read_text().strip().splitlines()

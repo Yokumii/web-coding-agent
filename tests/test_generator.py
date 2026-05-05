@@ -67,6 +67,7 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
                 num_turns=1,
                 session_id="session",
                 total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
                 result="done",
             ),
             0.2,
@@ -77,7 +78,7 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
     monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
 
     stats = await run_generator(
-        HarnessConfig(),
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
         file_comm,
         tmp_path,
         round_num=1,
@@ -85,7 +86,9 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
         mode="generate",
     )
 
-    assert stats.cost_usd == 0.2
+    # claude-sonnet-4-6 at $3 per 1M input tokens
+    # → 100_000 * 3 / 1e6 = $0.30.
+    assert stats.cost_usd == 0.3
     assert stats.duration_ms == 1
     assert "Mode: generate" in captured["prompt"]
     assert "Sprint: 1" in captured["prompt"]
@@ -161,6 +164,7 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
                 num_turns=1,
                 session_id="session",
                 total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
                 result="done",
             ),
             0.2,
@@ -171,7 +175,7 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
     monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
 
     stats = await run_generator(
-        HarnessConfig(),
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
         file_comm,
         tmp_path,
         round_num=2,
@@ -179,7 +183,8 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
         mode="repair",
     )
 
-    assert stats.cost_usd == 0.2
+    # claude-sonnet-4-6 at $3 per 1M input tokens → 100_000 * 3 / 1e6 = $0.30.
+    assert stats.cost_usd == 0.3
     assert stats.duration_ms == 1
     assert "Mode: repair" in captured["prompt"]
     assert "Sprint: 1" in captured["prompt"]

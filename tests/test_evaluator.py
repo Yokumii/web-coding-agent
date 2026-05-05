@@ -175,6 +175,7 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
                 num_turns=1,
                 session_id="session",
                 total_cost_usd=0.3,
+                usage={"input_tokens": 100_000},
                 result="done",
             ),
             0.3,
@@ -185,7 +186,7 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
     monkeypatch.setattr("src.agents.evaluator.run_sdk_agent", fake_run_sdk_agent)
 
     passed, grades, stats = await run_evaluator(
-        HarnessConfig(),
+        HarnessConfig(evaluator_model="claude-sonnet-4-6"),
         file_comm,
         tmp_path,
         round_num=2,
@@ -194,6 +195,9 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
 
     assert passed is True
     assert grades["mode_recommendation"] == "generate_next_sprint"
+    # claude-sonnet-4-6 at $3 per 1M input tokens → 100_000 * 3 / 1e6 = $0.30.
+    # Matches the legacy 0.3 by coincidence but is now derived from the
+    # local pricing table.
     assert stats.cost_usd == 0.3
     assert stats.duration_ms == 1
     assert "Application URL: http://127.0.0.1:4173" in captured["prompt"]
@@ -250,6 +254,7 @@ async def test_evaluator_reads_written_grade_file_and_uses_overall_verdict(
                 num_turns=1,
                 session_id="session",
                 total_cost_usd=0.3,
+                usage={"input_tokens": 100_000},
                 result="done",
             ),
             0.3,
@@ -260,7 +265,7 @@ async def test_evaluator_reads_written_grade_file_and_uses_overall_verdict(
     monkeypatch.setattr("src.agents.evaluator.run_sdk_agent", fake_run_sdk_agent)
 
     passed, grades, stats = await run_evaluator(
-        HarnessConfig(),
+        HarnessConfig(evaluator_model="claude-sonnet-4-6"),
         file_comm,
         tmp_path,
         round_num=1,
@@ -271,6 +276,7 @@ async def test_evaluator_reads_written_grade_file_and_uses_overall_verdict(
     assert grades["overall_passed"] is False
     assert grades["mode_recommendation"] == "repair"
     assert grades["phase_results"]["ui_functionality"] == "pass"
+    # Local pricing: claude-sonnet-4-6 input @ $3 / 1M → 100_000 * 3 / 1e6 = $0.30.
     assert stats.cost_usd == 0.3
 
 

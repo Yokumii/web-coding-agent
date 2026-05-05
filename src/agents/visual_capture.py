@@ -49,7 +49,7 @@ async def run_visual_capture(
         f"[bold magenta]Visual capture[/] round {round_num} captured "
         f"{len(manifest.get('screenshots', []))} screenshot(s). Cost: ${total_cost:.4f}"
     )
-    return manifest, build_agent_run_stats(response)
+    return manifest, build_agent_run_stats(response, model=config.evaluator_model)
 
 
 def _build_visual_capture_prompt(*, round_num: int, app_url: str, workdir: Path) -> str:

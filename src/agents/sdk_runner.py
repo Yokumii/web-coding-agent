@@ -21,6 +21,7 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 from src.config import HarnessConfig
+from src.orchestration.pricing import estimate_cost_usd
 
 LOCAL_AGENT_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"}
 LOCAL_AGENT_TOOLS_WITH_BASH = LOCAL_AGENT_TOOLS | {"Bash"}
@@ -229,7 +230,18 @@ def _collect_token_usage(source: dict[str, Any], output: dict[str, int]) -> None
             _collect_token_usage(value, output)
 
 
-def build_agent_run_stats(result_message: ResultMessage) -> AgentRunStats:
+def build_agent_run_stats(
+    result_message: ResultMessage, *, model: str
+) -> AgentRunStats:
+    """Build :class:`AgentRunStats` from a CLI ``ResultMessage``.
+
+    ``cost_usd`` is computed from the local pricing table (see
+    :mod:`src.orchestration.pricing`) rather than read from
+    ``result_message.total_cost_usd``. The CLI's own estimate uses a
+    Claude-only price book and silently produces 0 / wrong values when
+    the harness proxies to GLM, OpenAI, or any other backend, which
+    would let the harness budget gate be bypassed.
+    """
     usage = result_message.usage if isinstance(result_message.usage, dict) else {}
     model_usage = result_message.model_usage if isinstance(result_message.model_usage, dict) else {}
     token_usage: dict[str, int] = {}
@@ -250,7 +262,7 @@ def build_agent_run_stats(result_message: ResultMessage) -> AgentRunStats:
         _collect_token_usage(source, token_usage)
 
     return AgentRunStats(
-        cost_usd=float(result_message.total_cost_usd or 0.0),
+        cost_usd=estimate_cost_usd(model, token_usage),
         duration_ms=result_message.duration_ms,
         duration_api_ms=result_message.duration_api_ms,
         token_usage=token_usage,
@@ -600,11 +612,18 @@ async def run_sdk_agent(
         details = "; ".join(result_message.errors or [])
         raise RuntimeError(result_message.result or details or "Agent SDK run failed")
 
+    # Compute the cost via the local pricing table to keep this consistent
+    # with build_agent_run_stats; result_message.total_cost_usd is the
+    # CLI's Claude-only estimate and can disagree with the table when the
+    # base URL is proxied to a non-Claude backend.
+    stats = build_agent_run_stats(result_message, model=model)
+    cost_usd = stats.cost_usd
+
     if trace_writer:
         trace_writer.write(
             "run_complete",
             {
-                "total_cost_usd": float(result_message.total_cost_usd or 0.0),
+                "total_cost_usd": cost_usd,
                 "result": result_message.result,
                 "last_assistant_text": last_assistant_text,
                 "permission_denials": permission_denials,
@@ -613,7 +632,7 @@ async def run_sdk_agent(
 
     return (
         result_message,
-        float(result_message.total_cost_usd or 0.0),
+        cost_usd,
         last_assistant_text,
         permission_denials,
     )

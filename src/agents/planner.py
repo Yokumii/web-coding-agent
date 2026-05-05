@@ -401,4 +401,4 @@ async def run_planner(
         )
 
     logger.info(f"[bold blue]Planner[/] done. Cost: ${cost:.4f}")
-    return build_agent_run_stats(result)
+    return build_agent_run_stats(result, model=config.planner_model)

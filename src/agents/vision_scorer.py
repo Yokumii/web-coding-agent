@@ -5,6 +5,7 @@ import base64
 import json
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -12,6 +13,7 @@ from urllib import error, request
 from src.agents.sdk_runner import AgentRunStats
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.pricing import estimate_cost_usd
 from src.prompts.evaluator_vision import EVALUATOR_VISION_SYSTEM_PROMPT
 
 _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
@@ -196,7 +198,7 @@ def _build_stats_from_http_response(
         if isinstance(value, int) and "token" in key
     }
     return AgentRunStats(
-        cost_usd=0.0,
+        cost_usd=estimate_cost_usd(model, token_usage),
         duration_ms=duration_ms,
         duration_api_ms=duration_ms,
         token_usage=token_usage,
@@ -400,7 +402,17 @@ def _perform_visual_review_request(
     stats = _build_stats_from_http_response(
         duration_ms=duration_ms,
         usage=parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {},
-        model=f"{config.evaluator_vision_model}:{endpoint_type}",
+        model=config.evaluator_vision_model,
+    )
+    # Preserve the endpoint hint for trace consumers; the bare model
+    # name is used for pricing lookup above.
+    stats = replace(
+        stats,
+        model_usage={
+            **stats.model_usage,
+            "endpoint_type": endpoint_type,
+            "model": f"{config.evaluator_vision_model}:{endpoint_type}",
+        },
     )
     return review, stats
 

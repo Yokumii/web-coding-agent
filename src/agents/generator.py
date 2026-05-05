@@ -299,4 +299,4 @@ async def run_generator(
         f"[bold green]Generator[/] mode={mode} round={round_num} sprint={sprint_num} "
         f"done. Cost: ${cost:.4f}"
     )
-    return build_agent_run_stats(result)
+    return build_agent_run_stats(result, model=config.generator_model)

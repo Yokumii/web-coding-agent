@@ -72,7 +72,7 @@ async def run_evaluator(
         )
     logger.info(f"[bold yellow]Evaluator[/] round {round_num} {status}. Cost: ${total_cost:.4f}")
 
-    return passed, grades or {}, build_agent_run_stats(response)
+    return passed, grades or {}, build_agent_run_stats(response, model=config.evaluator_model)
 
 
 def _get_current_sprint_context(file_comm: FileComm) -> tuple[int, dict[str, Any]]:
