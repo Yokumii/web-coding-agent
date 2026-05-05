@@ -12,7 +12,6 @@ from src.bench.manifest import HarnessRecord, SampleRecord
 @dataclass
 class HarnessSubprocessResult:
     returncode: int
-    stdout: str
     stderr: str
 
 
@@ -94,7 +93,7 @@ def _invoke(cmd: list[str], *, cwd: Path, log_path: Path) -> HarnessSubprocessRe
         with log_path.open("a", encoding="utf-8") as log:
             log.write("\n--- STDERR ---\n")
             log.write(stderr)
-    return HarnessSubprocessResult(returncode=proc.returncode, stdout="", stderr=stderr)
+    return HarnessSubprocessResult(returncode=proc.returncode, stderr=stderr)
 
 
 def _tail(text: str, *, lines: int) -> str:

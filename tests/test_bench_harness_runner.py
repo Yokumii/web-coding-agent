@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -45,7 +44,7 @@ def test_run_harness_for_sample_success(tmp_path: Path, monkeypatch) -> None:
         wd = Path(cmd[cmd.index("--workdir") + 1])
         _write_state(wd, last_verdict="completed", round_num=2,
                      costs={"planner": 1.0, "generator_r1": 3.0})
-        return HarnessSubprocessResult(returncode=0, stdout="", stderr="")
+        return HarnessSubprocessResult(returncode=0, stderr="")
 
     monkeypatch.setattr("src.bench.harness_runner._invoke", fake_run)
 
@@ -71,7 +70,7 @@ def test_run_harness_for_sample_subprocess_failure(tmp_path: Path, monkeypatch) 
     log_dir.mkdir(parents=True)
 
     def fake_run(cmd, **kwargs):
-        return HarnessSubprocessResult(returncode=1, stdout="", stderr="boom\n")
+        return HarnessSubprocessResult(returncode=1, stderr="boom\n")
 
     monkeypatch.setattr("src.bench.harness_runner._invoke", fake_run)
 
@@ -97,7 +96,7 @@ def test_run_harness_for_sample_missing_state(tmp_path: Path, monkeypatch) -> No
 
     monkeypatch.setattr(
         "src.bench.harness_runner._invoke",
-        lambda cmd, **kw: HarnessSubprocessResult(returncode=0, stdout="", stderr=""),
+        lambda cmd, **kw: HarnessSubprocessResult(returncode=0, stderr=""),
     )
 
     result = run_harness_for_sample(
@@ -125,7 +124,7 @@ def test_run_harness_for_sample_log_path_captured(tmp_path: Path, monkeypatch) -
         captured["cmd"] = list(cmd)
         wd = Path(cmd[cmd.index("--workdir") + 1])
         _write_state(wd)
-        return HarnessSubprocessResult(returncode=0, stdout="", stderr="")
+        return HarnessSubprocessResult(returncode=0, stderr="")
 
     monkeypatch.setattr("src.bench.harness_runner._invoke", fake_run)
 
@@ -139,5 +138,8 @@ def test_run_harness_for_sample_log_path_captured(tmp_path: Path, monkeypatch) -
 
     assert captured["log_path"] == log_dir / "harness_000004.log"
     # extra_args appear after the prompt + --workdir
-    assert captured["cmd"][-4:] == ["--workdir", str(run_dir / "samples" / "000004"),
-                                    "--max-rounds", "3"] or "--max-budget" in captured["cmd"]
+    cmd_list = captured["cmd"]
+    wd_idx = cmd_list.index("--workdir")
+    assert cmd_list[wd_idx + 1] == str(run_dir / "samples" / "000004")
+    assert cmd_list[wd_idx + 2:] == ["--max-rounds", "3", "--max-budget", "30"]
+    assert cmd_list[wd_idx - 1] == "build 000004"  # prompt immediately precedes --workdir
