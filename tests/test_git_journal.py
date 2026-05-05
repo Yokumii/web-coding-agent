@@ -142,12 +142,6 @@ def test_build_commit_message_unknown_mode_still_renders():
     assert "round 02 / sprint_4 (custom): generator output" in msg
 
 
-async def _git_log_subjects(repo: Path) -> list[str]:
-    rc, out, err = await _run_git_for_test(repo, "log", "--format=%s")
-    assert rc == 0, err
-    return [line for line in out.splitlines() if line]
-
-
 async def _run_git_for_test(repo: Path, *args: str) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         "git", *args,
@@ -157,6 +151,12 @@ async def _run_git_for_test(repo: Path, *args: str) -> tuple[int, str, str]:
     )
     stdout_b, stderr_b = await proc.communicate()
     return proc.returncode or 0, stdout_b.decode(), stderr_b.decode()
+
+
+async def _git_log_subjects(repo: Path) -> list[str]:
+    rc, out, err = await _run_git_for_test(repo, "log", "--format=%s")
+    assert rc == 0, err
+    return [line for line in out.splitlines() if line]
 
 
 @pytest.mark.anyio
@@ -170,7 +170,9 @@ async def test_commit_round_happy_path_creates_commit(tmp_path: Path):
     )
 
     assert result.success is True
-    assert result.commit_hash is not None and len(result.commit_hash) == 40
+    assert result.commit_hash is not None
+    assert len(result.commit_hash) in (40, 64)  # SHA-1 default, SHA-256 if init.defaultObjectFormat
+    assert all(c in "0123456789abcdef" for c in result.commit_hash)
     assert "round 01 / sprint_1 (generate)" in result.message
     assert result.was_empty is False
 
@@ -218,3 +220,31 @@ async def test_commit_round_returns_failure_when_git_unavailable(monkeypatch, tm
     assert result.success is False
     assert result.error == "git not on PATH"
     assert not (frontend / ".git").exists()
+
+
+@pytest.mark.anyio
+async def test_commit_round_returns_failure_when_subprocess_startup_raises(
+    monkeypatch, tmp_path: Path,
+):
+    """If asyncio.create_subprocess_exec itself raises (e.g. git removed
+    between is_git_available() and the actual call, or frontend_dir is
+    a file masquerading as a dir), commit_round must still not raise."""
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+
+    real_create = asyncio.create_subprocess_exec
+
+    async def boom(*args, **kwargs):
+        raise FileNotFoundError("simulated: git binary disappeared")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+
+    result = await commit_round(frontend, round_n=1, sprint_num=1, mode="generate")
+
+    assert result.success is False
+    # The exact error string is implementation-detail; assert it carries
+    # the subprocess context plus the simulated FileNotFoundError message.
+    assert "subprocess error" in (result.error or "") or "ensure_repo failed" in (result.error or "")
+
+    # Restore so subsequent test setup/teardown is unaffected.
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", real_create)

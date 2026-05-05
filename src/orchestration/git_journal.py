@@ -37,14 +37,23 @@ build/
 
 
 async def _run_git(*args: str, cwd: Path) -> tuple[int, str, str]:
-    """Run `git <args>` in cwd, capturing stdout/stderr as text."""
-    proc = await asyncio.create_subprocess_exec(
-        "git", *args,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout_b, stderr_b = await proc.communicate()
+    """Run `git <args>` in cwd, capturing stdout/stderr as text.
+
+    Subprocess startup failures (OSError: git binary missing, cwd does
+    not exist, EMFILE, ...) are converted to `(1, "", "subprocess error: ...")`
+    so callers can treat them as ordinary git failures rather than having
+    to wrap each call in their own try/except.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, stderr_b = await proc.communicate()
+    except OSError as exc:
+        return 1, "", f"subprocess error: {exc}"
     return (
         proc.returncode if proc.returncode is not None else 0,
         stdout_b.decode("utf-8", errors="replace"),
