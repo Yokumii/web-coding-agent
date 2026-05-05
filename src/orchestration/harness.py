@@ -521,7 +521,17 @@ async def run_harness(
             # file changes (--allow-empty) so every round shows up in
             # `git log`. Failures are recorded in build_log.md and never
             # abort the run (commit_round is contractually never-raises).
-            prior_grade = file_comm.read_grades(round_num - 1) if round_num > 1 else None
+            # `prior_grade` is only meaningful in repair mode (same-sprint
+            # retry). For `generate` rounds — round 1, or a fresh sprint
+            # advanced to after a previous sprint was accepted — the
+            # previous round's grade belongs to a *different* sprint, so
+            # surfacing it as "prior grade" would mislead a reader of
+            # `git log`.
+            prior_grade = (
+                file_comm.read_grades(round_num - 1)
+                if round_num > 1 and mode == "repair"
+                else None
+            )
             accepted_for_msg = (file_comm.read_accepted_sprints() or {}).get("accepted", [])
             commit_result = await commit_round(
                 workdir / "frontend",
