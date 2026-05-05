@@ -1477,7 +1477,15 @@ async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: P
     assert call["frontend_dir"] == tmp_path / "frontend"
     assert call["round_n"] == 1
     assert call["sprint_num"] == 1
-    assert call["mode"] in {"generate", "repair"}
+    # Round 1 is deterministic: _select_generator_mode short-circuits to
+    # "generate" before any state-dependent checks (harness.py:126-127).
+    assert call["mode"] == "generate"
     # Round 1 has no prior grade.
     assert call["prior_grade"] is None
     assert call["accepted"] == []
+
+    # Task 5 also writes a build_log.md line on successful commit. Assert
+    # the harness consumes the CommitResult and surfaces the short SHA.
+    build_log = file_comm.read_build_log() or ""
+    assert "git commit 0000000" in build_log
+    assert "round 01/sprint_1 (generate)" in build_log
