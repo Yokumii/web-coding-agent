@@ -15,6 +15,7 @@ from src.agents.planner import run_planner
 from src.config import HarnessConfig
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
+from src.orchestration.git_journal import commit_round
 from src.orchestration.runtime import start_app_stack
 from src.utils.logger import get_logger
 
@@ -515,6 +516,45 @@ async def run_harness(
             _update_feature_statuses_for_sprint(file_comm, sprint_num, "implemented")
             cost_tracker.add(f"generator_r{round_num}", generator_stats.cost_usd)
             phase_metrics[f"generator_r{round_num}"] = generator_stats.to_dict()
+            # Snapshot the generator's frontend output as a linear commit on
+            # main inside <workdir>/frontend/. Runs even when there are no
+            # file changes (--allow-empty) so every round shows up in
+            # `git log`. Failures are recorded in build_log.md and never
+            # abort the run (commit_round is contractually never-raises).
+            prior_grade = file_comm.read_grades(round_num - 1) if round_num > 1 else None
+            accepted_for_msg = (file_comm.read_accepted_sprints() or {}).get("accepted", [])
+            commit_result = await commit_round(
+                workdir / "frontend",
+                round_n=round_num,
+                sprint_num=sprint_num,
+                mode=mode,
+                prior_grade=prior_grade,
+                accepted=accepted_for_msg,
+            )
+            if commit_result.success:
+                short = (commit_result.commit_hash or "")[:7]
+                empty_marker = " (no changes)" if commit_result.was_empty else ""
+                logger.info(
+                    f"[bold green]Generator commit[/] {short} round={round_num} "
+                    f"sprint={sprint_num} mode={mode}{empty_marker}"
+                )
+                _build_log_line = (
+                    f"round {round_num:02d}/sprint_{sprint_num} ({mode}): "
+                    f"git commit {short}{empty_marker}"
+                )
+            else:
+                logger.warning(
+                    f"[bold yellow]Generator commit failed[/] round={round_num} "
+                    f"sprint={sprint_num}: {commit_result.error}"
+                )
+                _build_log_line = (
+                    f"round {round_num:02d}/sprint_{sprint_num} ({mode}): "
+                    f"git commit FAILED — {commit_result.error}"
+                )
+            _existing_build_log = file_comm.read_build_log() or ""
+            file_comm.write_build_log(
+                (_existing_build_log.rstrip() + "\n" + _build_log_line + "\n").lstrip()
+            )
             _save_checkpoint(
                 file_comm,
                 f"build_r{round_num}",
