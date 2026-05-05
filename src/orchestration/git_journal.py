@@ -20,8 +20,66 @@ def is_git_available() -> bool:
     return shutil.which("git") is not None
 
 
+_DEFAULT_GITIGNORE = """\
+node_modules/
+dist/
+build/
+.next/
+.vite/
+.cache/
+.parcel-cache/
+.turbo/
+.svelte-kit/
+*.log
+.DS_Store
+"""
+
+
+async def _run_git(*args: str, cwd: Path) -> tuple[int, str, str]:
+    """Run `git <args>` in cwd, capturing stdout/stderr as text."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    return (
+        proc.returncode if proc.returncode is not None else 0,
+        stdout_b.decode("utf-8", errors="replace"),
+        stderr_b.decode("utf-8", errors="replace"),
+    )
+
+
 async def ensure_repo(frontend_dir: Path, *, default_branch: str = "main") -> None:
-    raise NotImplementedError
+    """Ensure `frontend_dir` is a git repo with sensible local config.
+
+    - If `frontend_dir` does not exist, raises FileNotFoundError.
+    - If `.git` is already there, no-op.
+    - Otherwise: `git init -b <default_branch>` (falling back to `git init`
+      + `git checkout -b` for older gits), set local user.name/email, and
+      write a default `.gitignore` only if the user has not provided one.
+    """
+    if not frontend_dir.exists():
+        raise FileNotFoundError(f"frontend dir does not exist: {frontend_dir}")
+
+    if (frontend_dir / ".git").exists():
+        return
+
+    rc, _out, err = await _run_git("init", "-b", default_branch, cwd=frontend_dir)
+    if rc != 0:
+        rc2, _out2, err2 = await _run_git("init", cwd=frontend_dir)
+        if rc2 != 0:
+            raise RuntimeError(f"git init failed: {err.strip() or err2.strip()}")
+        # Best-effort branch rename; non-fatal if it fails on detached HEAD pre-commit gits.
+        await _run_git("checkout", "-b", default_branch, cwd=frontend_dir)
+
+    await _run_git("config", "user.name", "web-coding-agent harness", cwd=frontend_dir)
+    await _run_git("config", "user.email", "harness@local", cwd=frontend_dir)
+
+    gitignore = frontend_dir / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(_DEFAULT_GITIGNORE)
 
 
 def build_commit_message(
