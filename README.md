@@ -25,6 +25,7 @@ What is implemented:
 - JSONL traces for planner, generator, evaluator, and visual capture runs
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
+- WebGen-Bench integration: end-to-end harness-then-bench runner with stratified sampling, resume, and aggregated summary
 
 ## Requirements
 
@@ -94,6 +95,8 @@ Priority order:
 3. Built-in default (`claude-sonnet-4-6`)
 
 ## Quick Start
+
+`uv run python -m src.main "<prompt>"` and `uv run harness "<prompt>"` are equivalent — the second form is a `[project.scripts]` entry. Examples below use whichever is shorter.
 
 Plan only:
 
@@ -181,6 +184,113 @@ HARNESS_WORKDIR=./e2e-counter docker compose run --rm harness \
 ```
 
 The frontend dev server is published to `127.0.0.1:5173` on the host only, so a browser on the host can visit `http://127.0.0.1:5173` while the container is running but nothing on the LAN can reach it. To use a different port you must change both the `--frontend-port` CLI flag and the `ports:` line in `docker-compose.yml`.
+
+## Running WebGen-Bench
+
+`harness-bench` runs the harness end-to-end against [WebGen-Bench](https://github.com/mnluzimu/WebGen-Bench) and aggregates UI-functional + appearance scores into `summary.{json,md}`. The bench's evaluation phase is unchanged; the harness's own evaluator is *not* replaced. Each sample gets its own sub-workdir and subprocess so a crash in one sample doesn't pollute the next.
+
+### Requirements (in addition to the base harness requirements)
+
+- `node`, `pm2` (or `npx`, used to start dev servers per sample)
+- `lsof` on macOS (the harness's port reaper needs it)
+- WebGen-Bench fork checked out at `awesome-web-bench/webgen-bench/WebGen-Bench/` — the patched [`YzkMing/WebGen-Bench`](https://github.com/YzkMing/WebGen-Bench) fork, which adapts `pm2` discovery and exposes the visual model via env vars
+- An **OpenAI-compatible** chat completions endpoint for the bench's vision scoring (UI verification + appearance grading). The startup check refuses to run if `EVALUATOR_VISION_ENDPOINT_TYPE` is non-`openai` and `--vlm-base-url` is not given, since webgen would otherwise fail at runtime with cryptic errors.
+
+### VLM configuration
+
+webgen reads `WEBGEN_VLM_API_KEY` / `WEBGEN_VLM_BASE_URL` / `WEBGEN_VLM_MODEL`. `harness-bench` sets these from (highest priority first):
+
+1. CLI flags `--vlm-api-key` / `--vlm-base-url` / `--vlm-model`
+2. `EVALUATOR_VISION_API_KEY` / `EVALUATOR_VISION_BASE_URL` / `EVALUATOR_VISION_MODEL`
+3. `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` (key/base only) and `EVALUATOR_MODEL` (model only)
+4. `OPENAI_API_KEY` / `OPENAI_BASE_URL` (key/base only)
+5. `Qwen2.5-VL-32B-Instruct` (model default)
+
+### Smoke run (1 sample)
+
+```bash
+uv run harness-bench webgen \
+  --jsonl awesome-web-bench/webgen-bench/WebGen-Bench/data/test.jsonl \
+  --runs-dir runs/smoke-1 \
+  --limit 1 \
+  --vlm-base-url https://your-openai-compatible-endpoint/v1 \
+  --vlm-model gpt-4o-mini \
+  --harness-args "--max-rounds 1 --max-budget 5 --playwright-headless"
+```
+
+`--harness-args` is forwarded verbatim to the harness CLI for each sample.
+
+### Stratified subset (recommended for first real run)
+
+```bash
+uv run harness-bench webgen \
+  --jsonl awesome-web-bench/webgen-bench/WebGen-Bench/data/test.jsonl \
+  --runs-dir runs/stratified-1 \
+  --strata application_type --per-stratum 1 --seed 42 \
+  --vlm-base-url https://your-openai-compatible-endpoint/v1 \
+  --vlm-model gpt-4o-mini \
+  --harness-args "--max-rounds 3 --max-budget 30 --playwright-headless"
+```
+
+Strata can be `application_type` (default) or `primary_category`. With `--per-stratum 1`, `application_type` typically yields 10–20 samples covering the bench's category distribution.
+
+### Other selection modes
+
+```bash
+# Specific sample IDs
+uv run harness-bench webgen --jsonl ... --runs-dir runs/r1 --ids 000001,000005,000023
+
+# Take first N rows of the jsonl (no sampling)
+uv run harness-bench webgen --jsonl ... --runs-dir runs/r1 --limit 5
+
+# Run every sample in the jsonl (101 for the full WebGen-Bench test set)
+uv run harness-bench webgen --jsonl ... --runs-dir runs/r1 --all
+```
+
+`--ids` / `--limit` / `--all` / stratified are mutually exclusive; if none is given, stratified sampling is used.
+
+### Resume / re-evaluate
+
+```bash
+# Resume after a crash or interrupt — skips samples whose harness already completed
+uv run harness-bench webgen --jsonl ... --runs-dir runs/stratified-1 --resume
+
+# Re-evaluate without re-running the harness — assumes runs/<run>/samples/<id>/frontend/ already exists
+uv run harness-bench webgen --jsonl ... --runs-dir runs/stratified-1 --skip-harness
+```
+
+`--resume` aborts cleanly if `runs/<run>/manifest.json` is absent (typoed `--runs-dir`). `--skip-harness` forces every sample's harness status to `completed` and proceeds straight to packaging + bench.
+
+### Output layout
+
+Given `--runs-dir runs/foo/`:
+
+```
+runs/foo/
+├── manifest.json              # state machine + per-sample status (atomic writes)
+├── sampled.jsonl              # selected subset (audit trail)
+├── samples/<sample_id>/
+│   ├── frontend/              # harness-produced app
+│   └── .harness/              # harness state (verdict, costs, traces)
+├── bench_input/
+│   ├── 000001.zip             # NOTE: filename is the 1-based jsonl row, not sample_id
+│   ├── 000001.json            # boltAction chat json (install + start commands)
+│   └── extracted/             # webgen unzips here, then writes results/ + <id>/shots/
+├── logs/
+│   ├── harness_<sample_id>.log
+│   ├── ui_eval.log
+│   └── eval_appearance.log
+├── summary.json
+└── summary.md
+```
+
+The original `sample_id` and the bench-positional `app_id` are both recorded in `bench_input/<app_id>.json._meta` for traceability.
+
+### How the verdict is computed
+
+The aggregator reads webgen's raw artifacts directly — `bench_input/extracted/results/task_<idx>_<sub>/interact_messages.json` (UI verdicts: `YES`=1, `PARTIAL`=0.5, else 0) and `bench_input/extracted/<app_id>/shots/result.json` (appearance grade extracted from the visual model's `model_output` text). It does **not** invoke webgen's `compute_acc.py` / `compute_grade.py`; those scripts are hardcoded for 101 samples and produce wrong numbers on subsets. Per-sample numbers, totals, and a `by_verdict` breakdown (grouped by harness `last_verdict`) end up in `summary.json` plus a Markdown table in `summary.md`.
+
+Samples whose harness errored or whose frontend was missing still get rows in the summary (with `ui_accuracy=0`, `appearance_grade=1`); the `harness_verdict` column reflects what actually happened so failures aren't silently filtered out.
 
 ## CLI
 
@@ -300,6 +410,7 @@ The harness currently uses:
 - `src/orchestration/runtime.py`: frontend dev-server process management
 - `src/orchestration/file_comm.py`: shared `.harness/` file bus between agents
 - `src/orchestration/cost_tracker.py`: per-phase cost accounting and budget cap
+- `src/bench/`: WebGen-Bench integration — `sampler` / `manifest` / `harness_runner` / `packager` / `bench_runner` / `aggregator` / `cli`. The `harness-bench` CLI is registered through `[project.scripts]` in `pyproject.toml`.
 
 ## Security Model
 
