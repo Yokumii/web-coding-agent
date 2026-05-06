@@ -113,3 +113,7 @@ def test_run_eval_appearance_invokes_correct_script(tmp_path: Path, monkeypatch)
     assert any("grade_appearance_bolt_diy/eval_appearance.py" in p for p in captured["cmd"])
     # eval_appearance uses `-t` (positional in_dir + -t test_file)
     assert "-t" in captured["cmd"]
+    # eval_appearance.py does not accept --api_* flags; config flows via env vars.
+    assert "--api_key" not in captured["cmd"]
+    assert "--api_model" not in captured["cmd"]
+    assert "--api_base_url" not in captured["cmd"]

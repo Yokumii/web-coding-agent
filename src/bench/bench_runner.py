@@ -59,11 +59,15 @@ def run_ui_eval(
     env: dict[str, str],
     log_path: Path,
 ) -> int:
+    # webgen scripts run with cwd=webgen_dir; resolve so listdir/open succeed
+    # regardless of where harness-bench was invoked from.
+    abs_in_dir = str(Path(in_dir).resolve())
+    abs_test_file = str(Path(test_file).resolve())
     cmd = [
         "uv", "run", "python", "-u",
         "src/ui_test_bolt/ui_eval_with_answer.py",
-        "--in_dir", str(in_dir),
-        "--test_file", str(test_file),
+        "--in_dir", abs_in_dir,
+        "--test_file", abs_test_file,
     ]
     if env.get("WEBGEN_VLM_API_KEY"):
         cmd += ["--api_key", env["WEBGEN_VLM_API_KEY"]]
@@ -84,19 +88,16 @@ def run_eval_appearance(
     env: dict[str, str],
     log_path: Path,
 ) -> int:
-    # Note: positional in_dir, -t test_file (mirrors README example).
+    # eval_appearance.py only accepts positional `in_dir` and `-t test_file`;
+    # API config flows through WEBGEN_VLM_* env vars consumed by vlm_eval_qwenvl.
+    abs_in_dir = str(Path(in_dir).resolve())
+    abs_test_file = str(Path(test_file).resolve())
     cmd = [
         "uv", "run", "python", "-u",
         "src/grade_appearance_bolt_diy/eval_appearance.py",
-        str(in_dir),
-        "-t", str(test_file),
+        abs_in_dir,
+        "-t", abs_test_file,
     ]
-    if env.get("WEBGEN_VLM_API_KEY"):
-        cmd += ["--api_key", env["WEBGEN_VLM_API_KEY"]]
-    if env.get("WEBGEN_VLM_MODEL"):
-        cmd += ["--api_model", env["WEBGEN_VLM_MODEL"]]
-    if env.get("WEBGEN_VLM_BASE_URL"):
-        cmd += ["--api_base_url", env["WEBGEN_VLM_BASE_URL"]]
 
     result = _invoke(cmd, cwd=webgen_dir, env=env, log_path=log_path)
     return result.returncode

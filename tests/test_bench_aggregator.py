@@ -28,9 +28,9 @@ def _manifest_with(samples: list[SampleRecord]) -> Manifest:
     )
 
 
-def _make_interact_messages(extracted_dir: Path, sample_idx_1based: int,
+def _make_interact_messages(extracted_dir: Path, app_id: str,
                             sub_idx: int, verdict_text: str) -> None:
-    task_dir = extracted_dir / "results" / f"task_{sample_idx_1based}_{sub_idx}"
+    task_dir = extracted_dir / "results" / f"task{app_id}_{sub_idx}"
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "interact_messages.json").write_text(json.dumps([
         {"role": "user", "content": "go"},
@@ -55,12 +55,12 @@ def test_parse_first_grade_int_returns_zero_when_missing() -> None:
 
 def test_parse_ui_accuracy_yes_partial_no_average(tmp_path: Path) -> None:
     extracted = tmp_path / "extracted"
-    # sample 000001 is index 1 (1-based); 3 sub-tasks: YES, PARTIAL, NO
-    _make_interact_messages(extracted, 1, 0, "Done. YES")
-    _make_interact_messages(extracted, 1, 1, "PARTIAL achievement")
-    _make_interact_messages(extracted, 1, 2, "Could not. NO")
+    # app_id 000001; 3 sub-tasks: YES, PARTIAL, NO
+    _make_interact_messages(extracted, "000001", 0, "Done. YES")
+    _make_interact_messages(extracted, "000001", 1, "PARTIAL achievement")
+    _make_interact_messages(extracted, "000001", 2, "Could not. NO")
 
-    acc = parse_ui_accuracy(extracted, sample_idx_1based=1, sub_count=3)
+    acc = parse_ui_accuracy(extracted, app_id="000001", sub_count=3)
 
     # (1 + 0.5 + 0) / 3 = 0.5
     assert acc == pytest.approx(0.5)
@@ -68,10 +68,10 @@ def test_parse_ui_accuracy_yes_partial_no_average(tmp_path: Path) -> None:
 
 def test_parse_ui_accuracy_missing_subtask_counts_as_zero(tmp_path: Path) -> None:
     extracted = tmp_path / "extracted"
-    _make_interact_messages(extracted, 2, 0, "YES")
+    _make_interact_messages(extracted, "000002", 0, "YES")
     # sub-task 1 missing — counts as 0
 
-    acc = parse_ui_accuracy(extracted, sample_idx_1based=2, sub_count=2)
+    acc = parse_ui_accuracy(extracted, app_id="000002", sub_count=2)
 
     assert acc == pytest.approx(0.5)
 
@@ -79,7 +79,7 @@ def test_parse_ui_accuracy_missing_subtask_counts_as_zero(tmp_path: Path) -> Non
 def test_parse_ui_accuracy_returns_none_when_no_subtasks(tmp_path: Path) -> None:
     extracted = tmp_path / "extracted"
     extracted.mkdir()
-    acc = parse_ui_accuracy(extracted, sample_idx_1based=1, sub_count=0)
+    acc = parse_ui_accuracy(extracted, app_id="000001", sub_count=0)
     assert acc is None
 
 
@@ -117,10 +117,10 @@ def test_aggregate_writes_summary(tmp_path: Path) -> None:
     extracted = bench_input / "extracted"
 
     # sample 1 (000001): UI 1.0, appearance 5
-    _make_interact_messages(extracted, 1, 0, "YES")
+    _make_interact_messages(extracted, "000001", 0, "YES")
     _make_shots_result(extracted, "000001", "Grade: 5")
     # sample 2 (000002): UI 0.0, appearance 1 (errored bench)
-    _make_interact_messages(extracted, 2, 0, "NO")
+    _make_interact_messages(extracted, "000002", 0, "NO")
     _make_shots_result(extracted, "000002", "Grade: 1")
 
     sample_1_raw = {"id": "000001", "ui_instruct": [{"task": "x", "expected_result": "y",

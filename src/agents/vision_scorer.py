@@ -109,12 +109,113 @@ def _read_image_as_base64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
+_FENCED_JSON_RE = re.compile(
+    r"```(?:json|JSON)?\s*(\{.*?\})\s*```",
+    re.DOTALL,
+)
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+_LINE_COMMENT_RE = re.compile(r"(?<!:)//[^\n]*")
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def _strip_json_relaxations(blob: str) -> str:
+    """Strip common LLM-introduced violations of strict JSON.
+
+    Handles:
+      - ``// line comments`` and ``/* block comments */``
+      - trailing commas before ``}`` or ``]``
+    """
+    cleaned = _BLOCK_COMMENT_RE.sub("", blob)
+    cleaned = _LINE_COMMENT_RE.sub("", cleaned)
+    cleaned = _TRAILING_COMMA_RE.sub(r"\1", cleaned)
+    return cleaned
+
+
+def _extract_balanced_json_blobs(text: str) -> list[str]:
+    """Yield every top-level balanced ``{...}`` block, ignoring braces in strings.
+
+    The previous implementation used ``find('{')`` + ``rfind('}')`` which
+    over-grabs whenever the model emits multiple JSON-shaped blocks (e.g.
+    an example schema followed by the actual answer) — the slice ends up
+    spanning both, with text in between, and json.loads chokes.
+    """
+    blobs: list[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start >= 0:
+                blobs.append(text[start : i + 1])
+                start = -1
+    return blobs
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
+    """Best-effort extraction of a JSON object from a model response.
+
+    Tries, in order:
+      1. ```json fenced``` blocks (strict, then relaxed)
+      2. Top-level balanced ``{...}`` blocks, longest first (strict, then relaxed)
+      3. The full ``find('{')..rfind('}')`` slice (strict, then relaxed)
+
+    On total failure, raises with a redacted snippet of the raw text so
+    the caller's log line shows what the model actually returned.
+    """
+    candidates: list[str] = []
+    for match in _FENCED_JSON_RE.finditer(text):
+        candidates.append(match.group(1))
+
+    # Schema-example-then-answer is common: prefer the longer block, which is
+    # almost always the real answer. Ties broken by original order (stable sort).
+    balanced = _extract_balanced_json_blobs(text)
+    balanced.sort(key=len, reverse=True)
+    candidates.extend(balanced)
+
     start = text.find("{")
     end = text.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("vision response did not contain a JSON object")
-    return json.loads(text[start : end + 1])
+    if start >= 0 and end > start:
+        candidates.append(text[start : end + 1])
+
+    last_error: Exception | None = None
+    for blob in candidates:
+        try:
+            return json.loads(blob)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+        try:
+            return json.loads(_strip_json_relaxations(blob))
+        except json.JSONDecodeError as exc:
+            last_error = exc
+
+    snippet = _scrub_secrets(text, limit=400)
+    if last_error is not None:
+        raise ValueError(
+            f"vision response was not valid JSON ({last_error}); raw text: {snippet}"
+        )
+    raise ValueError(
+        f"vision response did not contain a JSON object; raw text: {snippet}"
+    )
 
 
 def _build_review_context(

@@ -10,6 +10,7 @@ from src.agents.vision_scorer import (
     _build_messages_url,
     _build_openai_request,
     _extract_anthropic_message_text,
+    _extract_json_object,
     _extract_openai_message_text,
     _normalize_endpoint_type,
     _scrub_secrets,
@@ -269,3 +270,55 @@ def test_scrub_secrets_truncates_long_input():
     detail = "x" * 4096
     scrubbed = _scrub_secrets(detail, limit=512)
     assert len(scrubbed) <= 512 + len("...[truncated]")
+
+
+def test_extract_json_object_strict_object():
+    assert _extract_json_object('{"a": 1}') == {"a": 1}
+
+
+def test_extract_json_object_handles_prose_around_object():
+    text = 'Here is my analysis:\n\n{"phase_result": "pass"}\n\nLet me know.'
+    assert _extract_json_object(text) == {"phase_result": "pass"}
+
+
+def test_extract_json_object_handles_markdown_fence():
+    text = "Sure!\n\n```json\n{\"phase_result\": \"pass\"}\n```\n"
+    assert _extract_json_object(text) == {"phase_result": "pass"}
+
+
+def test_extract_json_object_handles_trailing_comma():
+    text = '{"a": 1, "b": 2,}'
+    assert _extract_json_object(text) == {"a": 1, "b": 2}
+
+
+def test_extract_json_object_handles_line_comment():
+    text = '{\n  "a": 1, // explanatory comment\n  "b": 2\n}'
+    assert _extract_json_object(text) == {"a": 1, "b": 2}
+
+
+def test_extract_json_object_picks_balanced_block_when_two_objects_present():
+    # Schema example then real answer; previous impl would slice the union and choke.
+    text = (
+        'Schema is `{"score": "number"}`.\n'
+        'My answer:\n'
+        '{"phase_result": "pass", "criteria_scores": {"design_quality": {"score": 8}}}'
+    )
+    result = _extract_json_object(text)
+    assert result["phase_result"] == "pass"
+    assert result["criteria_scores"]["design_quality"]["score"] == 8
+
+
+def test_extract_json_object_raises_with_snippet_on_total_failure():
+    bad = "no braces here at all"
+    with pytest.raises(ValueError) as exc_info:
+        _extract_json_object(bad)
+    assert "raw text:" in str(exc_info.value)
+    assert "no braces here" in str(exc_info.value)
+
+
+def test_extract_json_object_redacts_secrets_in_error_snippet():
+    bad = "Here is sk-AbCdEfGhIjKlMnOp and that is all"
+    with pytest.raises(ValueError) as exc_info:
+        _extract_json_object(bad)
+    assert "sk-AbCdEfGhIjKlMnOp" not in str(exc_info.value)
+    assert "***" in str(exc_info.value)

@@ -3,6 +3,7 @@ __pycache__/
 .env
 workdir/
 examples/
+runs/
 .venv/
 *.egg-info/
 dist/

@@ -24,10 +24,14 @@ def parse_first_grade_int(text: str) -> int:
 def parse_ui_accuracy(
     extracted_dir: Path,
     *,
-    sample_idx_1based: int,
+    app_id: str,
     sub_count: int,
 ) -> float | None:
     """Read interact_messages.json per sub-task; YES=1, PARTIAL=0.5, else 0.
+
+    webvoyager names task dirs `task{web_name}` where `web_name` = app_id
+    (zero-padded 6-digit string), and tasks_test_with_answer.jsonl gives each
+    sub-task id `{app_id}_{sub_idx}` — so the on-disk dir is `task{app_id}_{sub_idx}`.
 
     Missing sub-task directories count as 0 (matches webgen's "start_failed" semantics).
     Returns None when sub_count == 0.
@@ -38,7 +42,7 @@ def parse_ui_accuracy(
     results_dir = extracted_dir / "results"
     score = 0.0
     for sub_idx in range(sub_count):
-        task_dir = results_dir / f"task_{sample_idx_1based}_{sub_idx}"
+        task_dir = results_dir / f"task{app_id}_{sub_idx}"
         msg_path = task_dir / "interact_messages.json"
         if not msg_path.is_file():
             continue
@@ -113,7 +117,7 @@ def aggregate(
         raw = sample_raw_by_id.get(sample.id, {})
         sub_count = len(raw.get("ui_instruct") or [])
         ui_acc = parse_ui_accuracy(
-            extracted, sample_idx_1based=idx_0based + 1, sub_count=sub_count,
+            extracted, app_id=app_id, sub_count=sub_count,
         )
         app_grade = parse_appearance_grade(extracted, app_id=app_id)
 

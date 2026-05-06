@@ -84,7 +84,10 @@ def test_run_webgen_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
     def fake_ui_eval(*, webgen_dir, in_dir, test_file, env, log_path):
         extracted = Path(in_dir) / "extracted"
         for sample_idx in (1, 2):
-            d = extracted / "results" / f"task_{sample_idx}_0"
+            # webvoyager names dirs `task{web_name}_{sub_idx}` where
+            # web_name = app_id (zero-padded 6-digit string).
+            app_id = f"{sample_idx:06d}"
+            d = extracted / "results" / f"task{app_id}_0"
             d.mkdir(parents=True)
             (d / "interact_messages.json").write_text(json.dumps([
                 {"role": "assistant", "content": "YES"},
