@@ -22,7 +22,6 @@ from src.bench.bench_runner import (
     run_eval_appearance,
     run_ui_eval,
 )
-from src.bench.harness_runner import run_harness_for_sample
 from src.bench.manifest import (
     BenchRecord,
     HarnessRecord,
@@ -150,18 +149,27 @@ def _check_harness_args_safe(harness_args: list[str], *, concurrency: int) -> st
     --workdir is always forbidden: bench owns that.
     --frontend-port is only allowed when concurrency=1 (no port pool collision).
     Returns an error message, or None if safe.
+
+    Matches both space form (--flag VALUE) and equals form (--flag=VALUE),
+    since argparse accepts both.
     """
-    if "--workdir" in harness_args:
+    if _has_flag(harness_args, "--workdir"):
         return (
             "--harness-args cannot contain --workdir; bench always sets workdir "
             "to runs/<run>/samples/<id>/"
         )
-    if concurrency >= 2 and "--frontend-port" in harness_args:
+    if concurrency >= 2 and _has_flag(harness_args, "--frontend-port"):
         return (
             f"--harness-args cannot contain --frontend-port when --concurrency >= 2 "
             f"(got {concurrency}); ports are pool-allocated from --frontend-port-base"
         )
     return None
+
+
+def _has_flag(args: list[str], flag: str) -> bool:
+    """True if `flag` appears as either `["--flag", "value"]` or `["--flag=value"]`."""
+    prefix = f"{flag}="
+    return any(a == flag or a.startswith(prefix) for a in args)
 
 
 def _check_port_range_free(base: int, size: int) -> str | None:

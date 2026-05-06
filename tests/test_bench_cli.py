@@ -480,6 +480,25 @@ def test_check_harness_args_safe_passes_unrelated_args() -> None:
     assert _check_harness_args_safe([], concurrency=4) is None
 
 
+def test_check_harness_args_safe_rejects_workdir_equals_form() -> None:
+    """argparse accepts --workdir=/x; the validator must catch this form too."""
+    from src.bench.cli import _check_harness_args_safe
+    err = _check_harness_args_safe(["--workdir=/x"], concurrency=1)
+    assert err is not None and "--workdir" in err
+    err = _check_harness_args_safe(["--workdir=/x"], concurrency=4)
+    assert err is not None and "--workdir" in err
+
+
+def test_check_harness_args_safe_rejects_frontend_port_equals_form_when_concurrent() -> None:
+    """argparse accepts --frontend-port=6000; the validator must catch this form too."""
+    from src.bench.cli import _check_harness_args_safe
+    # Concurrency=1 still allows it (escape hatch for single-worker users).
+    assert _check_harness_args_safe(["--frontend-port=6000"], concurrency=1) is None
+    # Concurrency>=2 forbids both forms.
+    err = _check_harness_args_safe(["--frontend-port=6000"], concurrency=2)
+    assert err is not None and "--frontend-port" in err
+
+
 def test_check_port_range_free_returns_none_when_all_free(monkeypatch) -> None:
     from src.bench import cli as cli_mod
     monkeypatch.setattr(cli_mod, "find_listening_pids", lambda port: [])
