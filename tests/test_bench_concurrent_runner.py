@@ -270,3 +270,48 @@ async def test_run_harness_phase_preserves_errored_record_from_arun(
     assert by_id["000001"].harness.status == "completed"
     assert by_id["000002"].harness.status == "errored"
     assert "harness exit 1" in (by_id["000002"].harness.error or "")
+
+
+@pytest.mark.anyio
+async def test_run_harness_phase_cancels_pending_tasks_and_propagates(
+    tmp_path, monkeypatch,
+) -> None:
+    """Outer cancel should propagate; tasks should observe CancelledError."""
+    from src.bench.concurrent_runner import run_harness_phase
+
+    manifest = _make_manifest([f"00000{i}" for i in range(1, 5)])  # 4 samples
+    store = ManifestStore(tmp_path / "manifest.json")
+
+    cancelled_ids: list[str] = []
+    started_ids: list[str] = []
+
+    async def fake_arun(sample, **kw):
+        started_ids.append(sample.id)
+        try:
+            await asyncio.sleep(10)  # never completes
+        except asyncio.CancelledError:
+            cancelled_ids.append(sample.id)
+            raise
+        return HarnessRecord(status="completed", workdir=f"samples/{sample.id}")
+
+    monkeypatch.setattr("src.bench.concurrent_runner.arun_harness_for_sample", fake_arun)
+
+    phase_task = asyncio.create_task(run_harness_phase(
+        manifest, store,
+        concurrency=4, frontend_port_base=5173,
+        run_dir=tmp_path, project_root=tmp_path,
+        extra_args=[], log_dir=tmp_path / "logs",
+    ))
+    # Let the dispatch reach the await point.
+    await asyncio.sleep(0.05)
+    phase_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await phase_task
+
+    # All four were dispatched, all four observed cancellation.
+    assert sorted(started_ids) == ["000001", "000002", "000003", "000004"]
+    assert sorted(cancelled_ids) == ["000001", "000002", "000003", "000004"]
+    # Manifest still says running (we deliberately do NOT mark errored on cancel).
+    for s in manifest.samples:
+        assert s.harness.status == "running"
