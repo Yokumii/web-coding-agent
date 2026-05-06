@@ -438,3 +438,28 @@ def test_check_harness_args_safe_passes_unrelated_args() -> None:
         ["--max-rounds", "3", "--max-budget", "30"], concurrency=4
     ) is None
     assert _check_harness_args_safe([], concurrency=4) is None
+
+
+def test_check_port_range_free_returns_none_when_all_free(monkeypatch) -> None:
+    from src.bench import cli as cli_mod
+    monkeypatch.setattr(cli_mod, "find_listening_pids", lambda port: [])
+    assert cli_mod._check_port_range_free(5173, 4) is None
+
+
+def test_check_port_range_free_reports_occupied_ports(monkeypatch) -> None:
+    from src.bench import cli as cli_mod
+
+    def fake_pids(port: int) -> list[int]:
+        if port == 5174:
+            return [12345]
+        if port == 5176:
+            return [99999, 88888]
+        return []
+
+    monkeypatch.setattr(cli_mod, "find_listening_pids", fake_pids)
+    err = cli_mod._check_port_range_free(5173, 4)
+    assert err is not None
+    assert "5174" in err
+    assert "12345" in err
+    assert "5176" in err
+    assert "99999" in err

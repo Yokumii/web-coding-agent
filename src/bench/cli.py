@@ -38,6 +38,7 @@ from src.bench.sampler import (
     take_first_n,
     write_jsonl,
 )
+from src.orchestration.runtime import find_listening_pids
 
 
 PROJECT_ROOT_DEFAULT = Path(__file__).resolve().parents[2]
@@ -152,6 +153,27 @@ def _check_harness_args_safe(harness_args: list[str], *, concurrency: int) -> st
             f"(got {concurrency}); ports are pool-allocated from --frontend-port-base"
         )
     return None
+
+
+def _check_port_range_free(base: int, size: int) -> str | None:
+    """Verify ports [base, base+size) are not currently listening.
+
+    Returns an error message naming the occupied ports + PIDs, or None if all
+    free. Bench refuses to auto-kill (avoid stomping on the user's other local
+    services); harness's own per-round ensure_port_available will reap stale
+    dev servers from prior runs on the port it ends up assigned.
+    """
+    occupied: list[tuple[int, list[int]]] = []
+    for port in range(base, base + size):
+        pids = find_listening_pids(port)
+        if pids:
+            occupied.append((port, pids))
+    if not occupied:
+        return None
+    details = ", ".join(
+        f"port {p} (PIDs: {','.join(str(x) for x in pids)})" for p, pids in occupied
+    )
+    return f"frontend port range {base}..{base + size - 1} not free: {details}"
 
 
 def _ensure_pm2_log_dir() -> None:
