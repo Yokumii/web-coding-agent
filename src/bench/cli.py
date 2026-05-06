@@ -134,6 +134,26 @@ def _validate_vlm_endpoint(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _check_harness_args_safe(harness_args: list[str], *, concurrency: int) -> str | None:
+    """Validate user-supplied --harness-args under bench's concurrency model.
+
+    --workdir is always forbidden: bench owns that.
+    --frontend-port is only allowed when concurrency=1 (no port pool collision).
+    Returns an error message, or None if safe.
+    """
+    if "--workdir" in harness_args:
+        return (
+            "--harness-args cannot contain --workdir; bench always sets workdir "
+            "to runs/<run>/samples/<id>/"
+        )
+    if concurrency >= 2 and "--frontend-port" in harness_args:
+        return (
+            f"--harness-args cannot contain --frontend-port when --concurrency >= 2 "
+            f"(got {concurrency}); ports are pool-allocated from --frontend-port-base"
+        )
+    return None
+
+
 def _ensure_pm2_log_dir() -> None:
     """Auto-create ~/.pm2/logs (pm2 fails if the directory is missing)."""
     Path("~/.pm2/logs").expanduser().mkdir(parents=True, exist_ok=True)

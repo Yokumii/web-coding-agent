@@ -411,3 +411,30 @@ def test_load_dotenv_called_at_import(monkeypatch) -> None:
     importlib.reload(src.bench.cli)
 
     assert calls["n"] >= 1
+
+
+def test_check_harness_args_safe_rejects_workdir_at_any_concurrency() -> None:
+    from src.bench.cli import _check_harness_args_safe
+    err = _check_harness_args_safe(["--workdir", "/x"], concurrency=1)
+    assert err is not None and "--workdir" in err
+    err = _check_harness_args_safe(["--workdir", "/x"], concurrency=4)
+    assert err is not None and "--workdir" in err
+
+
+def test_check_harness_args_safe_rejects_frontend_port_only_when_concurrent() -> None:
+    from src.bench.cli import _check_harness_args_safe
+    # Concurrency=1 allows the user to override the frontend port.
+    assert _check_harness_args_safe(["--frontend-port", "6000"], concurrency=1) is None
+    # Concurrency>=2 forbids it.
+    err = _check_harness_args_safe(["--frontend-port", "6000"], concurrency=2)
+    assert err is not None and "--frontend-port" in err
+    err = _check_harness_args_safe(["--frontend-port", "6000"], concurrency=8)
+    assert err is not None
+
+
+def test_check_harness_args_safe_passes_unrelated_args() -> None:
+    from src.bench.cli import _check_harness_args_safe
+    assert _check_harness_args_safe(
+        ["--max-rounds", "3", "--max-budget", "30"], concurrency=4
+    ) is None
+    assert _check_harness_args_safe([], concurrency=4) is None
