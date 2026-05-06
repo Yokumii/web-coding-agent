@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import shlex
@@ -80,6 +81,14 @@ def build_parser() -> argparse.ArgumentParser:
     webgen.add_argument("--vlm-api-key")
     webgen.add_argument("--vlm-base-url")
     webgen.add_argument("--vlm-model")
+
+    webgen.add_argument("--concurrency", type=int, default=1,
+                        help="Number of harness samples to run in parallel "
+                             "(default: 1, behaviorally equivalent to old serial run)")
+    webgen.add_argument("--frontend-port-base", type=int, default=5173,
+                        help="First port in the contiguous range used by parallel "
+                             "harness workers (default: 5173). Range is "
+                             "[base, base + concurrency).")
 
     webgen.add_argument("--webgen-dir", default=str(WEBGEN_DIR_DEFAULT),
                         help="Path to WebGen-Bench checkout")
@@ -205,6 +214,19 @@ def run_webgen(
         print(f"[harness-bench] {vlm_err}", file=sys.stderr)
         return 2
 
+    extra_args_preview = shlex.split(args.harness_args) if args.harness_args else []
+    harness_args_err = _check_harness_args_safe(
+        extra_args_preview, concurrency=args.concurrency,
+    )
+    if harness_args_err is not None:
+        print(f"[harness-bench] {harness_args_err}", file=sys.stderr)
+        return 2
+
+    port_err = _check_port_range_free(args.frontend_port_base, args.concurrency)
+    if port_err is not None:
+        print(f"[harness-bench] {port_err}", file=sys.stderr)
+        return 2
+
     _ensure_pm2_log_dir()
 
     manifest_path = runs_dir / "manifest.json"
@@ -244,21 +266,17 @@ def run_webgen(
     extra_args = shlex.split(args.harness_args) if args.harness_args else []
 
     if not args.skip_harness:
-        for sample in list(manifest.samples):
-            if sample.harness.status == "completed":
-                continue
-            sample.harness.status = "running"
-            store.save(manifest)
+        from src.bench.concurrent_runner import run_harness_phase
 
-            record = run_harness_for_sample(
-                sample,
-                run_dir=runs_dir,
-                project_root=project_root,
-                extra_args=extra_args,
-                log_dir=log_dir,
-            )
-            sample.harness = record
-            store.save(manifest)
+        asyncio.run(run_harness_phase(
+            manifest, store,
+            concurrency=args.concurrency,
+            frontend_port_base=args.frontend_port_base,
+            run_dir=runs_dir,
+            project_root=project_root,
+            extra_args=extra_args,
+            log_dir=log_dir,
+        ))
     else:
         for sample in manifest.samples:
             sample.harness.status = "completed"

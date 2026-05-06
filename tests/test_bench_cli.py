@@ -78,7 +78,15 @@ def test_run_webgen_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
             last_verdict="completed", rounds=2, cost_usd=5.0,
         )
 
-    monkeypatch.setattr("src.bench.cli.run_harness_for_sample", fake_run_harness)
+    async def fake_arun_harness(sample, *, run_dir, project_root, extra_args, log_dir):
+        return fake_run_harness(
+            sample, run_dir=run_dir, project_root=project_root,
+            extra_args=extra_args, log_dir=log_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", fake_arun_harness,
+    )
 
     # Stub bench_runner: return 0, write fake raw artifacts
     def fake_ui_eval(*, webgen_dir, in_dir, test_file, env, log_path):
@@ -107,6 +115,7 @@ def test_run_webgen_end_to_end_with_mocks(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
     monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
     monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
@@ -155,12 +164,21 @@ def test_run_webgen_zip_named_by_position_not_sample_id(tmp_path: Path, monkeypa
         return HarnessRecord(status="completed", workdir=f"samples/{sample.id}",
                              last_verdict="completed", rounds=1, cost_usd=1.0)
 
-    monkeypatch.setattr("src.bench.cli.run_harness_for_sample", fake_run_harness)
+    async def fake_arun_harness(sample, *, run_dir, project_root, extra_args, log_dir):
+        return fake_run_harness(
+            sample, run_dir=run_dir, project_root=project_root,
+            extra_args=extra_args, log_dir=log_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", fake_arun_harness,
+    )
     monkeypatch.setattr("src.bench.cli.run_ui_eval", lambda **kw: 0)
     monkeypatch.setattr("src.bench.cli.run_eval_appearance", lambda **kw: 0)
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
     monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
     monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
@@ -227,7 +245,15 @@ def test_run_webgen_resume_skips_completed(tmp_path: Path, monkeypatch) -> None:
         return HarnessRecord(status="completed", workdir=f"samples/{sample.id}",
                              last_verdict="completed", rounds=1, cost_usd=3.0)
 
-    monkeypatch.setattr("src.bench.cli.run_harness_for_sample", fake_run_harness)
+    async def fake_arun_harness(sample, *, run_dir, project_root, extra_args, log_dir):
+        return fake_run_harness(
+            sample, run_dir=run_dir, project_root=project_root,
+            extra_args=extra_args, log_dir=log_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", fake_arun_harness,
+    )
     monkeypatch.setattr("src.bench.cli.run_ui_eval",
                         lambda **kw: 0)
     monkeypatch.setattr("src.bench.cli.run_eval_appearance",
@@ -235,6 +261,7 @@ def test_run_webgen_resume_skips_completed(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
     monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
     monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
@@ -261,8 +288,11 @@ def test_run_webgen_skip_harness_only_packages_and_evaluates(tmp_path: Path, mon
     (fe / "package.json").write_text(json.dumps({"scripts": {"dev": "vite"}}))
 
     calls = {"harness": 0, "ui": 0, "app": 0}
-    monkeypatch.setattr("src.bench.cli.run_harness_for_sample",
-                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")))
+    async def must_not_run(*a, **kw):
+        raise AssertionError("should not run")
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", must_not_run,
+    )
     monkeypatch.setattr("src.bench.cli.run_ui_eval",
                         lambda **kw: (calls.__setitem__("ui", calls["ui"] + 1) or 0))
     monkeypatch.setattr("src.bench.cli.run_eval_appearance",
@@ -270,6 +300,7 @@ def test_run_webgen_skip_harness_only_packages_and_evaluates(tmp_path: Path, mon
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
     monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
     monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
     monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
 
     parser = build_parser()
@@ -336,10 +367,19 @@ def test_run_webgen_vlm_endpoint_check_passes_with_explicit_base_url(tmp_path: P
         return HarnessRecord(status="completed", workdir=f"samples/{sample.id}",
                              last_verdict="completed", rounds=1, cost_usd=1.0)
 
-    monkeypatch.setattr("src.bench.cli.run_harness_for_sample", fake_run_harness)
+    async def fake_arun_harness(sample, *, run_dir, project_root, extra_args, log_dir):
+        return fake_run_harness(
+            sample, run_dir=run_dir, project_root=project_root,
+            extra_args=extra_args, log_dir=log_dir,
+        )
+
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", fake_arun_harness,
+    )
     monkeypatch.setattr("src.bench.cli.run_ui_eval", lambda **kw: 0)
     monkeypatch.setattr("src.bench.cli.run_eval_appearance", lambda **kw: 0)
     monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
 
     parser = build_parser()
     args = parser.parse_args([
@@ -463,3 +503,113 @@ def test_check_port_range_free_reports_occupied_ports(monkeypatch) -> None:
     assert "12345" in err
     assert "5176" in err
     assert "99999" in err
+
+
+def test_parser_accepts_concurrency_and_port_base() -> None:
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", "t.jsonl", "--runs-dir", "r1",
+        "--concurrency", "4", "--frontend-port-base", "6000",
+    ])
+    assert args.concurrency == 4
+    assert args.frontend_port_base == 6000
+
+
+def test_parser_default_concurrency_is_one_and_port_base_5173() -> None:
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", "t.jsonl", "--runs-dir", "r1",
+    ])
+    assert args.concurrency == 1
+    assert args.frontend_port_base == 5173
+
+
+def test_run_webgen_aborts_when_harness_args_unsafe(tmp_path: Path, monkeypatch) -> None:
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001"])
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl),
+        "--runs-dir", str(tmp_path / "runs" / "r1"), "--all",
+        "--concurrency", "4",
+        "--harness-args", "--frontend-port 6000",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc == 2
+
+
+def test_run_webgen_aborts_when_port_range_occupied(tmp_path: Path, monkeypatch) -> None:
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001"])
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
+
+    monkeypatch.setattr(
+        "src.bench.cli.find_listening_pids",
+        lambda port: [12345] if port == 5174 else [],
+    )
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl),
+        "--runs-dir", str(tmp_path / "runs" / "r1"), "--all",
+        "--concurrency", "4",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc == 2
+
+
+def test_run_webgen_concurrency_one_keeps_serial_behavior(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Default concurrency=1 must drive samples through the new code path
+    while remaining behaviorally equivalent to the old serial loop."""
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001", "000002"])
+    runs_dir = tmp_path / "runs" / "r1"
+
+    dispatch_order: list[str] = []
+
+    async def fake_arun(sample, *, run_dir, project_root, extra_args, log_dir):
+        dispatch_order.append(sample.id)
+        sub = run_dir / "samples" / sample.id
+        (sub / "frontend").mkdir(parents=True, exist_ok=True)
+        (sub / "frontend" / "package.json").write_text(
+            json.dumps({"scripts": {"dev": "vite"}})
+        )
+        from src.bench.manifest import HarnessRecord
+        return HarnessRecord(
+            status="completed", workdir=f"samples/{sample.id}",
+            last_verdict="completed", rounds=1, cost_usd=1.0,
+        )
+
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", fake_arun,
+    )
+    monkeypatch.setattr("src.bench.cli.run_ui_eval", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.run_eval_appearance", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl), "--runs-dir", str(runs_dir), "--all",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc == 0
+    # Dispatch order matches manifest.samples order.
+    assert dispatch_order == ["000001", "000002"]
+
+    raw = json.loads((runs_dir / "manifest.json").read_text())
+    assert all(s["harness"]["status"] == "completed" for s in raw["samples"])
