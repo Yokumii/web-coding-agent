@@ -65,13 +65,25 @@ async def run_harness_phase(
         async with sem:
             port = await pool.acquire()
             try:
-                record = await arun_harness_for_sample(
-                    sample,
-                    run_dir=run_dir,
-                    project_root=project_root,
-                    extra_args=[*extra_args, "--frontend-port", str(port)],
-                    log_dir=log_dir,
-                )
+                try:
+                    record = await arun_harness_for_sample(
+                        sample,
+                        run_dir=run_dir,
+                        project_root=project_root,
+                        extra_args=[*extra_args, "--frontend-port", str(port)],
+                        log_dir=log_dir,
+                    )
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "[%s] unexpected exception in worker: %r", sample.id, exc,
+                    )
+                    record = HarnessRecord(
+                        status="errored",
+                        workdir=sample.harness.workdir,
+                        error=f"unexpected exception in worker: {exc!r}",
+                    )
                 return sample, record
             finally:
                 pool.release(port)

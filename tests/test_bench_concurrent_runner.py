@@ -201,3 +201,72 @@ async def test_run_harness_phase_skips_already_completed_samples(
     )
 
     assert dispatched == ["000002"]
+
+
+@pytest.mark.anyio
+async def test_run_harness_phase_isolates_per_sample_failures(
+    tmp_path, monkeypatch,
+) -> None:
+    """One sample raising an unexpected exception must not abort the others."""
+    from src.bench.concurrent_runner import run_harness_phase
+
+    manifest = _make_manifest([f"00000{i}" for i in range(1, 6)])  # 5 samples
+    store = ManifestStore(tmp_path / "manifest.json")
+
+    async def fake_arun(sample, **kw):
+        if sample.id == "000003":
+            raise RuntimeError("simulated bug in worker plumbing")
+        return HarnessRecord(
+            status="completed", workdir=f"samples/{sample.id}",
+            last_verdict="completed", rounds=1, cost_usd=1.0,
+        )
+    monkeypatch.setattr("src.bench.concurrent_runner.arun_harness_for_sample", fake_arun)
+
+    await run_harness_phase(
+        manifest, store,
+        concurrency=3, frontend_port_base=5173,
+        run_dir=tmp_path, project_root=tmp_path,
+        extra_args=[], log_dir=tmp_path / "logs",
+    )
+
+    by_id = {s.id: s for s in manifest.samples}
+    assert by_id["000003"].harness.status == "errored"
+    assert "simulated bug" in (by_id["000003"].harness.error or "")
+    for ok in ("000001", "000002", "000004", "000005"):
+        assert by_id[ok].harness.status == "completed"
+
+
+@pytest.mark.anyio
+async def test_run_harness_phase_preserves_errored_record_from_arun(
+    tmp_path, monkeypatch,
+) -> None:
+    """When arun_harness_for_sample returns an errored HarnessRecord (not raises),
+    main coroutine writes it through unchanged."""
+    from src.bench.concurrent_runner import run_harness_phase
+
+    manifest = _make_manifest(["000001", "000002"])
+    store = ManifestStore(tmp_path / "manifest.json")
+
+    async def fake_arun(sample, **kw):
+        if sample.id == "000002":
+            return HarnessRecord(
+                status="errored", workdir="samples/000002",
+                error="harness exit 1: <fake>",
+            )
+        return HarnessRecord(
+            status="completed", workdir="samples/000001",
+            last_verdict="completed", rounds=1, cost_usd=1.0,
+        )
+    monkeypatch.setattr("src.bench.concurrent_runner.arun_harness_for_sample", fake_arun)
+
+    await run_harness_phase(
+        manifest, store,
+        concurrency=2, frontend_port_base=5173,
+        run_dir=tmp_path, project_root=tmp_path,
+        extra_args=[], log_dir=tmp_path / "logs",
+    )
+
+    by_id = {s.id: s for s in manifest.samples}
+    assert by_id["000001"].harness.status == "completed"
+    assert by_id["000002"].harness.status == "errored"
+    assert "harness exit 1" in (by_id["000002"].harness.error or "")
