@@ -215,7 +215,6 @@ async def test_ainvoke_cancellation_kills_subprocess_tree(
 
     Skipped on Windows (project depends on POSIX `lsof` and `os.killpg`).
     """
-    import os
     import sys
     import time
 
@@ -225,16 +224,6 @@ async def test_ainvoke_cancellation_kills_subprocess_tree(
     from src.bench.harness_runner import _ainvoke
 
     log_path = tmp_path / "ainvoke.log"
-
-    async def run_and_capture_pid() -> int:
-        # Wrap in a task so we can capture the underlying child's pid before
-        # cancellation. We can't easily reach into _ainvoke's local proc, so
-        # we use a simpler approach: spawn the same kind of subprocess directly
-        # in this test to confirm the kill path. To keep it integration-style,
-        # we instead invoke _ainvoke and cancel its awaiting task; we trust
-        # the post-cancel verification (process exit + cleanup time) to confirm
-        # the SIGTERM path executed.
-        return -1  # placeholder, see below
 
     # Strategy: kick off _ainvoke as a Task, sleep briefly so the subprocess
     # is started, then cancel the Task. _ainvoke's CancelledError handler
