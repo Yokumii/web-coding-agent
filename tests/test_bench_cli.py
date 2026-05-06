@@ -365,3 +365,46 @@ def test_run_webgen_resume_without_manifest_errors(tmp_path: Path, monkeypatch) 
     rc = run_webgen(args, project_root=tmp_path,
                     webgen_dir=tmp_path / "webgen-fake")
     assert rc != 0
+
+
+def test_cli_filters_empty_argv_tokens(monkeypatch) -> None:
+    """argparse trips on empty '' tokens (common in copy-pasted multiline shell
+    commands). cli() should drop them before parsing."""
+    import sys as _sys
+    from src.bench import cli as cli_mod
+
+    monkeypatch.setattr(_sys, "argv", [
+        "harness-bench", "webgen",
+        "--jsonl", "/tmp/no.jsonl",
+        "--runs-dir", "/tmp/r",
+        "--limit", "1",
+        "",  # empty token from broken line continuation
+    ])
+
+    captured: dict = {}
+    def fake_run_webgen(args, *, project_root, webgen_dir):
+        captured["args"] = args
+        return 99
+    monkeypatch.setattr(cli_mod, "run_webgen", fake_run_webgen)
+
+    with pytest.raises(SystemExit) as exc:
+        cli_mod.cli()
+    assert exc.value.code == 99
+    assert captured["args"].limit == 1
+
+
+def test_load_dotenv_called_at_import(monkeypatch) -> None:
+    """Importing src.bench.cli should call load_dotenv() so .env values are
+    visible to the bench CLI just like to the harness CLI."""
+    import importlib
+    calls = {"n": 0}
+
+    def fake_load_dotenv(*a, **kw):
+        calls["n"] += 1
+
+    monkeypatch.setattr("dotenv.load_dotenv", fake_load_dotenv)
+
+    import src.bench.cli
+    importlib.reload(src.bench.cli)
+
+    assert calls["n"] >= 1

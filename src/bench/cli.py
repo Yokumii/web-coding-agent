@@ -10,6 +10,10 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from src.bench.aggregator import aggregate, render_markdown
 from src.bench.bench_runner import (
     ensure_uv_synced,
@@ -84,7 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cli() -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    # Some terminals/copy-paste workflows introduce stray empty argv tokens
+    # which argparse reports as a confusing "unrecognized arguments: " error.
+    argv = [a for a in sys.argv[1:] if a != ""]
+    args = parser.parse_args(argv)
     sys.exit(run_webgen(args, project_root=PROJECT_ROOT_DEFAULT,
                         webgen_dir=Path(args.webgen_dir)))
 
