@@ -241,7 +241,26 @@ def run_webgen(
             )
             return 2
         manifest = store.load()
+        # Capture sample IDs that were 'running' BEFORE the reset so we can
+        # restrict salvage to them (don't auto-upgrade samples that were
+        # already pending — those are first-time runs, salvage is wrong).
+        previously_running_ids = {
+            s.id for s in manifest.samples if s.harness.status == "running"
+        }
         store.reset_running_to_pending(manifest)
+        if previously_running_ids:
+            from src.bench.concurrent_runner import try_salvage_completed_record
+            for sample in manifest.samples:
+                if sample.id not in previously_running_ids:
+                    continue
+                if sample.harness.status != "pending":
+                    continue
+                workdir = (runs_dir / "samples" / sample.id).resolve()
+                salvaged = try_salvage_completed_record(workdir, run_dir=runs_dir)
+                if salvaged is not None:
+                    sample.harness = salvaged
+            store.save(manifest)
+
         sample_raws = _load_raw_index(sampled_path)
         if not sample_raws:
             print(

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
-from src.bench.harness_runner import arun_harness_for_sample
+from src.bench.harness_runner import _load_record_from_state, arun_harness_for_sample
 from src.bench.manifest import HarnessRecord, Manifest, ManifestStore, SampleRecord
 
 logger = logging.getLogger(__name__)
@@ -105,3 +106,43 @@ async def run_harness_phase(
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+
+
+def try_salvage_completed_record(
+    workdir: Path,
+    *,
+    run_dir: Path,
+) -> HarnessRecord | None:
+    """Read harness_state.json; return a completed HarnessRecord only if the run
+    actually finished all rounds (last_completed_phase = evaluate_rN AND
+    last_verdict in final-verdict set).
+
+    Used on the --resume path to upgrade samples that were stuck in `running`
+    because the prior bench process was killed after harness finished but before
+    the result was written back to manifest.
+    """
+    state_path = workdir / ".harness" / "harness_state.json"
+    if not state_path.is_file():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not _is_state_fully_completed(state):
+        return None
+    return _load_record_from_state(workdir, run_dir=run_dir)
+
+
+_FINAL_VERDICTS = {"accepted_review", "failed_review", "completed"}
+
+
+def _is_state_fully_completed(state: dict) -> bool:
+    """A run is 'fully completed' when it reached evaluate_rN with a final verdict.
+
+    `awaiting_review` and `planned` are intermediate verdicts that should NOT
+    be salvaged — they mean the harness was still mid-flow.
+    """
+    last_phase = state.get("last_completed_phase") or ""
+    if not last_phase.startswith("evaluate_r"):
+        return False
+    return state.get("last_verdict") in _FINAL_VERDICTS

@@ -613,3 +613,147 @@ def test_run_webgen_concurrency_one_keeps_serial_behavior(
 
     raw = json.loads((runs_dir / "manifest.json").read_text())
     assert all(s["harness"]["status"] == "completed" for s in raw["samples"])
+
+
+def test_run_webgen_resume_salvages_running_sample_with_complete_state_json(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Resume case: a sample left in `running` whose harness_state.json shows
+    a fully completed run should be upgraded to `completed` without re-running.
+    """
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001", "000002"])
+    runs_dir = tmp_path / "runs" / "r1"
+
+    from src.bench.manifest import (
+        BenchRecord, HarnessRecord, ManifestStore, PackageRecord,
+        new_manifest,
+    )
+    from src.bench.sampler import load_jsonl
+
+    samples = load_jsonl(jsonl)
+    manifest = new_manifest(run_id="r1", jsonl_source=str(jsonl),
+                            strata=None, samples=samples)
+    # 000001 was running when bench died.
+    manifest.samples[0].harness = HarnessRecord(
+        status="running", workdir="samples/000001",
+    )
+    runs_dir.mkdir(parents=True)
+    ManifestStore(runs_dir / "manifest.json").save(manifest)
+    (runs_dir / "sampled.jsonl").write_text(jsonl.read_text())
+
+    # 000001's frontend & state.json show a fully-completed harness run.
+    fe1 = runs_dir / "samples" / "000001" / "frontend"
+    fe1.mkdir(parents=True)
+    (fe1 / "package.json").write_text(json.dumps({"scripts": {"dev": "vite"}}))
+    harness_dir = runs_dir / "samples" / "000001" / ".harness"
+    harness_dir.mkdir(parents=True)
+    (harness_dir / "harness_state.json").write_text(json.dumps({
+        "last_completed_phase": "evaluate_r2",
+        "round_num": 2,
+        "last_verdict": "accepted_review",
+        "costs": {"planner": 1.0, "generator_r1": 4.0, "evaluator_r1": 1.0},
+    }))
+
+    dispatched: list[str] = []
+
+    async def fake_arun(sample, *, run_dir, project_root, extra_args, log_dir):
+        dispatched.append(sample.id)
+        sub = run_dir / "samples" / sample.id
+        (sub / "frontend").mkdir(parents=True, exist_ok=True)
+        (sub / "frontend" / "package.json").write_text(
+            json.dumps({"scripts": {"dev": "vite"}})
+        )
+        return HarnessRecord(
+            status="completed", workdir=f"samples/{sample.id}",
+            last_verdict="completed", rounds=1, cost_usd=2.0,
+        )
+
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", fake_arun,
+    )
+    monkeypatch.setattr("src.bench.cli.run_ui_eval", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.run_eval_appearance", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl), "--runs-dir", str(runs_dir),
+        "--all", "--resume",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc == 0
+
+    # Only 000002 was re-run; 000001 was salvaged from its state.json.
+    assert dispatched == ["000002"]
+    raw = json.loads((runs_dir / "manifest.json").read_text())
+    by_id = {s["id"]: s for s in raw["samples"]}
+    assert by_id["000001"]["harness"]["status"] == "completed"
+    assert by_id["000001"]["harness"]["last_verdict"] == "accepted_review"
+    assert by_id["000001"]["harness"]["rounds"] == 2
+    assert by_id["000001"]["harness"]["cost_usd"] == pytest.approx(6.0)
+
+
+def test_run_webgen_resume_does_not_salvage_running_sample_without_state_json(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Sample was running but state.json missing -> resume must re-run it."""
+    jsonl = tmp_path / "test.jsonl"
+    _make_test_jsonl(jsonl, ["000001"])
+    runs_dir = tmp_path / "runs" / "r1"
+
+    from src.bench.manifest import HarnessRecord, ManifestStore, new_manifest
+    from src.bench.sampler import load_jsonl
+
+    samples = load_jsonl(jsonl)
+    manifest = new_manifest(run_id="r1", jsonl_source=str(jsonl),
+                            strata=None, samples=samples)
+    manifest.samples[0].harness = HarnessRecord(
+        status="running", workdir="samples/000001",
+    )
+    runs_dir.mkdir(parents=True)
+    ManifestStore(runs_dir / "manifest.json").save(manifest)
+    (runs_dir / "sampled.jsonl").write_text(jsonl.read_text())
+    # Note: no state.json, no frontend.
+
+    dispatched: list[str] = []
+
+    async def fake_arun(sample, *, run_dir, project_root, extra_args, log_dir):
+        dispatched.append(sample.id)
+        sub = run_dir / "samples" / sample.id
+        (sub / "frontend").mkdir(parents=True, exist_ok=True)
+        (sub / "frontend" / "package.json").write_text(
+            json.dumps({"scripts": {"dev": "vite"}})
+        )
+        return HarnessRecord(
+            status="completed", workdir=f"samples/{sample.id}",
+            last_verdict="completed", rounds=1, cost_usd=1.0,
+        )
+
+    monkeypatch.setattr(
+        "src.bench.concurrent_runner.arun_harness_for_sample", fake_arun,
+    )
+    monkeypatch.setattr("src.bench.cli.run_ui_eval", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.run_eval_appearance", lambda **kw: 0)
+    monkeypatch.setattr("src.bench.cli.ensure_uv_synced", lambda webgen_dir: None)
+    monkeypatch.setattr("src.bench.cli.check_dependencies", lambda *a, **kw: [])
+    monkeypatch.setattr("src.bench.cli._ensure_pm2_log_dir", lambda: None)
+    monkeypatch.setattr("src.bench.cli.find_listening_pids", lambda port: [])
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "webgen", "--jsonl", str(jsonl), "--runs-dir", str(runs_dir),
+        "--all", "--resume",
+    ])
+    rc = run_webgen(args, project_root=tmp_path,
+                    webgen_dir=tmp_path / "webgen-fake")
+    assert rc == 0
+
+    # Was re-run because state.json wasn't there to salvage from.
+    assert dispatched == ["000001"]

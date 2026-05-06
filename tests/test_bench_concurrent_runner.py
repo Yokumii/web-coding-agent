@@ -315,3 +315,58 @@ async def test_run_harness_phase_cancels_pending_tasks_and_propagates(
     # Manifest still says running (we deliberately do NOT mark errored on cancel).
     for s in manifest.samples:
         assert s.harness.status == "running"
+
+
+def test_try_salvage_returns_none_when_state_missing(tmp_path) -> None:
+    from src.bench.concurrent_runner import try_salvage_completed_record
+    workdir = tmp_path / "samples" / "000001"
+    workdir.mkdir(parents=True)
+    assert try_salvage_completed_record(workdir, run_dir=tmp_path) is None
+
+
+def test_try_salvage_returns_none_when_state_not_fully_completed(tmp_path) -> None:
+    from src.bench.concurrent_runner import try_salvage_completed_record
+    workdir = tmp_path / "samples" / "000001"
+    harness_dir = workdir / ".harness"
+    harness_dir.mkdir(parents=True)
+    (harness_dir / "harness_state.json").write_text(json.dumps({
+        "last_completed_phase": "build_r2",  # not evaluate_*
+        "round_num": 2,
+        "last_verdict": "awaiting_review",
+        "costs": {"planner": 1.0, "generator_r1": 2.0},
+    }))
+    assert try_salvage_completed_record(workdir, run_dir=tmp_path) is None
+
+
+def test_try_salvage_returns_record_when_evaluate_round_complete(tmp_path) -> None:
+    from src.bench.concurrent_runner import try_salvage_completed_record
+    workdir = tmp_path / "samples" / "000001"
+    harness_dir = workdir / ".harness"
+    harness_dir.mkdir(parents=True)
+    (harness_dir / "harness_state.json").write_text(json.dumps({
+        "last_completed_phase": "evaluate_r3",
+        "round_num": 3,
+        "last_verdict": "accepted_review",
+        "costs": {"planner": 1.0, "generator_r1": 2.0, "evaluator_r1": 1.5},
+    }))
+    rec = try_salvage_completed_record(workdir, run_dir=tmp_path)
+    assert rec is not None
+    assert rec.status == "completed"
+    assert rec.last_verdict == "accepted_review"
+    assert rec.rounds == 3
+    assert rec.cost_usd == pytest.approx(4.5)
+
+
+def test_try_salvage_returns_none_for_non_final_verdict(tmp_path) -> None:
+    """evaluate_rN reached but verdict still planned/awaiting -- not really done."""
+    from src.bench.concurrent_runner import try_salvage_completed_record
+    workdir = tmp_path / "samples" / "000001"
+    harness_dir = workdir / ".harness"
+    harness_dir.mkdir(parents=True)
+    (harness_dir / "harness_state.json").write_text(json.dumps({
+        "last_completed_phase": "evaluate_r1",
+        "round_num": 1,
+        "last_verdict": "awaiting_review",
+        "costs": {},
+    }))
+    assert try_salvage_completed_record(workdir, run_dir=tmp_path) is None
