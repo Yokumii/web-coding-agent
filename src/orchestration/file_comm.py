@@ -89,6 +89,21 @@ class FileComm:
     def read_visual_manifest(self, round_num: int) -> dict[str, Any] | None:
         return self._read_json(f"visual_manifest_round_{round_num}.json")
 
+    def write_repair_targets(self, round_num: int, payload: dict[str, Any]) -> Path:
+        return self._write_json(f"repair_targets_round_{round_num}.json", payload)
+
+    def read_repair_targets(self, round_num: int) -> dict[str, Any] | None:
+        return self._read_json(f"repair_targets_round_{round_num}.json")
+
+    def write_repair_report(self, round_num: int, payload: dict[str, Any]) -> Path:
+        return self._write_json(f"repair_report_round_{round_num}.json", payload)
+
+    def read_repair_report(self, round_num: int) -> dict[str, Any] | None:
+        return self._read_json(f"repair_report_round_{round_num}.json")
+
+    def write_repair_incomplete(self, round_num: int, payload: dict[str, Any]) -> Path:
+        return self._write_json(f"repair_incomplete_round_{round_num}.json", payload)
+
     def write_build_log(self, content: str) -> Path:
         path = self.dir / "build_log.md"
         path.write_text(content)
@@ -120,6 +135,9 @@ class FileComm:
             "grade_round_*.json",
             "visual_manifest_round_*.json",
             "visual_round_*.png",
+            "repair_targets_round_*.json",
+            "repair_report_round_*.json",
+            "repair_incomplete_round_*.json",
         ):
             for path in self.dir.glob(pattern):
                 path.unlink(missing_ok=True)

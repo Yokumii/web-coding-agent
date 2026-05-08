@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
-from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
+from src.agents.sdk_runner import (
+    AgentRunStats,
+    build_agent_run_stats,
+    make_repair_completion_hook,
+    run_sdk_agent,
+)
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
@@ -21,9 +27,18 @@ _GENERATE_REQUIRED_READS = (
 _REPAIR_REQUIRED_READS = (
     ".harness/feedback_round_{feedback_round}.md",
     ".harness/grade_round_{feedback_round}.json",
+    ".harness/repair_targets_round_{round_num}.json",
     ".harness/sprint_plan.json",
     ".harness/design_tokens.json",
     ".harness/accepted_sprints.json",
+)
+
+# Recognise file paths inside agent prose. We deliberately keep this loose:
+# any "frontend/..." token with a recognised source extension is captured
+# as a file_hint. False positives here are harmless (the agent uses them
+# as suggestions); false negatives let the model dodge difficult fixes.
+_FILE_HINT_RE = re.compile(
+    r"frontend/[A-Za-z0-9_./\-]+\.(?:jsx?|tsx?|css|scss|html|json|svg)",
 )
 
 
@@ -99,6 +114,154 @@ def _format_failed_criteria(failed_criteria: list[dict[str, Any]]) -> str:
         )
         for criterion in failed_criteria
     )
+
+
+def _extract_file_hints(*texts: Any) -> list[str]:
+    """Pull `frontend/...` source paths out of evaluator notes.
+
+    Accepts arbitrary string-or-None inputs and returns a sorted, de-duplicated
+    list of capture strings. Used to seed `file_hints` on a repair target so
+    the agent has a concrete starting place and the completion hook has
+    something to compare ``files_modified`` against.
+    """
+    hits: set[str] = set()
+    for text in texts:
+        if isinstance(text, str) and text:
+            for match in _FILE_HINT_RE.findall(text):
+                hits.add(match)
+    return sorted(hits)
+
+
+def build_repair_targets_payload(
+    *,
+    grades: dict[str, Any],
+    sprint_num: int,
+    round_num: int,
+    sprint_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute the structured target list the generator must address in repair.
+
+    Aggregates failures from four sources in the grade JSON:
+
+    * ``ui_checks`` with status in {fail, partial} (partial only counted when critical)
+    * ``target_exit_criteria_results`` with passed=False
+    * ``bugs_found`` with severity in {critical, major}
+    * Free-form ``repair_instructions`` (kept verbatim as low-priority targets)
+
+    When ``sprint_context`` is provided, ui_checks and exit_criteria are scoped
+    to the sprint's feature_ids (matching :func:`_extract_repair_targets`),
+    so a failure attributed to a feature in a future sprint is not pinned to
+    this round's repair list.
+
+    File hints are extracted from each item's notes/details so the generator
+    has a concrete starting place. This payload is what the harness writes
+    to ``.harness/repair_targets_round_N.json``; the generator must produce a
+    matching ``.harness/repair_report_round_N.json`` before its Stop is allowed.
+    """
+    sprint_feature_ids: set[str] = set()
+    if sprint_context:
+        for fid in sprint_context.get("feature_ids", []) or []:
+            text = str(fid).strip()
+            if text:
+                sprint_feature_ids.add(text)
+
+    def _in_scope(feature_id: str) -> bool:
+        if not sprint_feature_ids:
+            return True
+        if not feature_id:
+            return True
+        return feature_id in sprint_feature_ids
+
+    targets: list[dict[str, Any]] = []
+
+    for check in grades.get("ui_checks", []) or []:
+        if not isinstance(check, dict):
+            continue
+        feature_id = str(check.get("feature_id", "")).strip()
+        if not _in_scope(feature_id):
+            continue
+        status = str(check.get("status", "")).strip().lower()
+        critical = check.get("critical") is True
+        if status == "fail" or (status == "partial" and critical):
+            check_id = str(check.get("check_id") or check.get("id") or "").strip()
+            if not check_id:
+                continue
+            targets.append(
+                {
+                    "id": check_id,
+                    "kind": "ui_check",
+                    "critical": critical,
+                    "summary": str(check.get("task", "")).strip(),
+                    "details": str(check.get("notes", "")).strip(),
+                    "file_hints": _extract_file_hints(check.get("notes"), check.get("task")),
+                }
+            )
+
+    for criterion in grades.get("target_exit_criteria_results", []) or []:
+        if not isinstance(criterion, dict):
+            continue
+        feature_id = str(criterion.get("feature_id", "")).strip()
+        if not _in_scope(feature_id):
+            continue
+        if criterion.get("passed") is False:
+            criterion_id = str(criterion.get("criterion_id", "")).strip()
+            if not criterion_id:
+                continue
+            targets.append(
+                {
+                    "id": criterion_id,
+                    "kind": "exit_criterion",
+                    "critical": criterion.get("critical") is True,
+                    "summary": str(criterion.get("criterion", "")).strip(),
+                    "details": str(criterion.get("notes", "")).strip(),
+                    "file_hints": _extract_file_hints(
+                        criterion.get("notes"), criterion.get("criterion")
+                    ),
+                }
+            )
+
+    for bug in grades.get("bugs_found", []) or []:
+        if not isinstance(bug, dict):
+            continue
+        severity = str(bug.get("severity", "")).strip().lower()
+        if severity not in {"critical", "major", "high"}:
+            continue
+        bug_id = str(bug.get("id") or bug.get("bug_id") or "").strip()
+        if not bug_id:
+            continue
+        file_hints = _extract_file_hints(bug.get("summary"), bug.get("notes"))
+        if isinstance(bug.get("file"), str):
+            file_hints = sorted(set(file_hints) | {bug["file"]})
+        targets.append(
+            {
+                "id": bug_id,
+                "kind": "bug",
+                "critical": severity == "critical",
+                "summary": str(bug.get("summary", "")).strip(),
+                "details": str(bug.get("notes", "")).strip(),
+                "file_hints": file_hints,
+            }
+        )
+
+    for index, instruction in enumerate(grades.get("repair_instructions", []) or [], start=1):
+        if not isinstance(instruction, str) or not instruction.strip():
+            continue
+        targets.append(
+            {
+                "id": f"REPAIR-{index:02d}",
+                "kind": "repair_instruction",
+                "critical": False,
+                "summary": instruction.strip()[:200],
+                "details": instruction.strip(),
+                "file_hints": _extract_file_hints(instruction),
+            }
+        )
+
+    return {
+        "round": round_num,
+        "sprint": sprint_num,
+        "targets": targets,
+    }
 
 
 def _get_sprint_context(file_comm: FileComm, sprint_num: int) -> dict:
@@ -184,13 +347,23 @@ def _build_repair_prompt(
             f"have crashed before writing grades."
         )
     repair_targets = _extract_repair_targets(previous_grades, sprint_context)
+    # Write the structured targets file the Stop hook will enforce against.
+    targets_payload = build_repair_targets_payload(
+        grades=previous_grades,
+        sprint_num=sprint_num,
+        round_num=round_num,
+        sprint_context=sprint_context,
+    )
+    file_comm.write_repair_targets(round_num, targets_payload)
     required_reads = "\n".join(
-        f"- {path.format(feedback_round=feedback_round)}" for path in _REPAIR_REQUIRED_READS
+        f"- {path.format(feedback_round=feedback_round, round_num=round_num)}"
+        for path in _REPAIR_REQUIRED_READS
     )
     feature_ids = ", ".join(sprint_context.get("feature_ids", []))
     affected_feature_ids = ", ".join(repair_targets["affected_feature_ids"]) or "None declared"
     failed_criteria = _format_failed_criteria(repair_targets["failed_criteria"])
     failed_checks = _format_failed_checks(repair_targets["failed_checks"])
+    target_id_list = ", ".join(t["id"] for t in targets_payload["targets"]) or "(none)"
     return (
         f"Mode: repair\n"
         f"Round: {round_num}\n"
@@ -203,6 +376,20 @@ def _build_repair_prompt(
         f"Failed Exit Criteria:\n{failed_criteria}\n"
         f"Failed UI Checks:\n{failed_checks}\n"
         f"Required Reads:\n{required_reads}\n\n"
+        f"## Repair Completion Protocol\n"
+        f"Before you may end your turn:\n"
+        f"1. Read .harness/repair_targets_round_{round_num}.json. Each entry under "
+        f'"targets" must be addressed. Targets in this round: {target_id_list}.\n'
+        f"2. Implement fixes for every target. If a target is genuinely unfixable in "
+        f"this sprint, document the reason rather than skipping silently.\n"
+        f"3. Write .harness/repair_report_round_{round_num}.json with one entry per "
+        f"target listing:\n"
+        f"   - target_id (verbatim from the targets file)\n"
+        f"   - addressed (true | false)\n"
+        f"   - files_modified (list of frontend/* paths you actually edited)\n"
+        f"   - notes (1-2 sentences) or reason (when addressed=false)\n"
+        f"4. Only after the report is written may you stop. The harness will block "
+        f"your stop attempt and feed back missing items if the report is incomplete.\n\n"
         f"Fix ONLY the issues needed for sprint acceptance or regression recovery.\n"
         f"Do not implement new features from future sprints.\n"
         f"Do not start work for the next sprint.\n"
@@ -267,6 +454,7 @@ async def run_generator(
             sprint_context=sprint_context,
             accepted_sprints=accepted_sprints,
         )
+        stop_hook = None
     else:
         user_msg = _build_repair_prompt(
             file_comm=file_comm,
@@ -275,6 +463,13 @@ async def run_generator(
             sprint_num=sprint_num,
             sprint_context=sprint_context,
             accepted_sprints=accepted_sprints,
+        )
+        stop_hook = make_repair_completion_hook(
+            targets_path=file_comm.dir / f"repair_targets_round_{round_num}.json",
+            report_path=file_comm.dir / f"repair_report_round_{round_num}.json",
+            max_block_attempts=config.max_repair_block_attempts,
+            file_comm=file_comm,
+            round_num=round_num,
         )
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
@@ -285,6 +480,7 @@ async def run_generator(
         system_prompt=GENERATOR_SYSTEM_PROMPT,
         max_turns=config.generator_max_turns,
         allow_bash=True,
+        stop_hook=stop_hook,
         trace_path=file_comm.dir / "traces" / f"generator_round_{round_num}.jsonl",
     )
 

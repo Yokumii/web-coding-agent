@@ -199,6 +199,140 @@ async def _keepalive_hook(_input: Any, _tool_use_id: str | None, _context: Any) 
     return {"continue_": True}
 
 
+def make_repair_completion_hook(
+    *,
+    targets_path: Path,
+    report_path: Path,
+    max_block_attempts: int,
+    file_comm: Any,
+    round_num: int,
+    trace_writer: "SdkTraceWriter | None" = None,
+):
+    """Build a Stop-hook callback that enforces a complete repair report.
+
+    Replaces :func:`_keepalive_hook` for repair-mode generator runs. On Stop:
+
+    1. Reads ``targets_path`` (written by the harness from the prior grade).
+    2. Reads ``report_path`` (the generator's claimed completion report).
+    3. If the report is missing or any target is unaddressed, returns
+       ``decision="block"`` with a feedback ``reason`` listing the gaps and
+       decrements ``block_attempts_remaining``.
+    4. Once attempts are exhausted, writes ``repair_incomplete_round_N.json``
+       and lets the Stop through so the harness can roll into the next round
+       (where the same items will reappear in the next grade and re-trigger
+       repair). This bounds the loop at ``max_block_attempts`` extra turns
+       even when the model can't make progress.
+
+    The state lives in the closure so the SDK can call the hook repeatedly
+    on the same generator session. The hook is also a no-op when
+    ``stop_hook_active`` is True (avoids interacting with another stop hook
+    in the chain) or when no targets were declared.
+    """
+    state = {"attempts_used": 0}
+
+    async def _hook(input_data: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        # Defensive: respect chained stop hooks; the SDK sets this true on
+        # the second invocation in a row to prevent recursion.
+        if isinstance(input_data, dict) and input_data.get("stop_hook_active"):
+            return {"continue_": True}
+
+        try:
+            targets_payload = json.loads(targets_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            # No targets file → nothing to enforce. Behave like keepalive.
+            return {"continue_": True}
+
+        targets = targets_payload.get("targets") or []
+        if not targets:
+            return {"continue_": True}
+
+        target_ids = [str(t.get("id", "")).strip() for t in targets if isinstance(t, dict)]
+        target_ids = [tid for tid in target_ids if tid]
+
+        report_payload: dict[str, Any] | None = None
+        if report_path.exists():
+            try:
+                report_payload = json.loads(report_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                report_payload = None
+
+        unaddressed: list[str] = []
+        if report_payload is None:
+            unaddressed = list(target_ids)
+            missing_report = True
+        else:
+            missing_report = False
+            addressed_map: dict[str, dict[str, Any]] = {}
+            for entry in report_payload.get("addressed", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                tid = str(entry.get("target_id", "")).strip()
+                if tid:
+                    addressed_map[tid] = entry
+            for tid in target_ids:
+                entry = addressed_map.get(tid)
+                if entry is None or entry.get("addressed") is not True:
+                    unaddressed.append(tid)
+
+        if not unaddressed:
+            return {"continue_": True}
+
+        if state["attempts_used"] >= max_block_attempts:
+            # Give up and let the harness move on. Persist the leftover
+            # for the next round's evaluator to surface.
+            file_comm.write_repair_incomplete(
+                round_num,
+                {
+                    "round": round_num,
+                    "unaddressed_target_ids": unaddressed,
+                    "block_attempts_used": state["attempts_used"],
+                },
+            )
+            if trace_writer:
+                trace_writer.write(
+                    "repair_block_exhausted",
+                    {"round": round_num, "unaddressed": unaddressed},
+                )
+            return {"continue_": True}
+
+        state["attempts_used"] += 1
+        attempts_left = max_block_attempts - state["attempts_used"]
+
+        if missing_report:
+            reason = (
+                f"You must write .harness/repair_report_round_{round_num}.json before ending. "
+                f"List one entry per target from .harness/repair_targets_round_{round_num}.json "
+                f"with target_id, addressed (true/false), files_modified (frontend/* paths you "
+                f"actually edited), and notes. Targets to address: {', '.join(target_ids)}. "
+                f"You have {attempts_left} more attempts before the harness moves on."
+            )
+        else:
+            reason = (
+                f"The following repair targets are still unaddressed: {', '.join(unaddressed)}. "
+                f"Re-read .harness/feedback_round_{round_num - 1}.md and "
+                f".harness/grade_round_{round_num - 1}.json, implement the fixes, then update "
+                f".harness/repair_report_round_{round_num}.json setting addressed=true for each. "
+                f"If a target is genuinely unfixable in this sprint, set addressed=false and "
+                f"explain why in `reason`. You have {attempts_left} more attempts."
+            )
+
+        if trace_writer:
+            trace_writer.write(
+                "repair_block",
+                {
+                    "round": round_num,
+                    "attempts_used": state["attempts_used"],
+                    "attempts_left": attempts_left,
+                    "missing_report": missing_report,
+                    "unaddressed": unaddressed,
+                },
+            )
+
+        return {"decision": "block", "reason": reason}
+
+    return _hook
+
+
 class SdkTraceWriter:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -625,6 +759,7 @@ def build_agent_options(
     allow_bash: bool,
     allow_playwright: bool = False,
     bash_profile: str = "full",
+    stop_hook: Any = None,
     trace_writer: SdkTraceWriter | None = None,
 ) -> ClaudeAgentOptions:
     mcp_servers: dict[str, McpStdioServerConfig] = {}
@@ -635,7 +770,7 @@ def build_agent_options(
         }
 
     allowed_tools = sorted(LOCAL_AGENT_TOOLS_WITH_BASH if allow_bash else LOCAL_AGENT_TOOLS)
-    hooks = {"Stop": [HookMatcher(hooks=[_keepalive_hook])]}
+    hooks = {"Stop": [HookMatcher(hooks=[stop_hook or _keepalive_hook])]}
 
     env = {}
     if config.api_key:
@@ -682,6 +817,7 @@ async def run_sdk_agent(
     allow_bash: bool,
     allow_playwright: bool = False,
     bash_profile: str = "full",
+    stop_hook: Any = None,
     trace_path: Path | None = None,
 ) -> tuple[ResultMessage, float, str, list[Any]]:
     trace_writer = SdkTraceWriter(trace_path) if trace_path else None
@@ -694,6 +830,7 @@ async def run_sdk_agent(
         allow_bash=allow_bash,
         allow_playwright=allow_playwright,
         bash_profile=bash_profile,
+        stop_hook=stop_hook,
         trace_writer=trace_writer,
     )
     if trace_writer:

@@ -65,6 +65,9 @@ class HarnessConfig:
     max_exit_criteria_per_sprint: int = field(
         default_factory=lambda: int(os.getenv("MAX_EXIT_CRITERIA_PER_SPRINT", "5"))
     )
+    max_repair_block_attempts: int = field(
+        default_factory=lambda: int(os.getenv("MAX_REPAIR_BLOCK_ATTEMPTS", "3"))
+    )
 
     frontend_port: int = field(
         default_factory=lambda: int(os.getenv("FRONTEND_PORT", "5173"))
