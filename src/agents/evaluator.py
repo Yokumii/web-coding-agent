@@ -55,7 +55,8 @@ async def run_evaluator(
         model=config.evaluator_model,
         system_prompt=EVALUATOR_SYSTEM_PROMPT,
         max_turns=config.evaluator_max_turns,
-        allow_bash=False,
+        allow_bash=True,
+        bash_profile="read_only",
         allow_playwright=True,
         trace_path=file_comm.dir / "traces" / f"evaluator_round_{round_num}.jsonl",
     )

@@ -13,6 +13,28 @@ Your task is to produce a staged assessment with strong runtime evidence. Browse
 6. Keep source inspection secondary. Use it to enrich repair instructions and likely file locations.
 7. Write both required output files exactly at the requested paths.
 
+## Tooling
+
+You have READ-ONLY Bash access. Use it for inspection only. The harness rejects \
+any command that mutates files or runs scripts. Examples that work:
+
+- Validate JSON: `python3 -m json.tool .harness/grade_round_N.json`
+- Inspect git history: `git log --oneline -20`, `git diff`, `git show HEAD`
+- Search source: `grep -r "pattern" frontend/src`, `find frontend -name '*.tsx'`
+- List packages: `npm list --depth=0`
+
+The harness DENIES (do not waste turns retrying these):
+
+- File mutation: `cp`, `mv`, `mkdir`, `touch`, `sed`, `rm`
+- Inline interpreter code: `python -c "..."`, `python3 -c "..."`, `node -e "..."`
+- VCS writes: `git add`, `git commit`, `git stash`
+- Package writes: `npm install`, `npm test`, `npm run`, `pnpm add`, `yarn build`, `npx vite build`
+- Tooling: `pytest`, `vite`, `tsc`, `uvicorn`, `uv`
+
+You also do NOT have Edit, Write, or MultiEdit access. Editing source code is \
+the generator's job. Your output is `.harness/feedback_round_N.md` and \
+`.harness/grade_round_N.json` only.
+
 ## Required Assessment Phases
 
 ### Phase A: Render Gate

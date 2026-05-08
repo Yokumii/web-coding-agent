@@ -478,3 +478,117 @@ async def test_permission_trace_is_written(tmp_path: Path):
     assert records[-1]["event"] == "permission_check"
     assert records[-1]["tool_name"] == "Bash"
     assert records[-1]["decision"] == "allow"
+
+
+# --- read-only Bash profile (evaluator) ---
+
+
+@pytest.mark.anyio
+async def test_readonly_bash_denies_file_mutation(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        bash_profile="read_only",
+        allow_playwright=False,
+    )
+    for cmd in (
+        "cp src/a.py src/b.py",
+        "mv a b",
+        "touch x",
+        "mkdir foo",
+        "sed -i s/a/b/ file",
+    ):
+        result = await callback("Bash", {"command": cmd}, None)
+        assert result.behavior == "deny", f"expected deny for {cmd!r}"
+
+
+@pytest.mark.anyio
+async def test_readonly_bash_denies_inline_interpreter_code(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        bash_profile="read_only",
+        allow_playwright=False,
+    )
+    for cmd in (
+        'python3 -c "print(1)"',
+        'python -c "print(1)"',
+        'node -e "console.log(1)"',
+    ):
+        result = await callback("Bash", {"command": cmd}, None)
+        assert result.behavior == "deny", f"expected deny for {cmd!r}"
+
+
+@pytest.mark.anyio
+async def test_readonly_bash_denies_git_mutators(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        bash_profile="read_only",
+        allow_playwright=False,
+    )
+    for cmd in (
+        "git add file",
+        'git commit -m "x"',
+        "git stash",
+    ):
+        result = await callback("Bash", {"command": cmd}, None)
+        assert result.behavior == "deny", f"expected deny for {cmd!r}"
+
+
+@pytest.mark.anyio
+async def test_readonly_bash_denies_package_manager_writes(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        bash_profile="read_only",
+        allow_playwright=False,
+    )
+    for cmd in (
+        "npm install",
+        "npm test",
+        "pnpm add react",
+        "yarn build",
+        "npx vite build",
+        "pytest",
+        "vite",
+    ):
+        result = await callback("Bash", {"command": cmd}, None)
+        assert result.behavior == "deny", f"expected deny for {cmd!r}"
+
+
+@pytest.mark.anyio
+async def test_readonly_bash_allows_inspection_commands(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        bash_profile="read_only",
+        allow_playwright=False,
+    )
+    for cmd in (
+        "cat .harness/grade_round_1.json",
+        "grep -r foo frontend/src",
+        "python3 -m json.tool .harness/grade_round_1.json",
+        "git log --oneline -20",
+        "git diff",
+        "git status",
+        "npm list --depth=0",
+        "find frontend -name *.tsx",
+        "ls .harness",
+    ):
+        result = await callback("Bash", {"command": cmd}, None)
+        assert result.behavior == "allow", f"expected allow for {cmd!r}, got {getattr(result, 'message', None)}"
+
+
+@pytest.mark.anyio
+async def test_full_bash_profile_remains_default_for_generator(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+    )
+    # Generator (default profile=full) must still be able to write code.
+    result = await callback("Bash", {"command": "sed -i s/a/b/ file"}, None)
+    assert result.behavior == "allow"
+    result = await callback("Bash", {"command": "git add file"}, None)
+    assert result.behavior == "allow"

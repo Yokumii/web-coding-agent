@@ -89,6 +89,58 @@ _GIT_ALLOWED_SUBCOMMANDS = frozenset({
     "stash",
 })
 
+# Subset of git subcommands available to the read-only bash profile
+# (the evaluator). Mutators removed: add, commit, stash.
+_GIT_READONLY_SUBCOMMANDS = frozenset({
+    "status",
+    "diff",
+    "log",
+    "show",
+    "rev-parse",
+    "branch",
+    "ls-files",
+})
+
+# Bash executables permitted in the read-only profile. Excludes anything
+# that can mutate files (cp/mv/touch/mkdir/sed) or run arbitrary code via
+# build/test entrypoints (pytest/vite/uv/uvicorn/tsc).
+_READONLY_ALLOWED_BASH_COMMANDS = frozenset({
+    "cat",
+    "find",
+    "git",
+    "grep",
+    "head",
+    "ls",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "pwd",
+    "python",
+    "python3",
+    "rg",
+    "tail",
+    "wc",
+    "which",
+    "yarn",
+})
+
+# Interpreter flags that smuggle inline executable code in the read-only
+# profile. The evaluator may invoke ``python3 -m json.tool path.json`` but
+# not ``python3 -c "open('x','w').write('owned')"``.
+_INTERPRETER_INLINE_CODE_FLAGS = frozenset({"-c", "-e", "--eval", "-i"})
+
+# Subcommands accepted for npm/pnpm/yarn/npx in the read-only profile.
+# All install/build/test/run flows are denied because they execute
+# arbitrary scripts and write to node_modules / dist.
+_PKG_MANAGER_READONLY_SUBCOMMANDS = frozenset({
+    "list",
+    "ls",
+    "view",
+    "info",
+    "outdated",
+})
+
 # find flags that turn the binary into an arbitrary executor or a
 # destructive bulk delete. `-print0` and `-fls` also stream
 # arbitrary content into outputs we don't want to expose.
@@ -353,6 +405,61 @@ def _validate_find_argv(argv: list[str]) -> None:
             raise ValueError(f"find flag not allowed: {token}")
 
 
+def _validate_bash_command_readonly(command: str) -> list[str]:
+    """Stricter Bash validator for agents that must not mutate the project.
+
+    Layered on top of :func:`_validate_bash_command` (which already gates
+    shell control operators, path traversal, and the global allowlist).
+    Adds:
+
+    * a smaller executable allowlist (``cp``/``mv``/``touch``/``mkdir``/
+      ``sed``/``pytest``/``vite``/``uv``/``uvicorn``/``tsc`` removed)
+    * git restricted to read-only subcommands
+    * ``python``/``python3``/``node`` reject ``-c``/``-e``/``--eval``/``-i``
+      so the agent cannot smuggle ``open('src/x','w').write(...)``
+    * ``npm``/``pnpm``/``yarn``/``npx`` restricted to read subcommands
+      (no ``install``/``test``/``build`` that would execute scripts and
+      write to ``node_modules``/``dist``)
+    """
+    argv = _validate_bash_command(command)
+    executable = argv[0]
+    if executable not in _READONLY_ALLOWED_BASH_COMMANDS:
+        raise ValueError(
+            f"command not allowed in read-only bash profile: {executable}"
+        )
+
+    if executable == "git":
+        if len(argv) < 2:
+            raise ValueError("git requires a subcommand")
+        if argv[1] not in _GIT_READONLY_SUBCOMMANDS:
+            raise ValueError(
+                f"git subcommand not allowed in read-only bash profile: {argv[1]}"
+            )
+    elif executable in {"python", "python3", "node"}:
+        for token in argv[1:]:
+            if token in _INTERPRETER_INLINE_CODE_FLAGS:
+                raise ValueError(
+                    f"inline code flag not allowed in read-only bash profile: {token}"
+                )
+    elif executable in {"npm", "pnpm", "yarn", "npx"}:
+        # Skip leading flags like `npm --silent list`. The first non-flag
+        # token after the executable is the subcommand.
+        subcommand = next((tok for tok in argv[1:] if not tok.startswith("-")), None)
+        if subcommand is None:
+            # Bare `npm` / `npx` does too much by default, deny.
+            raise ValueError(
+                f"{executable} requires a read-only subcommand "
+                f"({sorted(_PKG_MANAGER_READONLY_SUBCOMMANDS)})"
+            )
+        if subcommand not in _PKG_MANAGER_READONLY_SUBCOMMANDS:
+            raise ValueError(
+                f"{executable} subcommand not allowed in read-only bash profile: "
+                f"{subcommand}"
+            )
+
+    return argv
+
+
 def _collect_candidate_paths(value: Any) -> Iterable[str]:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -405,9 +512,13 @@ def make_tool_permission_callback(
     workdir: Path,
     allow_bash: bool,
     allow_playwright: bool,
+    bash_profile: str = "full",
     trace_writer: SdkTraceWriter | None = None,
     frontend_port: int = 5173,
 ):
+    if bash_profile not in {"full", "read_only"}:
+        raise ValueError(f"unsupported bash_profile: {bash_profile!r}")
+
     async def _can_use_tool(
         tool_name: str,
         tool_input: dict[str, Any],
@@ -455,7 +566,10 @@ def make_tool_permission_callback(
 
         if tool_name == "Bash":
             try:
-                _validate_bash_command(tool_input.get("command", ""))
+                if bash_profile == "read_only":
+                    _validate_bash_command_readonly(tool_input.get("command", ""))
+                else:
+                    _validate_bash_command(tool_input.get("command", ""))
             except ValueError as exc:
                 if trace_writer:
                     trace_writer.write(
@@ -510,6 +624,7 @@ def build_agent_options(
     max_turns: int,
     allow_bash: bool,
     allow_playwright: bool = False,
+    bash_profile: str = "full",
     trace_writer: SdkTraceWriter | None = None,
 ) -> ClaudeAgentOptions:
     mcp_servers: dict[str, McpStdioServerConfig] = {}
@@ -543,6 +658,7 @@ def build_agent_options(
             workdir=workdir,
             allow_bash=allow_bash,
             allow_playwright=allow_playwright,
+            bash_profile=bash_profile,
             trace_writer=trace_writer,
             frontend_port=config.frontend_port,
         ),
@@ -565,6 +681,7 @@ async def run_sdk_agent(
     max_turns: int,
     allow_bash: bool,
     allow_playwright: bool = False,
+    bash_profile: str = "full",
     trace_path: Path | None = None,
 ) -> tuple[ResultMessage, float, str, list[Any]]:
     trace_writer = SdkTraceWriter(trace_path) if trace_path else None
@@ -576,6 +693,7 @@ async def run_sdk_agent(
         max_turns=max_turns,
         allow_bash=allow_bash,
         allow_playwright=allow_playwright,
+        bash_profile=bash_profile,
         trace_writer=trace_writer,
     )
     if trace_writer:
