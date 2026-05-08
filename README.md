@@ -1,5 +1,7 @@
 # Web Coding Agent
 
+**English** | [简体中文](README.zh-CN.md)
+
 This repository is a simple reproduction of the frontend-oriented half of [Anthropic's long-running harness design work](https://www.anthropic.com/engineering/harness-design-long-running-apps).
 
 The current implementation is intentionally **frontend-only**:
@@ -18,14 +20,18 @@ What is implemented:
 - Claude Agent SDK based execution
 - Planner / Generator / Evaluator agent pipeline
 - Sprint-based progression with `generate` / `repair` generator modes
+- Sprint size caps (≤5 deliverables and ≤5 exit_criteria per sprint, validator-enforced) so the generator does not face an over-stuffed first round
+- Repair-completion enforcement: each repair round emits a structured target list (`repair_targets_round_N.json`); the generator must write a matching `repair_report_round_N.json` before its Stop is allowed, with an upper bound on retries
 - Frontend-only runtime management
 - Playwright MCP based functional evaluation
+- Read-only Bash for the evaluator (so it can `cat`/`grep`/`python3 -m json.tool` artifacts but cannot mutate source)
 - Dedicated screenshot capture and vision scoring pass that overrides appearance criteria
+- Vision scorer transient-error retry (5xx and connection failures, exponential backoff with jitter)
 - Resume/checkpoint support across plan, build, and evaluate phases
 - JSONL traces for planner, generator, evaluator, and visual capture runs
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
-- WebGen-Bench integration: end-to-end harness-then-bench runner with stratified sampling, resume, and aggregated summary
+- WebGen-Bench integration: end-to-end harness-then-bench runner with stratified sampling, concurrent harness workers, resume, and aggregated summary
 
 ## Requirements
 
@@ -70,6 +76,16 @@ EVALUATOR_VISION_API_KEY=...
 EVALUATOR_VISION_BASE_URL=...
 EVALUATOR_VISION_ENDPOINT_TYPE=anthropic   # or "openai" for OpenAI-compatible chat completions
 EVALUATOR_VISION_MAX_TOKENS=1200
+EVALUATOR_VISION_MAX_RETRIES=3             # transient 5xx / URLError retries (default 3)
+EVALUATOR_VISION_RETRY_BASE_DELAY=2.0      # exponential backoff base in seconds (default 2.0)
+```
+
+Optional planner / repair tuning (`.env`):
+
+```bash
+MAX_DELIVERABLES_PER_SPRINT=5      # validator hard cap; raise to relax sprint sizing
+MAX_EXIT_CRITERIA_PER_SPRINT=5     # validator hard cap on exit_criteria
+MAX_REPAIR_BLOCK_ATTEMPTS=3        # extra Stop-blocks before the harness lets an incomplete repair through
 ```
 
 ## Model Configuration
@@ -187,7 +203,7 @@ The frontend dev server is published to `127.0.0.1:5173` on the host only, so a 
 
 ## Running WebGen-Bench
 
-`harness-bench` runs the harness end-to-end against [WebGen-Bench](https://github.com/mnluzimu/WebGen-Bench) and aggregates UI-functional + appearance scores into `summary.{json,md}`. The bench's evaluation phase is unchanged; the harness's own evaluator is *not* replaced. Each sample gets its own sub-workdir and subprocess so a crash in one sample doesn't pollute the next.
+`harness-bench` runs the harness end-to-end against [WebGen-Bench](https://github.com/mnluzimu/WebGen-Bench) and aggregates UI-functional + appearance scores into `summary.{json,md}`. The bench's evaluation phase is unchanged; the harness's own evaluator is *not* replaced. Each sample gets its own sub-workdir and subprocess so a crash in one sample doesn't pollute the next, and the harness phase can now run several samples concurrently.
 
 ### Requirements (in addition to the base harness requirements)
 
@@ -219,6 +235,31 @@ uv run harness-bench webgen \
 ```
 
 `--harness-args` is forwarded verbatim to the harness CLI for each sample.
+
+### Concurrent harness run
+
+The harness phase is serial by default (`--concurrency 1`), which matches the old behavior. Increase `--concurrency` to run several harness samples at the same time before the shared WebGen-Bench evaluation pass starts.
+
+```bash
+uv run harness-bench webgen \
+  --jsonl awesome-web-bench/webgen-bench/WebGen-Bench/data/test.jsonl \
+  --runs-dir runs/parallel-4 \
+  --strata application_type --per-stratum 1 --seed 42 \
+  --concurrency 4 \
+  --frontend-port-base 5173 \
+  --vlm-base-url https://your-openai-compatible-endpoint/v1 \
+  --vlm-model gpt-4o-mini \
+  --harness-args "--max-rounds 3 --max-budget 30 --playwright-headless"
+```
+
+Port assignment rules in concurrent mode:
+
+- Worker ports come from the contiguous range `[--frontend-port-base, --frontend-port-base + --concurrency)`.
+- With `--concurrency 4 --frontend-port-base 5173`, workers use ports `5173`, `5174`, `5175`, and `5176`.
+- Startup fails fast if any port in that range is already listening; the bench runner does not kill unrelated local processes.
+- In concurrent mode, `--harness-args` must not contain `--frontend-port` or `--workdir`, because the bench runner owns both values per sample.
+
+Single-worker runs may still override the frontend port through `--harness-args "--frontend-port 6000"` if needed.
 
 ### Stratified subset (recommended for first real run)
 
@@ -261,6 +302,8 @@ uv run harness-bench webgen --jsonl ... --runs-dir runs/stratified-1 --skip-harn
 
 `--resume` aborts cleanly if `runs/<run>/manifest.json` is absent (typoed `--runs-dir`). `--skip-harness` forces every sample's harness status to `completed` and proceeds straight to packaging + bench.
 
+`--resume` also repairs interrupted concurrent runs: samples left in `running` are reset to `pending`, and any sample whose `samples/<id>/.harness/harness_state.json` already shows a final completed evaluation is promoted back to `completed` instead of being dispatched again.
+
 ### Output layout
 
 Given `--runs-dir runs/foo/`:
@@ -285,6 +328,8 @@ runs/foo/
 ```
 
 The original `sample_id` and the bench-positional `app_id` are both recorded in `bench_input/<app_id>.json._meta` for traceability.
+
+In a concurrent run, `logs/harness_<sample_id>.log` remains per-sample, so interleaved worker output is still easy to inspect after the run.
 
 ### How the verdict is computed
 
@@ -328,6 +373,9 @@ Given `--workdir ./e2e-test-1`, the harness writes:
 - `./e2e-test-1/.harness/build_log.md`: generator self-evaluation
 - `./e2e-test-1/.harness/feedback_round_N.md`: evaluator feedback
 - `./e2e-test-1/.harness/grade_round_N.json`: evaluator grades (functional + appearance merged)
+- `./e2e-test-1/.harness/repair_targets_round_N.json`: structured repair list seeded from the prior round's failed checks / exit criteria / bugs (only present when round N is in repair mode)
+- `./e2e-test-1/.harness/repair_report_round_N.json`: generator's per-target completion report; the Stop hook blocks the agent's stop until this exists and every target is `addressed=true` (or up to `MAX_REPAIR_BLOCK_ATTEMPTS` retries)
+- `./e2e-test-1/.harness/repair_incomplete_round_N.json`: written when the retry budget is exhausted; lists any unaddressed target ids so the next round's evaluator can surface them
 - `./e2e-test-1/.harness/visual_manifest_round_N.json`: screenshot manifest for the vision scorer
 - `./e2e-test-1/.harness/visual_round_N_*.png`: screenshots captured for the vision scorer
 - `./e2e-test-1/.harness/harness_state.json`: resume checkpoint
@@ -352,6 +400,18 @@ Each round runs three components:
 3. A **vision scorer** that posts those screenshots directly to a vision endpoint (Anthropic Messages API by default, or an OpenAI-compatible chat completions endpoint when `EVALUATOR_VISION_ENDPOINT_TYPE=openai`) and overrides the placeholder appearance values produced by the functional evaluator.
 
 The harness then merges the appearance pass into `grade_round_N.json`, recomputes the verdict, and decides whether to repair the current sprint, advance to the next sprint, or complete the run.
+
+### Repair Completion Protocol
+
+When the harness opens a repair round, it derives a structured list of **targets** from the previous round's `grade_round_{N-1}.json` — every failed UI check, every failed exit criterion, every critical/major bug, and every free-form `repair_instruction` — and writes it to `.harness/repair_targets_round_N.json`. Each target carries a stable `id`, a `summary`, and `file_hints` extracted from the evaluator's notes (e.g. `frontend/src/components/PriceChart.jsx`).
+
+The generator's repair prompt requires it to write `.harness/repair_report_round_N.json` listing one entry per target with `addressed=true|false`, `files_modified`, and a short `notes`/`reason`. A `Stop` hook reads both files when the agent tries to end its turn:
+
+- if the report is missing → block, ask the agent to write it
+- if any target is missing or `addressed=false` → block with the unaddressed ids in the feedback message
+- after `MAX_REPAIR_BLOCK_ATTEMPTS` blocks → write `.harness/repair_incomplete_round_N.json` and let the stop through, so the harness rolls into the next round (where the same items reappear in the next grade and re-trigger repair) instead of looping forever.
+
+This closes the failure mode where the generator silently dropped 1-2 of the harder repair instructions per round (CSS cascade ordering, WebGL rendering setup, etc.) and let the same `partial`/`fail` items reappear across many rounds.
 
 ## Debugging
 
@@ -390,10 +450,13 @@ sed -n '1,160p' ./e2e-test-1/.harness/traces/visual_capture_round_1.jsonl
 Useful trace signals:
 
 - `run_start`: agent invocation parameters
-- `permission_check`: tool allow/deny decisions
-- `sdk_message`: streamed SDK events
+- `permission_check`: tool allow/deny decisions from the `can_use_tool` callback (fires for tools NOT in `--allowedTools`)
+- `sdk_message`: streamed SDK events (look for `ToolUseBlock` with `name=Bash` to see what command the agent ran)
 - `sdk_stderr`: Claude Code CLI stderr
+- `repair_block` / `repair_block_exhausted`: Stop hook activity in repair mode (block reasons, attempts left, exhausted budget)
 - `run_complete`: final result + cost
+
+Vision-scorer transient retries (5xx / connection failures) are logged via the harness logger, not the per-agent trace, since the vision pass runs over plain HTTP rather than the SDK. Look for `vision scorer attempt N/M failed; retrying in ...` in the harness console output.
 
 ## Architecture Notes
 
@@ -418,9 +481,11 @@ The harness currently uses:
 
 What `sdk_runner.py` *does* enforce, on top of the Claude Agent SDK's own `can_use_tool` callback:
 
+- **PreToolUse Bash hook**: every `Bash` invocation is run through `_validate_bash_command` (or `_validate_bash_command_readonly` for the evaluator) *before* the CLI executes it. The CLI auto-allows tools listed in `--allowedTools` and never asks `can_use_tool` for them, so the gate has to live on PreToolUse for the validator to actually fire on the generator's Bash usage.
+- Bash command tokens reject shell control operators (`&&`, `||`, `|`, `;`, `>`, `<`, `$(`, backticks, **bare `&` background-fork**, newlines), absolute paths, `..`, and `~` shortcuts.
+- Bash is restricted to a hardcoded executable allowlist; `git` is restricted to `status`, `diff`, `log`, `show`, `add`, `commit`, `rev-parse`, `branch`, `ls-files`, `stash` — no `push`, `clone`, `fetch`, `remote`, `config`, `submodule`, and no flags before the subcommand;
+- the **evaluator** runs Bash under a stricter `read_only` profile: smaller allowlist (no `cp`/`mv`/`touch`/`mkdir`/`sed`), `python`/`python3`/`node` reject `-c`/`-e`/`--eval`/`-i` so inline code execution is blocked, `git` is restricted to read-only subcommands, and `npm`/`pnpm`/`yarn`/`npx` only accept `list`/`view`/`info`/`outdated`/`ls` (no `install`/`build`/`test`/`run`);
 - file paths handed to `Read` / `Write` / `Edit` / `MultiEdit` / `Glob` / `Grep` / `LS` must resolve inside `workdir` (no `..`, no absolute paths, no `~` shortcuts);
-- Bash is restricted to a hardcoded executable allowlist;
-- `git` is restricted to `status`, `diff`, `log`, `show`, `add`, `commit`, `rev-parse`, `branch`, `ls-files`, `stash` — no `push`, `clone`, `fetch`, `remote`, `config`, `submodule`, and no flags before the subcommand;
 - `find` rejects `-exec`, `-execdir`, `-delete`, `-fprint*`, `-ok`, `-okdir`, `-print0`, `-fls`;
 - the Playwright MCP browser is only allowed to navigate to `http(s)://{127.0.0.1, localhost, ::1}` on the configured frontend port — `file://`, cloud metadata IPs, and other localhost ports are rejected;
 - the dedicated vision scorer only accepts screenshot paths under `<workdir>/.harness/` with a `.png` suffix;
