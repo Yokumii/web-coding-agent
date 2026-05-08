@@ -26,7 +26,7 @@ from src.orchestration.pricing import estimate_cost_usd
 LOCAL_AGENT_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"}
 LOCAL_AGENT_TOOLS_WITH_BASH = LOCAL_AGENT_TOOLS | {"Bash"}
 PLAYWRIGHT_TOOL_PREFIX = "mcp__playwright__"
-_DISALLOWED_SHELL_SNIPPETS = ("&&", "||", "|", ";", ">", "<", "$(", "`", "\n", "\r")
+_DISALLOWED_SHELL_SNIPPETS = ("&&", "||", "|", ";", ">", "<", "$(", "`", "&", "\n", "\r")
 # Token check kept for documentation; the real gate is the allowlist below.
 _DISALLOWED_BASH_COMMANDS = {
     "rm",
@@ -197,6 +197,71 @@ async def _keepalive_hook(_input: Any, _tool_use_id: str | None, _context: Any) 
     requests to fail with `Stream closed` on single-shot streamed prompts.
     """
     return {"continue_": True}
+
+
+def make_bash_pretool_hook(*, bash_profile: str = "full"):
+    """Validate every Bash invocation via PreToolUse, regardless of allowedTools.
+
+    The Claude CLI auto-allows tools listed in ``--allowedTools`` and never asks
+    ``can_use_tool``. The generator runs with Bash in that allowlist, so the
+    legacy ``_validate_bash_command`` gate never fired for it (verified by
+    counting ``permission_check`` events in real run traces — always 0).
+    PreToolUse hooks fire for every tool call in any mode, so this is the
+    only place the harness can actually deny a Bash command.
+
+    Returns a hook callback. Non-Bash tool events pass through with
+    ``permissionDecision="allow"``. Bash events run through
+    :func:`_validate_bash_command` (or :func:`_validate_bash_command_readonly`
+    when ``bash_profile="read_only"``) and emit ``deny`` with the validator's
+    error message on failure.
+    """
+    if bash_profile not in {"full", "read_only"}:
+        raise ValueError(f"unsupported bash_profile: {bash_profile!r}")
+
+    async def _hook(
+        input_data: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        tool_name = ""
+        tool_input: dict[str, Any] = {}
+        if isinstance(input_data, dict):
+            tool_name = str(input_data.get("tool_name", ""))
+            raw_input = input_data.get("tool_input", {})
+            if isinstance(raw_input, dict):
+                tool_input = raw_input
+
+        if tool_name != "Bash":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                }
+            }
+
+        command = str(tool_input.get("command", ""))
+        try:
+            if bash_profile == "read_only":
+                _validate_bash_command_readonly(command)
+            else:
+                _validate_bash_command(command)
+        except ValueError as exc:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": str(exc),
+                }
+            }
+
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+            }
+        }
+
+    return _hook
 
 
 def make_repair_completion_hook(
@@ -770,7 +835,20 @@ def build_agent_options(
         }
 
     allowed_tools = sorted(LOCAL_AGENT_TOOLS_WITH_BASH if allow_bash else LOCAL_AGENT_TOOLS)
-    hooks = {"Stop": [HookMatcher(hooks=[stop_hook or _keepalive_hook])]}
+    hooks: dict[str, list[HookMatcher]] = {
+        "Stop": [HookMatcher(hooks=[stop_hook or _keepalive_hook])],
+    }
+    if allow_bash:
+        # PreToolUse fires for every tool call regardless of allowedTools, so
+        # this is the gate that actually catches `npx vite … &`, `cd /abs && …`,
+        # `sed -i`, etc. before the CLI executes them. can_use_tool is bypassed
+        # for tools in --allowedTools, so we cannot rely on it for Bash.
+        hooks["PreToolUse"] = [
+            HookMatcher(
+                matcher="Bash",
+                hooks=[make_bash_pretool_hook(bash_profile=bash_profile)],
+            )
+        ]
 
     env = {}
     if config.api_key:

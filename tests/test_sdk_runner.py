@@ -15,6 +15,7 @@ from src.agents.sdk_runner import (
     run_sdk_agent,
 )
 from src.config import HarnessConfig
+from src.orchestration.pricing import estimate_cost_usd
 
 
 @pytest.fixture
@@ -416,10 +417,10 @@ async def test_run_sdk_agent_returns_cost(monkeypatch, tmp_path: Path):
     )
 
     assert result.result == "done"
-    # glm-5.1 at $0.30 / 1M input tokens → 1_000_000 * 0.30 / 1e6 = $0.30.
+    expected_cost = estimate_cost_usd("glm-5.1", {"input_tokens": 1_000_000})
     # The SDK's total_cost_usd (1.5) is intentionally ignored so a proxy
     # to a non-Claude backend can't bypass the budget gate.
-    assert cost == 0.3
+    assert cost == expected_cost
     assert cost != 1.5
     assert assistant_text == "assistant text"
     assert permission_denials == []
@@ -592,3 +593,138 @@ async def test_full_bash_profile_remains_default_for_generator(tmp_path: Path):
     assert result.behavior == "allow"
     result = await callback("Bash", {"command": "git add file"}, None)
     assert result.behavior == "allow"
+
+
+# --- PreToolUse Bash gate ---
+
+
+@pytest.mark.anyio
+async def test_bash_pretool_hook_denies_disallowed_in_full_profile(tmp_path: Path):
+    from src.agents.sdk_runner import make_bash_pretool_hook
+
+    hook = make_bash_pretool_hook(bash_profile="full")
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls /etc/passwd && cat foo"},
+            "tool_use_id": "x",
+        },
+        None,
+        {},
+    )
+    spec = out["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny"
+    assert spec["hookEventName"] == "PreToolUse"
+    assert "shell control" in spec["permissionDecisionReason"]
+
+
+@pytest.mark.anyio
+async def test_bash_pretool_hook_denies_background_fork_ampersand(tmp_path: Path):
+    from src.agents.sdk_runner import make_bash_pretool_hook
+
+    hook = make_bash_pretool_hook(bash_profile="full")
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "npx vite --host 127.0.0.1 --port 3000 &\nsleep 3\ncurl http://x"
+            },
+            "tool_use_id": "x",
+        },
+        None,
+        {},
+    )
+    spec = out["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny"
+    # Either the bare `&` or the `\n` triggers, both must be forbidden snippets.
+    assert "shell control" in spec["permissionDecisionReason"]
+
+
+@pytest.mark.anyio
+async def test_bash_pretool_hook_allows_clean_command(tmp_path: Path):
+    from src.agents.sdk_runner import make_bash_pretool_hook
+
+    hook = make_bash_pretool_hook(bash_profile="full")
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "tool_use_id": "x",
+        },
+        None,
+        {},
+    )
+    spec = out.get("hookSpecificOutput", {})
+    # Either explicit allow or no decision (which the SDK treats as "no opinion").
+    assert spec.get("permissionDecision", "allow") == "allow"
+
+
+@pytest.mark.anyio
+async def test_bash_pretool_hook_uses_readonly_profile_when_set(tmp_path: Path):
+    from src.agents.sdk_runner import make_bash_pretool_hook
+
+    hook = make_bash_pretool_hook(bash_profile="read_only")
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sed -i s/a/b/ foo"},
+            "tool_use_id": "x",
+        },
+        None,
+        {},
+    )
+    spec = out["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny"
+
+
+@pytest.mark.anyio
+async def test_bash_pretool_hook_passes_non_bash_tools_through(tmp_path: Path):
+    from src.agents.sdk_runner import make_bash_pretool_hook
+
+    hook = make_bash_pretool_hook(bash_profile="full")
+    out = await hook(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "frontend/src/x.tsx"},
+            "tool_use_id": "x",
+        },
+        None,
+        {},
+    )
+    # Non-Bash tools must not be denied by the bash hook.
+    spec = out.get("hookSpecificOutput", {})
+    assert spec.get("permissionDecision", "allow") == "allow"
+
+
+def test_disallowed_shell_snippets_includes_ampersand():
+    from src.agents.sdk_runner import _DISALLOWED_SHELL_SNIPPETS
+
+    # Background-fork `&` must be in the deny set so `npx vite ... &` is
+    # rejected by both the can_use_tool path and the PreToolUse hook.
+    assert "&" in _DISALLOWED_SHELL_SNIPPETS
+
+
+def test_build_agent_options_installs_pretooluse_bash_hook(tmp_path: Path):
+    """Generator agents must have a PreToolUse hook on Bash; the previous
+    setup gated only via can_use_tool, which the CLI bypasses for tools in
+    --allowedTools (Bash was always in there for the generator, so the
+    validator never ran)."""
+    from src.agents.sdk_runner import build_agent_options
+
+    options = build_agent_options(
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="claude-sonnet-4-6",
+        system_prompt="x",
+        max_turns=1,
+        allow_bash=True,
+    )
+    pretool = options.hooks.get("PreToolUse") or []
+    assert pretool, "expected a PreToolUse hook list"
+    matchers = [m.matcher for m in pretool]
+    assert "Bash" in matchers
