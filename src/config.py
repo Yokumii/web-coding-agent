@@ -40,6 +40,12 @@ class HarnessConfig:
     evaluator_vision_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("EVALUATOR_VISION_MAX_TOKENS", "1200"))
     )
+    evaluator_vision_max_retries: int = field(
+        default_factory=lambda: int(os.getenv("EVALUATOR_VISION_MAX_RETRIES", "3"))
+    )
+    evaluator_vision_retry_base_delay_seconds: float = field(
+        default_factory=lambda: float(os.getenv("EVALUATOR_VISION_RETRY_BASE_DELAY", "2.0"))
+    )
     sdk_max_buffer_size: int = field(
         default_factory=lambda: int(os.getenv("SDK_MAX_BUFFER_SIZE", str(8 * 1024 * 1024)))
     )

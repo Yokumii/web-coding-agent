@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+import json as _json
 from pathlib import Path
+from urllib import error
 
 import pytest
 
@@ -322,3 +325,210 @@ def test_extract_json_object_redacts_secrets_in_error_snippet():
         _extract_json_object(bad)
     assert "sk-AbCdEfGhIjKlMnOp" not in str(exc_info.value)
     assert "***" in str(exc_info.value)
+
+
+# --- transient retry ---
+
+
+class _FakeUrlopenContext:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _make_http_error(status: int) -> error.HTTPError:
+    fp = io.BytesIO(b'{"error":{"message":"transient"}}')
+    return error.HTTPError(
+        url="http://example/v1/messages",
+        code=status,
+        msg="Service Unavailable",
+        hdrs=None,
+        fp=fp,
+    )
+
+
+def _vision_config(**overrides) -> HarnessConfig:
+    base = dict(
+        evaluator_vision_model="claude-sonnet-4-6",
+        evaluator_vision_api_key="test-key",
+        evaluator_vision_base_url="https://api.anthropic.com",
+        evaluator_vision_endpoint_type="anthropic",
+        evaluator_vision_max_tokens=600,
+        evaluator_vision_max_retries=3,
+        evaluator_vision_retry_base_delay_seconds=0.0,
+    )
+    base.update(overrides)
+    return HarnessConfig(**base)
+
+
+def _seed_workdir(tmp_path: Path) -> tuple[Path, list[str], "FileComm"]:
+    from src.orchestration.file_comm import FileComm
+
+    harness = tmp_path / ".harness"
+    harness.mkdir(parents=True)
+    image = harness / "round_1_home.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    file_comm = FileComm(harness)
+    file_comm.write_spec("# Spec\n")
+    file_comm.write_design_tokens(
+        {
+            "theme_name": "x",
+            "color": {"bg": "#000"},
+            "typography": {"display": "Sans"},
+            "spacing": {"base": 8},
+            "radius": {"card": 12},
+            "motion": {"fast": 100},
+            "style_rules": ["bold"],
+            "anti_patterns": [],
+        }
+    )
+    return tmp_path, [".harness/round_1_home.png"], file_comm
+
+
+def _success_response_body() -> bytes:
+    return _json.dumps(
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": _json.dumps(
+                        {
+                            "phase_result": "pass",
+                            "appearance_review": {
+                                "render_stability": 5,
+                                "content_relevance": 5,
+                                "layout_harmony": 5,
+                                "modernness_memorability": 5,
+                                "token_adherence": 5,
+                                "notes": "ok",
+                            },
+                            "criteria_scores": {
+                                "design_quality": {"score": 8, "notes": ""},
+                                "originality": {"score": 7, "notes": ""},
+                                "craft": {"score": 8, "notes": ""},
+                            },
+                        }
+                    ),
+                }
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }
+    ).encode("utf-8")
+
+
+def test_vision_scorer_retries_on_transient_5xx_then_succeeds(monkeypatch, tmp_path):
+    from src.agents import vision_scorer
+
+    workdir, paths, file_comm = _seed_workdir(tmp_path)
+
+    calls: list[int] = []
+
+    def fake_urlopen(req, timeout=90):
+        calls.append(timeout)
+        if len(calls) <= 2:
+            raise _make_http_error(503)
+        return _FakeUrlopenContext(_success_response_body())
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(vision_scorer.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(vision_scorer.time, "sleep", lambda s: sleeps.append(s))
+
+    review, stats = vision_scorer._perform_visual_review_request(
+        config=_vision_config(),
+        file_comm=file_comm,
+        workdir=workdir,
+        sprint_num=1,
+        sprint_context={"title": "t", "goal": "g", "deliverables": [], "exit_criteria": []},
+        screenshot_paths=paths,
+    )
+
+    assert review["phase_result"] == "pass"
+    assert len(calls) == 3  # 2 failures + 1 success
+    assert len(sleeps) == 2
+    assert stats.cost_usd >= 0
+
+
+def test_vision_scorer_gives_up_after_max_retries_on_persistent_5xx(monkeypatch, tmp_path):
+    from src.agents import vision_scorer
+
+    workdir, paths, file_comm = _seed_workdir(tmp_path)
+
+    def fake_urlopen(req, timeout=90):
+        raise _make_http_error(503)
+
+    monkeypatch.setattr(vision_scorer.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(vision_scorer.time, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError, match=r"vision scorer HTTP 503"):
+        vision_scorer._perform_visual_review_request(
+            config=_vision_config(evaluator_vision_max_retries=2),
+            file_comm=file_comm,
+            workdir=workdir,
+            sprint_num=1,
+            sprint_context={"title": "t", "goal": "g", "deliverables": [], "exit_criteria": []},
+            screenshot_paths=paths,
+        )
+
+
+def test_vision_scorer_does_not_retry_on_4xx(monkeypatch, tmp_path):
+    from src.agents import vision_scorer
+
+    workdir, paths, file_comm = _seed_workdir(tmp_path)
+
+    calls: list[int] = []
+
+    def fake_urlopen(req, timeout=90):
+        calls.append(1)
+        raise _make_http_error(401)
+
+    monkeypatch.setattr(vision_scorer.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(vision_scorer.time, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError, match=r"vision scorer HTTP 401"):
+        vision_scorer._perform_visual_review_request(
+            config=_vision_config(),
+            file_comm=file_comm,
+            workdir=workdir,
+            sprint_num=1,
+            sprint_context={"title": "t", "goal": "g", "deliverables": [], "exit_criteria": []},
+            screenshot_paths=paths,
+        )
+
+    assert len(calls) == 1
+
+
+def test_vision_scorer_retries_on_url_error(monkeypatch, tmp_path):
+    from src.agents import vision_scorer
+
+    workdir, paths, file_comm = _seed_workdir(tmp_path)
+
+    calls: list[int] = []
+
+    def fake_urlopen(req, timeout=90):
+        calls.append(1)
+        if len(calls) == 1:
+            raise error.URLError("connection reset")
+        return _FakeUrlopenContext(_success_response_body())
+
+    monkeypatch.setattr(vision_scorer.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(vision_scorer.time, "sleep", lambda s: None)
+
+    review, _ = vision_scorer._perform_visual_review_request(
+        config=_vision_config(),
+        file_comm=file_comm,
+        workdir=workdir,
+        sprint_num=1,
+        sprint_context={"title": "t", "goal": "g", "deliverables": [], "exit_criteria": []},
+        screenshot_paths=paths,
+    )
+
+    assert review["phase_result"] == "pass"
+    assert len(calls) == 2

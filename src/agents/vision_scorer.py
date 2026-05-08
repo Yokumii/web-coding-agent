@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import random
 import re
 import time
 from dataclasses import replace
@@ -15,9 +16,17 @@ from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.orchestration.pricing import estimate_cost_usd
 from src.prompts.evaluator_vision import EVALUATOR_VISION_SYSTEM_PROMPT
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 _DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
+
+# Upstream / proxy errors that we treat as transient and retry. Everything
+# else (4xx, JSON parse failure, etc.) raises immediately so we don't mask
+# real bugs behind silent retries.
+_RETRYABLE_HTTP_STATUS = frozenset({500, 502, 503, 504, 520, 521, 522, 524, 529})
 
 # Patterns that look like API credentials in upstream error bodies. We
 # do NOT want these in trace files or harness logs.
@@ -442,6 +451,56 @@ def _extract_anthropic_message_text(parsed: dict[str, Any]) -> str:
     return "\n".join(part for part in text_parts if part)
 
 
+def _urlopen_with_retries(
+    *,
+    endpoint: str,
+    body: bytes,
+    headers: dict[str, str],
+    max_retries: int,
+    base_delay: float,
+) -> str:
+    """POST ``body`` to ``endpoint`` and retry on transient upstream failures.
+
+    Retries on HTTP 5xx / proxy 5xx codes in ``_RETRYABLE_HTTP_STATUS`` and on
+    socket-level ``URLError`` (connection reset, DNS, timeout). 4xx and other
+    errors raise immediately. ``max_retries`` is the number of additional
+    attempts after the first try, so ``max_retries=3`` means up to 4 calls.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            http_request = request.Request(endpoint, data=body, headers=headers, method="POST")
+            with request.urlopen(http_request, timeout=90) as response:
+                return response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            detail = _scrub_secrets(exc.read().decode("utf-8", errors="replace"))
+            wrapped = RuntimeError(f"vision scorer HTTP {exc.code}: {detail}")
+            wrapped.__cause__ = exc
+            if exc.code not in _RETRYABLE_HTTP_STATUS or attempt >= max_retries:
+                raise wrapped from exc
+            last_exc = wrapped
+        except error.URLError as exc:
+            wrapped = RuntimeError(
+                f"vision scorer connection failed: {_scrub_secrets(str(exc.reason))}"
+            )
+            wrapped.__cause__ = exc
+            if attempt >= max_retries:
+                raise wrapped from exc
+            last_exc = wrapped
+
+        delay = base_delay * (2 ** attempt)
+        if delay > 0:
+            delay *= 1.0 + random.uniform(-0.25, 0.25)
+        logger.warning(
+            f"vision scorer attempt {attempt + 1}/{max_retries + 1} failed: {last_exc}; "
+            f"retrying in {delay:.1f}s"
+        )
+        time.sleep(max(0.0, delay))
+
+    # Defensive: the loop should always exit via return-on-success or raise.
+    raise last_exc if last_exc else RuntimeError("vision scorer retry loop exited unexpectedly")
+
+
 def _perform_visual_review_request(
     *,
     config: HarnessConfig,
@@ -481,17 +540,13 @@ def _perform_visual_review_request(
     body = json.dumps(payload).encode("utf-8")
     started = time.perf_counter()
 
-    try:
-        http_request = request.Request(endpoint, data=body, headers=headers, method="POST")
-        with request.urlopen(http_request, timeout=90) as response:
-            response_body = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        detail = _scrub_secrets(exc.read().decode("utf-8", errors="replace"))
-        raise RuntimeError(f"vision scorer HTTP {exc.code}: {detail}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(
-            f"vision scorer connection failed: {_scrub_secrets(str(exc.reason))}"
-        ) from exc
+    response_body = _urlopen_with_retries(
+        endpoint=endpoint,
+        body=body,
+        headers=headers,
+        max_retries=max(0, int(config.evaluator_vision_max_retries)),
+        base_delay=max(0.0, float(config.evaluator_vision_retry_base_delay_seconds)),
+    )
 
     duration_ms = int((time.perf_counter() - started) * 1000)
     parsed = json.loads(response_body)
