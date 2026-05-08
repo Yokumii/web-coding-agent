@@ -134,7 +134,7 @@ def _validate_feature_list(feature_list: dict[str, Any]) -> None:
             )
 
 
-def _validate_sprint_plan(sprint_plan: dict[str, Any]) -> None:
+def _validate_sprint_plan(sprint_plan: dict[str, Any], config: HarnessConfig) -> None:
     total_sprints = sprint_plan.get("total_sprints")
     if not isinstance(total_sprints, int) or total_sprints < 1:
         raise RuntimeError(
@@ -160,12 +160,24 @@ def _validate_sprint_plan(sprint_plan: dict[str, Any]) -> None:
         _require_non_empty_list(
             f"sprint_plan.json.sprints[{index}].feature_ids", sprint_dict["feature_ids"]
         )
-        _require_non_empty_list(
+        deliverables = _require_non_empty_list(
             f"sprint_plan.json.sprints[{index}].deliverables", sprint_dict["deliverables"]
         )
-        _require_non_empty_list(
+        if len(deliverables) > config.max_deliverables_per_sprint:
+            raise RuntimeError(
+                f"Planner wrote invalid sprint_plan.json: sprint {sprint_dict['number']} has "
+                f"{len(deliverables)} deliverables; max allowed is "
+                f"{config.max_deliverables_per_sprint}. Split into smaller sprints."
+            )
+        exit_criteria = _require_non_empty_list(
             f"sprint_plan.json.sprints[{index}].exit_criteria", sprint_dict["exit_criteria"]
         )
+        if len(exit_criteria) > config.max_exit_criteria_per_sprint:
+            raise RuntimeError(
+                f"Planner wrote invalid sprint_plan.json: sprint {sprint_dict['number']} has "
+                f"{len(exit_criteria)} exit_criteria; max allowed is "
+                f"{config.max_exit_criteria_per_sprint}. Split into smaller sprints."
+            )
 
 
 def _validate_ui_verification_plan(verification_plan: dict[str, Any]) -> None:
@@ -218,7 +230,11 @@ def _validate_ui_verification_plan(verification_plan: dict[str, Any]) -> None:
             )
 
 
-def _validate_planning_bundle(file_comm: FileComm) -> dict[str, Any]:
+def _validate_planning_bundle(
+    file_comm: FileComm, config: HarnessConfig | None = None
+) -> dict[str, Any]:
+    if config is None:
+        config = HarnessConfig()
     spec = file_comm.read_spec()
     if not spec:
         raise RuntimeError("Planner completed without writing .harness/spec.md.")
@@ -238,7 +254,7 @@ def _validate_planning_bundle(file_comm: FileComm) -> dict[str, Any]:
     sprint_plan = file_comm.read_sprint_plan()
     if sprint_plan is None:
         raise RuntimeError("Planner completed without writing .harness/sprint_plan.json.")
-    _validate_sprint_plan(_require_dict("sprint_plan.json", sprint_plan))
+    _validate_sprint_plan(_require_dict("sprint_plan.json", sprint_plan), config)
 
     verification_plan = file_comm.read_ui_verification_plan()
     if verification_plan is None:
@@ -392,7 +408,7 @@ async def run_planner(
                 "used final result text as fallback."
             )
 
-    sprint_plan = _validate_planning_bundle(file_comm)
+    sprint_plan = _validate_planning_bundle(file_comm, config)
     _initialize_accepted_sprints(file_comm, sprint_plan)
 
     if permission_denials:

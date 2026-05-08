@@ -53,6 +53,13 @@ class HarnessConfig:
     generator_max_turns: int = 200
     evaluator_max_turns: int = 120
 
+    max_deliverables_per_sprint: int = field(
+        default_factory=lambda: int(os.getenv("MAX_DELIVERABLES_PER_SPRINT", "5"))
+    )
+    max_exit_criteria_per_sprint: int = field(
+        default_factory=lambda: int(os.getenv("MAX_EXIT_CRITERIA_PER_SPRINT", "5"))
+    )
+
     frontend_port: int = field(
         default_factory=lambda: int(os.getenv("FRONTEND_PORT", "5173"))
     )

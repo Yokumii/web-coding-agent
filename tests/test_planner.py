@@ -489,3 +489,64 @@ def test_validate_planning_bundle_rejects_sprint_plan_missing_a_sprint_number(tm
 
     with pytest.raises(RuntimeError, match="sprint"):
         _validate_planning_bundle(file_comm)
+
+
+# --- sprint sizing caps ---
+
+
+def test_validate_sprint_plan_rejects_too_many_deliverables(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    sprint_plan = file_comm.read_sprint_plan()
+    sprint_plan["sprints"][0]["deliverables"] = [f"Deliverable {i}" for i in range(6)]
+    file_comm.write_sprint_plan(sprint_plan)
+
+    with pytest.raises(RuntimeError, match=r"deliverables.*max allowed is 5"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_validate_sprint_plan_rejects_too_many_exit_criteria(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    sprint_plan = file_comm.read_sprint_plan()
+    sprint_plan["sprints"][0]["exit_criteria"] = [f"Criterion {i}" for i in range(6)]
+    file_comm.write_sprint_plan(sprint_plan)
+
+    with pytest.raises(RuntimeError, match=r"exit_criteria.*max allowed is 5"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_validate_sprint_plan_accepts_at_cap(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    sprint_plan = file_comm.read_sprint_plan()
+    sprint_plan["sprints"][0]["deliverables"] = [f"D{i}" for i in range(5)]
+    sprint_plan["sprints"][0]["exit_criteria"] = [f"C{i}" for i in range(5)]
+    file_comm.write_sprint_plan(sprint_plan)
+
+    assert _validate_planning_bundle(file_comm)["total_sprints"] == 2
+
+
+def test_validate_sprint_plan_respects_config_override_for_caps(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    sprint_plan = file_comm.read_sprint_plan()
+    sprint_plan["sprints"][0]["deliverables"] = [f"D{i}" for i in range(8)]
+    file_comm.write_sprint_plan(sprint_plan)
+
+    relaxed = HarnessConfig(max_deliverables_per_sprint=8)
+    assert _validate_planning_bundle(file_comm, relaxed)["total_sprints"] == 2
+
+
+def test_planner_prompt_documents_sprint_size_caps():
+    from src.prompts.planner import PLANNER_SYSTEM_PROMPT
+
+    # Hard cap on per-sprint scope must be visible in the system prompt so
+    # the planner doesn't ship 8-deliverable mega-sprints (see test-chunk-1-c2).
+    assert "5 deliverables" in PLANNER_SYSTEM_PROMPT
+    assert "5 exit_criteria" in PLANNER_SYSTEM_PROMPT
+    assert "vertical slice" in PLANNER_SYSTEM_PROMPT.lower()
