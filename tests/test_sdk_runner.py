@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -462,6 +463,223 @@ async def test_run_sdk_agent_returns_permission_denials_without_failing(monkeypa
     assert cost == 0.0
     assert assistant_text == ""
     assert permission_denials == ["Write denied"]
+
+
+@pytest.mark.anyio
+async def test_run_sdk_agent_stops_after_result_message_even_if_stream_hangs(
+    monkeypatch,
+    tmp_path: Path,
+):
+    closed = {"value": False}
+
+    async def fake_query(*, prompt, options):
+        _ = [message async for message in prompt]
+        del options
+        try:
+            yield ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.0,
+                result="done",
+            )
+            await asyncio.Event().wait()
+        finally:
+            closed["value"] = True
+
+    monkeypatch.setattr("src.agents.sdk_runner.query", fake_query)
+
+    result, cost, assistant_text, permission_denials = await asyncio.wait_for(
+        run_sdk_agent(
+            prompt="hello",
+            config=HarnessConfig(),
+            workdir=tmp_path,
+            model="glm-5.1",
+            system_prompt="system",
+            max_turns=5,
+            allow_bash=False,
+        ),
+        timeout=1.0,
+    )
+
+    assert result.result == "done"
+    assert cost == 0.0
+    assert assistant_text == ""
+    assert permission_denials == []
+    assert closed["value"] is True
+
+
+@pytest.mark.anyio
+async def test_run_sdk_agent_isolates_cancellation_during_stream_close(
+    monkeypatch,
+    tmp_path: Path,
+):
+    class FakeStream:
+        def __init__(self) -> None:
+            self.sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.0,
+                result="done",
+            )
+
+        async def aclose(self):
+            # Simulate an anyio-backed shutdown path that cancels the task
+            # performing stream close. The parent harness task must not retain
+            # that cancellation after `run_sdk_agent()` returns.
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    def fake_query(*, prompt, options):
+        del prompt, options
+        return FakeStream()
+
+    monkeypatch.setattr("src.agents.sdk_runner.query", fake_query)
+
+    result, cost, assistant_text, permission_denials = await run_sdk_agent(
+        prompt="hello",
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=5,
+        allow_bash=False,
+    )
+
+    assert result.result == "done"
+    assert cost == 0.0
+    assert assistant_text == ""
+    assert permission_denials == []
+    # If the parent task were still marked cancelled, this await would raise.
+    await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
+async def test_run_sdk_agent_clears_delayed_parent_cancellation_after_success(
+    monkeypatch,
+    tmp_path: Path,
+):
+    parent_task: asyncio.Task | None = None
+
+    async def fake_query(*, prompt, options):
+        nonlocal parent_task
+        _ = [message async for message in prompt]
+        del options
+        parent_task = asyncio.current_task()
+        try:
+            yield ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.0,
+                result="done",
+            )
+        finally:
+            assert parent_task is not None
+            asyncio.get_running_loop().call_soon(parent_task.cancel)
+
+    monkeypatch.setattr("src.agents.sdk_runner.query", fake_query)
+
+    result, cost, assistant_text, permission_denials = await run_sdk_agent(
+        prompt="hello",
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=5,
+        allow_bash=False,
+    )
+
+    assert result.result == "done"
+    assert cost == 0.0
+    assert assistant_text == ""
+    assert permission_denials == []
+    # The delayed parent-task cancellation fired after the stream had already
+    # produced its result. The SDK boundary must clear it before returning.
+    await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
+async def test_run_sdk_agent_waits_for_stream_close_despite_parent_cancellation(
+    monkeypatch,
+    tmp_path: Path,
+):
+    parent_task: asyncio.Task | None = None
+    close_finished = {"value": False}
+
+    class FakeStream:
+        def __init__(self) -> None:
+            self.sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            nonlocal parent_task
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            parent_task = asyncio.current_task()
+            return ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.0,
+                result="done",
+            )
+
+        async def aclose(self):
+            assert parent_task is not None
+            parent_task.cancel()
+            await asyncio.sleep(0)
+            close_finished["value"] = True
+
+    def fake_query(*, prompt, options):
+        del prompt, options
+        return FakeStream()
+
+    monkeypatch.setattr("src.agents.sdk_runner.query", fake_query)
+
+    result, cost, assistant_text, permission_denials = await run_sdk_agent(
+        prompt="hello",
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=5,
+        allow_bash=False,
+    )
+
+    assert result.result == "done"
+    assert cost == 0.0
+    assert assistant_text == ""
+    assert permission_denials == []
+    assert close_finished["value"] is True
+    await asyncio.sleep(0)
 
 
 @pytest.mark.anyio

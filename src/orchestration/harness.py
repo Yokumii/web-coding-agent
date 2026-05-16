@@ -82,6 +82,62 @@ def _coerce_agent_run_stats(stats: AgentRunStats | float | int) -> AgentRunStats
     )
 
 
+def _clear_current_task_cancellation() -> int:
+    task = asyncio.current_task()
+    if task is None:
+        return 0
+
+    cleared = 0
+    while task.cancelling():
+        task.uncancel()
+        cleared += 1
+    return cleared
+
+
+async def _close_app_stack_safely(app_stack) -> None:
+    """Close the dev server stack without letting leaked cancellations win.
+
+    Some SDK-backed evaluator shutdown paths can leave the harness task in a
+    cancelling state *after* a successful result has already been returned.
+    If that leaked cancellation lands on the next await, the harness loses the
+    completed evaluation checkpoint while merely trying to stop the frontend.
+    Run the close operation in a shielded child task, then keep clearing any
+    leaked parent-task cancellation until the cleanup task has really finished.
+    """
+    close_task = asyncio.create_task(app_stack.close(), name="app_stack_close")
+    suppressed = 0
+    try:
+        while True:
+            try:
+                await asyncio.shield(close_task)
+                break
+            except asyncio.CancelledError:
+                cleared = _clear_current_task_cancellation()
+                suppressed += max(cleared, 1)
+                if close_task.done():
+                    break
+
+        if close_task.cancelled():
+            logger.warning(
+                "[bold yellow]App stack cleanup task was cancelled after evaluation; "
+                "continuing with the completed round state.[/]"
+            )
+            return
+
+        exc = close_task.exception()
+        if exc is not None:
+            raise exc
+
+        if suppressed > 0:
+            logger.warning(
+                "[bold yellow]Suppressed leaked cancellation during app stack cleanup "
+                "after evaluation.[/]"
+            )
+    finally:
+        if not close_task.done():
+            close_task.cancel()
+
+
 def _copy_phase_metrics(existing: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     if not isinstance(existing, dict):
         return {}
@@ -609,22 +665,20 @@ async def run_harness(
             evaluate_started_at = time.perf_counter()
             app_stack = await start_app_stack(workdir, harness_dir, config, round_num)
             try:
-                evaluator_result, visual_capture_result = await _gather_or_cancel(
-                    run_evaluator(
-                        config, file_comm, workdir,
-                        round_num=round_num,
-                        app_url=app_stack.frontend_url,
-                    ),
-                    run_visual_capture(
-                        config,
-                        file_comm,
-                        workdir,
-                        round_num=round_num,
-                        app_url=app_stack.frontend_url,
-                    ),
+                evaluator_result = await run_evaluator(
+                    config, file_comm, workdir,
+                    round_num=round_num,
+                    app_url=app_stack.frontend_url,
                 )
             finally:
-                await app_stack.close()
+                await _close_app_stack_safely(app_stack)
+            visual_capture_result = await run_visual_capture(
+                config,
+                file_comm,
+                workdir,
+                round_num=round_num,
+                app_url=app_stack.frontend_url,
+            )
             passed, grades, evaluator_stats = evaluator_result
             visual_manifest, visual_capture_stats = visual_capture_result
             evaluator_stats = _coerce_agent_run_stats(evaluator_stats).with_wall_duration(
@@ -691,7 +745,7 @@ async def run_harness(
             accepted_sprints = next_accepted_sprints
 
             if cost_tracker.is_over_budget():
-                # Evaluate phase fans into evaluator + visual_capture +
+                # Evaluate phase now includes evaluator + manifest collection +
                 # visual_score, any of which can spike cost. Without this gate
                 # a single round could run far past max_budget_usd before the
                 # next round's build-phase check noticed.

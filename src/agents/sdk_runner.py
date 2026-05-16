@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
@@ -534,6 +535,40 @@ async def _single_prompt_stream(prompt: str):
     }
 
 
+def _clear_current_task_cancellation() -> int:
+    task = asyncio.current_task()
+    if task is None:
+        return 0
+
+    cleared = 0
+    while task.cancelling():
+        task.uncancel()
+        cleared += 1
+    return cleared
+
+
+async def _drain_leaked_cancellation_after_success(
+    *,
+    result_message: ResultMessage | None,
+    trace_writer: SdkTraceWriter | None,
+) -> None:
+    if result_message is None:
+        return
+
+    try:
+        # Yield one event-loop turn so delayed cancellations scheduled by
+        # async-generator finalizers land here, within the SDK boundary,
+        # instead of poisoning the caller's next unrelated await.
+        await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        cleared = _clear_current_task_cancellation()
+        if trace_writer:
+            trace_writer.write(
+                "post_success_cancellation_suppressed",
+                {"cleared": cleared},
+            )
+
+
 def _resolve_path(path: str, workdir: Path) -> Path:
     candidate = Path(path)
     if not candidate.is_absolute():
@@ -928,16 +963,79 @@ async def run_sdk_agent(
     result_message: ResultMessage | None = None
     last_assistant_text = ""
     permission_denials: list[Any] = []
-    async for message in query(prompt=_single_prompt_stream(prompt), options=options):
-        if trace_writer:
-            trace_writer.write("sdk_message", _serialize_sdk_message(message))
-        if isinstance(message, ResultMessage):
-            result_message = message
-            permission_denials = list(message.permission_denials or [])
-        elif isinstance(message, AssistantMessage):
-            text = _extract_text_from_assistant_message(message)
-            if text:
-                last_assistant_text = text
+    stream = query(prompt=_single_prompt_stream(prompt), options=options)
+    try:
+        async for message in stream:
+            if trace_writer:
+                trace_writer.write("sdk_message", _serialize_sdk_message(message))
+            if isinstance(message, ResultMessage):
+                result_message = message
+                permission_denials = list(message.permission_denials or [])
+                # Some SDK backends emit the terminal ResultMessage and then
+                # keep the stream open instead of closing it promptly. Treat
+                # ResultMessage as authoritative and stop consuming here so
+                # the harness does not appear stuck in Generator/Evaluator.
+                break
+            if isinstance(message, AssistantMessage):
+                text = _extract_text_from_assistant_message(message)
+                if text:
+                    last_assistant_text = text
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            # Some SDK / anyio-backed stream implementations cancel the task
+            # executing `aclose()` as part of their internal shutdown path.
+            # If we close on the harness task directly, that cancellation can
+            # leak past a successful ResultMessage and poison the *next* await
+            # (e.g. generator commit via `git init`). Run close on a dedicated
+            # child task, shield it from parent-task cancellation, and keep
+            # draining leaked cancellations until shutdown has actually ended.
+            close_task = asyncio.create_task(aclose(), name="sdk_stream_close")
+            try:
+                suppressed = 0
+                while True:
+                    try:
+                        await asyncio.shield(close_task)
+                        break
+                    except asyncio.CancelledError:
+                        cleared = _clear_current_task_cancellation()
+                        suppressed += max(cleared, 1)
+                        if result_message is None:
+                            raise
+                        if close_task.done():
+                            break
+                if close_task.cancelled():
+                    if result_message is None:
+                        raise RuntimeError("Agent SDK stream close task was cancelled")
+                    if trace_writer:
+                        trace_writer.write(
+                            "stream_close_cancelled",
+                            {
+                                "suppressed": True,
+                                "task_cancelled": True,
+                                "cleared": suppressed,
+                            },
+                        )
+                else:
+                    close_exc = close_task.exception()
+                    if close_exc is not None:
+                        raise close_exc
+                    if suppressed > 0 and trace_writer:
+                        trace_writer.write(
+                            "stream_close_cancelled",
+                            {
+                                "suppressed": True,
+                                "task_cancelled": False,
+                                "cleared": suppressed,
+                            },
+                        )
+            finally:
+                if not close_task.done():
+                    close_task.cancel()
+        await _drain_leaked_cancellation_after_success(
+            result_message=result_message,
+            trace_writer=trace_writer,
+        )
 
     if result_message is None:
         raise RuntimeError("Agent SDK returned no result message")

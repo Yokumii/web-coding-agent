@@ -4,69 +4,21 @@ import json
 from pathlib import Path
 from typing import Any
 
-from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
+from src.agents.sdk_runner import AgentRunStats
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
-from src.prompts.visual_capture import VISUAL_CAPTURE_SYSTEM_PROMPT
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
-async def run_visual_capture(
-    config: HarnessConfig,
-    file_comm: FileComm,
-    workdir: Path,
-    round_num: int,
-    app_url: str,
-) -> tuple[dict[str, Any], AgentRunStats]:
-    logger.info(
-        f"[bold magenta]Visual capture[/] round {round_num} starting at {app_url}"
-    )
-    prompt = _build_visual_capture_prompt(
-        round_num=round_num,
-        app_url=app_url,
-        workdir=workdir,
-    )
-    response, total_cost, _assistant_text, permission_denials = await run_sdk_agent(
-        prompt=prompt,
-        config=config,
-        workdir=workdir,
-        model=config.evaluator_model,
-        system_prompt=VISUAL_CAPTURE_SYSTEM_PROMPT,
-        max_turns=40,
-        allow_bash=False,
-        allow_playwright=True,
-        trace_path=file_comm.dir / "traces" / f"visual_capture_round_{round_num}.jsonl",
-    )
-    if permission_denials:
-        logger.warning(
-            f"[bold yellow]Visual capture[/] completed with permission denials: {permission_denials}"
-        )
-
-    manifest = file_comm.read_visual_manifest(round_num) or _fallback_manifest(file_comm, round_num)
-    logger.info(
-        f"[bold magenta]Visual capture[/] round {round_num} captured "
-        f"{len(manifest.get('screenshots', []))} screenshot(s). Cost: ${total_cost:.4f}"
-    )
-    return manifest, build_agent_run_stats(response, model=config.evaluator_model)
-
-
-def _build_visual_capture_prompt(*, round_num: int, app_url: str, workdir: Path) -> str:
-    lines = [
-        f"Application URL: {app_url}",
-        f"Round: {round_num}",
-        "",
-        "Goal:",
-        "- Capture representative screenshots for external visual review.",
-        "",
-        "Required Steps:",
-        "1. Open the application URL.",
-        "2. Wait until the page is stable enough for screenshots.",
-        f"3. Capture `.harness/visual_round_{round_num}_home.png` at the top of the page.",
-        f"4. If the page meaningfully scrolls, capture `.harness/visual_round_{round_num}_mid.png` from a middle section.",
-        f"5. If the page meaningfully scrolls, capture `.harness/visual_round_{round_num}_bottom.png` near the bottom section.",
-        f"6. Write `.harness/visual_manifest_round_{round_num}.json` with this schema:",
+def build_visual_capture_requirements(*, round_num: int, app_url: str) -> list[str]:
+    return [
+        "Phase C: Deferred Visual Review Capture",
+        f"- During this evaluator run, capture `.harness/visual_round_{round_num}_home.png` at the top of the page.",
+        f"- If the page meaningfully scrolls, also capture `.harness/visual_round_{round_num}_mid.png` from a middle section.",
+        f"- If the page meaningfully scrolls, also capture `.harness/visual_round_{round_num}_bottom.png` near the bottom section.",
+        f"- Write `.harness/visual_manifest_round_{round_num}.json` with this schema:",
         json.dumps(
             {
                 "round": round_num,
@@ -80,18 +32,38 @@ def _build_visual_capture_prompt(*, round_num: int, app_url: str, workdir: Path)
             },
             indent=2,
         ),
-        "",
-        "Rules:",
-        "- `.harness` already exists. Do not create directories.",
-        "- Do not call Bash.",
         "- Only include screenshots that were actually created.",
         "- Use only relative paths such as `.harness/visual_round_1_home.png`.",
         "- Save screenshots via the browser screenshot tool filename argument.",
         "- Write the manifest with the Write tool only.",
-        "- Do not write grades or evaluation results.",
-        f"Workdir: {workdir}",
+        "- Keep the appearance verdict as a placeholder for the downstream VLM review; do not treat this capture step as the final visual score.",
     ]
-    return "\n".join(lines)
+
+
+async def run_visual_capture(
+    config: HarnessConfig,
+    file_comm: FileComm,
+    workdir: Path,
+    round_num: int,
+    app_url: str,
+) -> tuple[dict[str, Any], AgentRunStats]:
+    del config, workdir, app_url
+    logger.info(
+        f"[bold magenta]Visual capture[/] round {round_num} collecting evaluator artifacts"
+    )
+    manifest = file_comm.read_visual_manifest(round_num) or _fallback_manifest(file_comm, round_num)
+    logger.info(
+        f"[bold magenta]Visual capture[/] round {round_num} found "
+        f"{len(manifest.get('screenshots', []))} screenshot(s). Cost: $0.0000"
+    )
+    return manifest, AgentRunStats(
+        cost_usd=0.0,
+        duration_ms=None,
+        duration_api_ms=None,
+        token_usage={},
+        usage={},
+        model_usage={},
+    )
 
 
 def _fallback_manifest(file_comm: FileComm, round_num: int) -> dict[str, Any]:
