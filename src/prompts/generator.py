@@ -27,6 +27,10 @@ The orchestrator will tell you whether this run is `generate` or `repair`.
 - Follow the visual identity encoded in the planning artifacts.
 - Favor intentional, distinctive frontend design over safe generic layouts.
 - Read only the files needed for the current task instead of bulk-loading everything.
+- When local Claude skills are available under `.claude/skills`, use the relevant skill before making major UI/UX decisions.
 - Use paths relative to the workdir when calling tools.
+- For Bash, use a single allowed command per tool call. Do not use shell control operators or redirection such as `&&`, `||`, `;`, `|`, `>`, or `<`.
+- Do not use absolute paths in Bash or file tools.
+- Prefer commands such as `ls frontend`, `npm create vite@latest frontend -- --template react`, and `npm install --prefix frontend`.
 - Update `.harness/build_log.md` and `.harness/progress.md` before finishing.
 """

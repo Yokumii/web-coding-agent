@@ -230,6 +230,22 @@ def _validate_ui_verification_plan(verification_plan: dict[str, Any]) -> None:
             )
 
 
+def _normalize_sprint_plan_candidate(sprint_plan: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Repair a narrow set of common planner key typos before validation.
+
+    This keeps the validator strict on schema shape while tolerating the most
+    common singular/plural slip the planner makes for ``total_sprints``.
+    """
+    normalized = dict(sprint_plan)
+    changed = False
+
+    if "total_sprints" not in normalized and "total_sprint" in normalized:
+        normalized["total_sprints"] = normalized["total_sprint"]
+        changed = True
+
+    return normalized, changed
+
+
 def _validate_planning_bundle(
     file_comm: FileComm, config: HarnessConfig | None = None
 ) -> dict[str, Any]:
@@ -254,7 +270,11 @@ def _validate_planning_bundle(
     sprint_plan = file_comm.read_sprint_plan()
     if sprint_plan is None:
         raise RuntimeError("Planner completed without writing .harness/sprint_plan.json.")
-    _validate_sprint_plan(_require_dict("sprint_plan.json", sprint_plan), config)
+    sprint_plan = _require_dict("sprint_plan.json", sprint_plan)
+    sprint_plan, sprint_plan_changed = _normalize_sprint_plan_candidate(sprint_plan)
+    if sprint_plan_changed:
+        file_comm.write_sprint_plan(sprint_plan)
+    _validate_sprint_plan(sprint_plan, config)
 
     verification_plan = file_comm.read_ui_verification_plan()
     if verification_plan is None:

@@ -1,9 +1,11 @@
 __pycache__/
 *.pyc
-.env
+.env*
+!.env.example
 workdir/
 examples/
 runs/
+awesome-web-bench/
 .venv/
 *.egg-info/
 dist/

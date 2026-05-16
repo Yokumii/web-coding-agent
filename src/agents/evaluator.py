@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
 from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
+from src.agents.visual_capture import build_visual_capture_requirements
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
@@ -21,6 +23,25 @@ _EVALUATOR_REQUIRED_READS = [
     ".harness/ui_verification_plan.json",
     ".harness/accepted_sprints.json",
 ]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_LOCAL_CLAUDE_SKILLS_DIR = _REPO_ROOT / ".claude" / "skills"
+
+
+def _ensure_local_claude_skills(workdir: Path) -> None:
+    """Expose repository-local Claude skills inside the evaluator workdir."""
+    if not _LOCAL_CLAUDE_SKILLS_DIR.is_dir():
+        return
+
+    claude_dir = workdir / ".claude"
+    skills_dir = claude_dir / "skills"
+    if skills_dir.exists() or skills_dir.is_symlink():
+        return
+
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        skills_dir.symlink_to(_LOCAL_CLAUDE_SKILLS_DIR, target_is_directory=True)
+    except OSError:
+        shutil.copytree(_LOCAL_CLAUDE_SKILLS_DIR, skills_dir)
 
 
 async def run_evaluator(
@@ -31,6 +52,7 @@ async def run_evaluator(
     app_url: str,
 ) -> tuple[bool, dict[str, Any], AgentRunStats]:
     """Run evaluator agent with Playwright MCP."""
+    _ensure_local_claude_skills(workdir)
     sprint_num, sprint_context = _get_current_sprint_context(file_comm)
     accepted_sprints = _get_accepted_sprints(file_comm)
 
@@ -235,16 +257,20 @@ def _build_evaluator_prompt(
         "Assessment Order:",
         "1. Phase A: Render Gate",
         "2. Phase B: UI Functionality Verification",
-        "3. Phase C: External Appearance Review Placeholder",
+        "3. Phase C: Deferred Visual Review Capture",
         "4. Phase D: Source Inspection",
         "5. Phase E: Score Aggregation And Verdict",
         "",
         "Output Files:",
         f"1. .harness/feedback_round_{round_num}.md",
         f"2. .harness/grade_round_{round_num}.json",
+        f"3. .harness/visual_manifest_round_{round_num}.json",
         "",
+        *build_visual_capture_requirements(round_num=round_num, app_url=app_url),
+        "",
+        "If `.claude/skills/webapp-testing/SKILL.md` exists in the workdir, consult and use it for browser testing and evaluation strategy.",
         "Use paths relative to the workdir when calling file tools; do not use absolute paths.",
-        f"Workdir: {workdir}",
+        "Treat `.` as the workdir root.",
     ]
     return "\n".join(lines)
 

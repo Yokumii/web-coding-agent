@@ -99,7 +99,11 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
     assert "- .harness/feature_list.json" in captured["prompt"]
     assert "- .harness/design_tokens.json" in captured["prompt"]
     assert "- .harness/accepted_sprints.json" in captured["prompt"]
+    assert ".harness/feedback_round_1.md" not in captured["prompt"]
+    assert ".harness/grade_round_1.json" not in captured["prompt"]
     assert "Do not implement future sprint functionality or unrelated refactors." in captured["prompt"]
+    assert "preserve accepted work" in captured["prompt"]
+    assert ".claude/skills/ui-ux-pro-max/SKILL.md" in captured["prompt"]
     assert "Read the planning bundle first" not in captured["prompt"]
     assert ".harness/spec.md" not in captured["prompt"]
     assert ".harness/ui_verification_plan.json" not in captured["prompt"]
@@ -203,10 +207,115 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
     assert "- .harness/sprint_plan.json" in captured["prompt"]
     assert "- .harness/design_tokens.json" in captured["prompt"]
     assert "- .harness/accepted_sprints.json" in captured["prompt"]
+    assert ".claude/skills/ui-ux-pro-max/SKILL.md" in captured["prompt"]
     assert "Do not implement new features from future sprints." in captured["prompt"]
     assert "Do not start work for the next sprint." in captured["prompt"]
     assert ".harness/spec.md" not in captured["prompt"]
     assert ".harness/feature_list.json" not in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_generate_mode_reads_previous_feedback_when_present(
+    monkeypatch, tmp_path: Path
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_feedback(1, "Preserve the accepted nav spacing.")
+    file_comm.write_grades(
+        1,
+        {
+            "round": 1,
+            "overall_passed": True,
+            "mode_recommendation": "generate_next_sprint",
+        },
+    )
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=2,
+        sprint_num=2,
+        mode="generate",
+    )
+
+    assert ".harness/feedback_round_1.md" in captured["prompt"]
+    assert ".harness/grade_round_1.json" in captured["prompt"]
+    assert "avoid regressions" in captured["prompt"]
+    assert "without re-opening already accepted sprint scope" in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_exposes_repo_local_claude_skills_to_workdir(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+
+    source_skills = tmp_path / "source-skills"
+    (source_skills / "ui-ux-pro-max").mkdir(parents=True)
+    (source_skills / "ui-ux-pro-max" / "SKILL.md").write_text("# local skill\n")
+    monkeypatch.setattr("src.agents.generator._LOCAL_CLAUDE_SKILLS_DIR", source_skills)
+
+    async def fake_run_sdk_agent(**kwargs):
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+    )
+
+    exposed = tmp_path / ".claude" / "skills"
+    assert exposed.exists()
+    if exposed.is_symlink():
+        assert exposed.resolve() == source_skills.resolve()
+    else:
+        assert (exposed / "ui-ux-pro-max" / "SKILL.md").read_text() == "# local skill\n"
 
 
 @pytest.mark.anyio

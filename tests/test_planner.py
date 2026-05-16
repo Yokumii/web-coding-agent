@@ -491,6 +491,22 @@ def test_validate_planning_bundle_rejects_sprint_plan_missing_a_sprint_number(tm
         _validate_planning_bundle(file_comm)
 
 
+def test_validate_planning_bundle_normalizes_total_sprint_alias(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+
+    sprint_plan = file_comm.read_sprint_plan()
+    sprint_plan["total_sprint"] = sprint_plan.pop("total_sprints")
+    file_comm.write_sprint_plan(sprint_plan)
+
+    validated = _validate_planning_bundle(file_comm)
+
+    assert validated["total_sprints"] == 2
+    assert "total_sprint" in validated
+    persisted = file_comm.read_sprint_plan()
+    assert persisted["total_sprints"] == 2
+
+
 # --- sprint sizing caps ---
 
 

@@ -221,10 +221,14 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
     assert "- .harness/accepted_sprints.json" in captured["prompt"]
     assert "- .harness/feedback_round_1.md" in captured["prompt"]
     assert "- .harness/grade_round_1.json" in captured["prompt"]
+    assert ".claude/skills/webapp-testing/SKILL.md" in captured["prompt"]
     assert "Phase A: Render Gate" in captured["prompt"]
     assert "Phase B: UI Functionality Verification" in captured["prompt"]
-    assert "Phase C: External Appearance Review Placeholder" in captured["prompt"]
+    assert "Phase C: Deferred Visual Review Capture" in captured["prompt"]
     assert "Phase E: Score Aggregation And Verdict" in captured["prompt"]
+    assert "3. .harness/visual_manifest_round_2.json" in captured["prompt"]
+    assert ".harness/visual_round_2_home.png" in captured["prompt"]
+    assert "downstream VLM review" in captured["prompt"]
 
 
 @pytest.mark.anyio
@@ -278,6 +282,53 @@ async def test_evaluator_reads_written_grade_file_and_uses_overall_verdict(
     assert grades["phase_results"]["ui_functionality"] == "pass"
     # Local pricing: claude-sonnet-4-6 input @ $3 / 1M → 100_000 * 3 / 1e6 = $0.30.
     assert stats.cost_usd == 0.3
+
+
+@pytest.mark.anyio
+async def test_evaluator_exposes_repo_local_claude_skills_to_workdir(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_evaluator_context(file_comm)
+
+    source_skills = tmp_path / "source-skills"
+    (source_skills / "webapp-testing").mkdir(parents=True)
+    (source_skills / "webapp-testing" / "SKILL.md").write_text("# webapp testing skill\n")
+    monkeypatch.setattr("src.agents.evaluator._LOCAL_CLAUDE_SKILLS_DIR", source_skills)
+
+    async def fake_run_sdk_agent(**kwargs):
+        file_comm.write_grades(1, _passing_grades(1))
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.3,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.3,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.evaluator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_evaluator(
+        HarnessConfig(evaluator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        app_url="http://127.0.0.1:4173",
+    )
+
+    exposed = tmp_path / ".claude" / "skills"
+    assert exposed.exists()
+    if exposed.is_symlink():
+        assert exposed.resolve() == source_skills.resolve()
+    else:
+        assert (exposed / "webapp-testing" / "SKILL.md").read_text() == "# webapp testing skill\n"
 
 
 def test_extract_grades_from_response_parses_embedded_json():
@@ -414,4 +465,3 @@ def test_extract_grades_from_response_handles_truncated_trailing_json():
     extracted = _extract_grades_from_response(response)
     assert extracted is not None
     assert extracted["round"] == 1
-

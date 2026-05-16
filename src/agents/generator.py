@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -18,6 +19,8 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 GeneratorMode = Literal["generate", "repair"]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_LOCAL_CLAUDE_SKILLS_DIR = _REPO_ROOT / ".claude" / "skills"
 _GENERATE_REQUIRED_READS = (
     ".harness/sprint_plan.json",
     ".harness/feature_list.json",
@@ -40,6 +43,23 @@ _REPAIR_REQUIRED_READS = (
 _FILE_HINT_RE = re.compile(
     r"frontend/[A-Za-z0-9_./\-]+\.(?:jsx?|tsx?|css|scss|html|json|svg)",
 )
+
+
+def _ensure_local_claude_skills(workdir: Path) -> None:
+    """Expose repository-local Claude skills inside the generator workdir."""
+    if not _LOCAL_CLAUDE_SKILLS_DIR.is_dir():
+        return
+
+    claude_dir = workdir / ".claude"
+    skills_dir = claude_dir / "skills"
+    if skills_dir.exists() or skills_dir.is_symlink():
+        return
+
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        skills_dir.symlink_to(_LOCAL_CLAUDE_SKILLS_DIR, target_is_directory=True)
+    except OSError:
+        shutil.copytree(_LOCAL_CLAUDE_SKILLS_DIR, skills_dir)
 
 
 def _extract_repair_targets(
@@ -291,6 +311,7 @@ def _get_accepted_sprints(file_comm: FileComm) -> dict:
 
 def _build_generate_prompt(
     *,
+    file_comm: FileComm,
     workdir: Path,
     round_num: int,
     sprint_num: int,
@@ -298,7 +319,16 @@ def _build_generate_prompt(
     accepted_sprints: dict,
 ) -> str:
     accepted = accepted_sprints.get("accepted", [])
-    required_reads = "\n".join(f"- {path}" for path in _GENERATE_REQUIRED_READS)
+    required_reads = list(_GENERATE_REQUIRED_READS)
+    previous_round = round_num - 1
+    if previous_round >= 1:
+        previous_feedback = file_comm.dir / f"feedback_round_{previous_round}.md"
+        previous_grades = file_comm.dir / f"grade_round_{previous_round}.json"
+        if previous_feedback.exists():
+            required_reads.append(f".harness/{previous_feedback.name}")
+        if previous_grades.exists():
+            required_reads.append(f".harness/{previous_grades.name}")
+    required_reads_text = "\n".join(f"- {path}" for path in required_reads)
     feature_ids = ", ".join(sprint_context.get("feature_ids", []))
     deliverables = "\n".join(f"- {item}" for item in sprint_context.get("deliverables", []))
     exit_criteria = "\n".join(f"- {item}" for item in sprint_context.get("exit_criteria", []))
@@ -312,15 +342,21 @@ def _build_generate_prompt(
         f"Deliverables:\n{deliverables}\n"
         f"Exit Criteria:\n{exit_criteria}\n"
         f"Accepted Sprints: {accepted}\n"
-        f"Required Reads:\n{required_reads}\n\n"
+        f"Required Reads:\n{required_reads_text}\n\n"
         f"Implement only sprint {sprint_num}.\n"
-        f"Set up or update the frontend-only project in: {workdir}/frontend\n"
+        f"Set up or update the frontend-only project in `frontend/`.\n"
         f"Do not implement future sprint functionality or unrelated refactors.\n"
+        f"If previous-round feedback or grades are present, read them to preserve accepted work, "
+        f"avoid regressions, and carry forward non-blocking polish notes without re-opening already accepted sprint scope.\n"
+        f"If `.claude/skills/ui-ux-pro-max/SKILL.md` exists in the workdir, consult and use it for UI/UX design and review decisions.\n"
         f"Use paths relative to the workdir when calling tools; do not use absolute paths.\n"
+        f"For Bash, use exactly one command per tool call with no shell control operators or redirection.\n"
+        f"Allowed examples: `ls frontend`, `npm create vite@latest frontend -- --template react`, "
+        f"`npm install --prefix frontend`, `head -20 frontend/package.json`.\n"
         f"When done, update `.harness/build_log.md` with round, sprint, mode, implemented features, "
         f"and a short summary of what was completed.\n"
         f"Also append a short progress entry to `.harness/progress.md`.\n"
-        f"Workdir: {workdir}"
+        f"Treat `.` as the workdir root."
     )
 
 
@@ -393,11 +429,15 @@ def _build_repair_prompt(
         f"Fix ONLY the issues needed for sprint acceptance or regression recovery.\n"
         f"Do not implement new features from future sprints.\n"
         f"Do not start work for the next sprint.\n"
+        f"If `.claude/skills/ui-ux-pro-max/SKILL.md` exists in the workdir, consult and use it for UI/UX design and review decisions.\n"
         f"Use paths relative to the workdir when calling tools; do not use absolute paths.\n"
+        f"For Bash, use exactly one command per tool call with no shell control operators or redirection.\n"
+        f"Allowed examples: `ls frontend/src`, `grep -n \"pattern\" frontend/src/App.jsx`, "
+        f"`npm install --prefix frontend`, `head -20 .harness/grade_round_{feedback_round}.json`.\n"
         f"When done, update `.harness/build_log.md` with round, sprint, mode, addressed issues, "
         f"and a short summary of what was repaired.\n"
         f"Also append a short progress entry to `.harness/progress.md`.\n"
-        f"Workdir: {workdir}"
+        f"Treat `.` as the workdir root."
     )
 
 
@@ -442,12 +482,14 @@ async def run_generator(
     logger.info(
         f"[bold green]Generator[/] starting mode={mode} round={round_num} sprint={sprint_num}"
     )
+    _ensure_local_claude_skills(workdir)
 
     sprint_context = _get_sprint_context(file_comm, sprint_num)
     accepted_sprints = _get_accepted_sprints(file_comm)
 
     if mode == "generate":
         user_msg = _build_generate_prompt(
+            file_comm=file_comm,
             workdir=workdir,
             round_num=round_num,
             sprint_num=sprint_num,

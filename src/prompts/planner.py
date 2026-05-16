@@ -101,7 +101,7 @@ Every feature mentioned in `spec.md` must appear here.
 
 Write a JSON object with:
 
-- `total_sprints`
+- `total_sprints` (exact key name; plural)
 - `sprints`
 
 Each sprint entry must include:
