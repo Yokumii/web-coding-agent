@@ -4,11 +4,15 @@ import asyncio
 import json
 import os
 import signal
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from src.bench.manifest import HarnessRecord, SampleRecord
+
+IS_WINDOWS = sys.platform == "win32"
+FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 @dataclass
@@ -46,7 +50,7 @@ async def arun_harness_for_sample(
     finished_at = datetime.now().isoformat()
 
     workdir_field = (
-        str(workdir.relative_to(run_dir))
+        workdir.relative_to(run_dir).as_posix()
         if workdir.is_relative_to(run_dir) else str(workdir)
     )
 
@@ -114,7 +118,7 @@ def _load_record_from_state(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     costs = state.get("costs") or {}
     workdir_field = (
-        str(workdir.relative_to(run_dir))
+        workdir.relative_to(run_dir).as_posix()
         if run_dir is not None and workdir.is_relative_to(run_dir)
         else str(workdir)
     )
@@ -138,8 +142,9 @@ async def _ainvoke(
 ) -> HarnessSubprocessResult:
     """Async subprocess invocation. tee stdout to log_path, capture stderr.
 
-    start_new_session=True puts the child in its own process group so cancellation
-    can kill the whole tree (vite/esbuild children of pnpm dev, etc.).
+    On POSIX, start_new_session=True puts the child in its own process group
+    so cancellation can kill the whole tree (vite/esbuild children of pnpm
+    dev, etc.). Windows falls back to terminating the direct child process.
     Replaceable in tests via monkeypatch.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,19 +154,27 @@ async def _ainvoke(
             cwd=str(cwd),
             stdout=log,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            start_new_session=not IS_WINDOWS,
         )
         try:
             _, stderr_bytes = await proc.communicate()
         except asyncio.CancelledError:
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    os.killpg(pgid, signal.SIGKILL)
-                    await proc.wait()
+                if IS_WINDOWS:
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                else:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        os.killpg(pgid, FORCE_KILL_SIGNAL)
+                        await proc.wait()
             except (ProcessLookupError, PermissionError):
                 pass
             raise

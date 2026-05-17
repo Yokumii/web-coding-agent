@@ -4,6 +4,7 @@ import asyncio
 import os
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,8 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 HOST = "127.0.0.1"
+IS_WINDOWS = sys.platform == "win32"
+FORCE_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 @dataclass
@@ -46,6 +49,9 @@ def build_frontend_command(frontend_dir: Path, port: int) -> list[str]:
 
 
 def find_listening_pids(port: int) -> list[int]:
+    if IS_WINDOWS:
+        return _find_listening_pids_windows(port)
+
     try:
         result = subprocess.run(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
@@ -66,6 +72,38 @@ def find_listening_pids(port: int) -> list[int]:
         if stripped.isdigit():
             pids.append(int(stripped))
     return pids
+
+
+def _find_listening_pids_windows(port: int) -> list[int]:
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("`netstat` is required to inspect occupied frontend ports") from exc
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(f"Failed to inspect port {port} with netstat: {stderr}")
+
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        protocol, local_address, _remote_address, state, pid_text = parts[:5]
+        if protocol.upper() != "TCP" or state.upper() != "LISTENING":
+            continue
+        if not pid_text.isdigit():
+            continue
+        if ":" not in local_address:
+            continue
+        if local_address.rsplit(":", 1)[-1] == str(port):
+            pids.append(int(pid_text))
+    return sorted(set(pids))
 
 
 def wait_for_port_release(port: int, timeout_secs: float = 5.0, poll_interval: float = 0.2) -> bool:
@@ -105,7 +143,7 @@ def ensure_port_available(port: int) -> None:
 
     remaining_pids = find_listening_pids(port)
     if remaining_pids:
-        _terminate_pids(port, remaining_pids, signal.SIGKILL)
+        _terminate_pids(port, remaining_pids, FORCE_KILL_SIGNAL)
         if wait_for_port_release(port):
             return
 
@@ -177,9 +215,9 @@ def start_process(
         stderr=subprocess.STDOUT,
         text=True,
         # New POSIX session so we own the process group and stop_process
-        # can SIGTERM/SIGKILL the whole tree (vite/esbuild/worker children
-        # of `pnpm dev` would otherwise orphan).
-        start_new_session=True,
+        # can terminate the whole tree. Windows falls back to signalling
+        # the direct child because POSIX process groups are unavailable.
+        start_new_session=not IS_WINDOWS,
     )
     logger.info(f"[bold]Starting {name}[/] — {' '.join(command)}")
     return ManagedProcess(name=name, process=process, log_path=log_path, log_file=log_file)
@@ -287,7 +325,13 @@ async def stop_process(managed: ManagedProcess) -> None:
             try:
                 await asyncio.to_thread(process.wait, 5)
             except subprocess.TimeoutExpired:
-                _signal_process_tree(process, signal.SIGKILL)
+                if IS_WINDOWS:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                else:
+                    _signal_process_tree(process, FORCE_KILL_SIGNAL)
                 await asyncio.to_thread(process.wait, 5)
     finally:
         managed.log_file.close()
@@ -296,12 +340,19 @@ async def stop_process(managed: ManagedProcess) -> None:
 def _signal_process_tree(process: subprocess.Popen[str], sig: int) -> None:
     """Signal the leader's whole process group.
 
-    `start_process` launches in a new POSIX session so the process and
+    On POSIX, `start_process` launches in a new session so the process and
     its descendants share a process group (the leader's PID). Signalling
     the group cleans up children that `pnpm dev` / `npm run dev`
-    routinely fork (vite, esbuild, workers). Falls back to signalling
-    just the leader if we lost the group somehow.
+    routinely fork (vite, esbuild, workers). Windows does not expose the
+    same APIs, so it falls back to signalling the direct child.
     """
+    if IS_WINDOWS:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        return
+
     try:
         pgid = os.getpgid(process.pid)
     except (ProcessLookupError, OSError):
@@ -315,7 +366,7 @@ def _signal_process_tree(process: subprocess.Popen[str], sig: int) -> None:
             pass
 
     try:
-        if sig == signal.SIGKILL:
+        if sig == FORCE_KILL_SIGNAL:
             process.kill()
         else:
             process.terminate()

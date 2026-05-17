@@ -75,6 +75,22 @@ def test_planning_artifact_round_trip():
         assert comm.read_accepted_sprints() == accepted_sprints
 
 
+def test_utf8_artifact_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        comm = FileComm(Path(tmp) / ".harness")
+        spec = "# 规格\n设计一个带有“增量”按钮的计数器。"
+        feedback = "修复按钮文案：增加"
+        feature_list = {"features": [{"id": "F001", "name": "计数器", "description": "支持“+1”"}]}
+
+        comm.write_spec(spec)
+        comm.write_feedback(1, feedback)
+        comm.write_feature_list(feature_list)
+
+        assert comm.read_spec() == spec
+        assert comm.read_feedback(1) == feedback
+        assert comm.read_feature_list() == feature_list
+
+
 def test_progress_round_trip_and_append():
     with tempfile.TemporaryDirectory() as tmp:
         comm = FileComm(Path(tmp) / ".harness")
