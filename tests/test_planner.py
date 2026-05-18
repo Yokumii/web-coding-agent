@@ -46,6 +46,13 @@ def _write_valid_planning_bundle(file_comm: FileComm) -> None:
             "motion": {"duration_fast": 160},
             "style_rules": ["bold hierarchy"],
             "anti_patterns": ["generic cards"],
+            "visual_experiment": {
+                "design_hypothesis": "Use image-first composition to escape template dashboards.",
+                "reason_for_image_first": "A code-only agent tends to reuse safe card grids.",
+                "desired_break_from_web_templates": ["poster-like asymmetry"],
+                "visual_opportunities_beyond_css": ["layered print texture"],
+                "forbidden_generic_patterns": ["centered SaaS hero"],
+            },
         }
     )
     file_comm.write_feature_list(
@@ -99,6 +106,77 @@ def _write_valid_planning_bundle(file_comm: FileComm) -> None:
         }
     )
     file_comm.write_progress("# Progress Log\n\n## planning\n- status: complete")
+
+
+def test_validate_planning_bundle_rejects_missing_visual_experiment(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_spec(_valid_spec_text())
+    file_comm.write_design_tokens(
+        {
+            "theme_name": "editorial counter",
+            "color": {"bg": "#111111"},
+            "typography": {"display": "Space Grotesk"},
+            "spacing": {"base": 8},
+            "radius": {"card": 16},
+            "motion": {"duration_fast": 160},
+            "style_rules": ["bold hierarchy"],
+            "anti_patterns": ["generic cards"],
+        }
+    )
+    file_comm.write_feature_list(
+        {
+            "features": [
+                {
+                    "id": "F001",
+                    "name": "Counter",
+                    "priority": "high",
+                    "depends_on": [],
+                    "description": "Count values.",
+                    "acceptance_criteria": ["Counter increments correctly."],
+                    "status": "planned",
+                    "sprint": 1,
+                }
+            ]
+        }
+    )
+    file_comm.write_sprint_plan(
+        {
+            "total_sprints": 1,
+            "sprints": [
+                {
+                    "number": 1,
+                    "title": "Core counter",
+                    "goal": "Ship the primary counter flow.",
+                    "feature_ids": ["F001"],
+                    "deliverables": ["Visible counter UI."],
+                    "exit_criteria": ["Counter increments correctly."],
+                }
+            ],
+        }
+    )
+    file_comm.write_ui_verification_plan(
+        {
+            "sprints": [
+                {
+                    "sprint": 1,
+                    "checks": [
+                        {
+                            "id": "UI-001",
+                            "feature_id": "F001",
+                            "task": "Click increment once.",
+                            "expected_result": "Counter changes by one step.",
+                            "critical": True,
+                            "category": "core_interaction",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    file_comm.write_progress("# Progress")
+
+    with pytest.raises(RuntimeError, match="visual_experiment"):
+        _validate_planning_bundle(file_comm)
 
 
 @pytest.mark.anyio
@@ -192,6 +270,13 @@ async def test_planner_raises_when_planning_bundle_is_malformed(monkeypatch, tmp
                 "motion": {"duration_fast": 160},
                 "style_rules": ["bold hierarchy"],
                 "anti_patterns": ["generic cards"],
+                "visual_experiment": {
+                    "design_hypothesis": "Use image-first composition to escape template dashboards.",
+                    "reason_for_image_first": "A code-only agent tends to reuse safe card grids.",
+                    "desired_break_from_web_templates": ["poster-like asymmetry"],
+                    "visual_opportunities_beyond_css": ["layered print texture"],
+                    "forbidden_generic_patterns": ["centered SaaS hero"],
+                },
             }
         )
         file_comm.write_feature_list({"features": []})
@@ -349,6 +434,13 @@ def _seed_valid_bundle(file_comm: FileComm) -> None:
             "motion": {"duration_fast": 160},
             "style_rules": ["bold hierarchy"],
             "anti_patterns": ["generic cards"],
+            "visual_experiment": {
+                "design_hypothesis": "Use image-first composition to escape template dashboards.",
+                "reason_for_image_first": "A code-only agent tends to reuse safe card grids.",
+                "desired_break_from_web_templates": ["poster-like asymmetry"],
+                "visual_opportunities_beyond_css": ["layered print texture"],
+                "forbidden_generic_patterns": ["centered SaaS hero"],
+            },
         }
     )
     file_comm.write_feature_list(

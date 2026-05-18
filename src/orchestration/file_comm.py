@@ -13,6 +13,10 @@ class FileComm:
         self.dir = harness_dir
         self.dir.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def design_dir(self) -> Path:
+        return self.dir / "design"
+
     def write_spec(self, content: str) -> Path:
         path = self.dir / "spec.md"
         path.write_text(content)
@@ -51,6 +55,24 @@ class FileComm:
 
     def read_accepted_sprints(self) -> dict[str, Any] | None:
         return self._read_json("accepted_sprints.json")
+
+    def write_design_brief(self, payload: dict[str, Any]) -> Path:
+        return self._write_json("design/design_brief.json", payload)
+
+    def read_design_brief(self) -> dict[str, Any] | None:
+        return self._read_json("design/design_brief.json")
+
+    def write_layout_contract(self, payload: dict[str, Any]) -> Path:
+        return self._write_json("design/layout_contract.json", payload)
+
+    def read_layout_contract(self) -> dict[str, Any] | None:
+        return self._read_json("design/layout_contract.json")
+
+    def write_asset_manifest(self, payload: dict[str, Any]) -> Path:
+        return self._write_json("design/asset_manifest.json", payload)
+
+    def read_asset_manifest(self) -> dict[str, Any] | None:
+        return self._read_json("design/asset_manifest.json")
 
     def write_progress(self, content: str) -> Path:
         path = self.dir / "progress.md"
@@ -142,13 +164,14 @@ class FileComm:
             for path in self.dir.glob(pattern):
                 path.unlink(missing_ok=True)
 
-        for subdir in ("logs", "traces"):
+        for subdir in ("logs", "traces", "design"):
             path = self.dir / subdir
             if path.exists():
                 shutil.rmtree(path)
 
     def _write_json(self, filename: str, payload: dict[str, Any]) -> Path:
         path = self.dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2))
         return path
 

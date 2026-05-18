@@ -25,6 +25,36 @@ The explored image-first workflow addresses that gap:
 
 This should be introduced as a new **Design** stage between `plan` and `build`, not as an ad-hoc trick inside the existing generator.
 
+## Research Motivation: Expanding The Reachable Visual Space
+
+The purpose of image-first design in this project is **not** merely to make the same frontend slightly prettier.
+
+The stronger research hypothesis is:
+
+> A text-only web-coding agent tends to converge on a narrow set of familiar web patterns. Adding an image-generation stage can expand the reachable visual design space by proposing authored compositions, material qualities, image-led structures, and non-template hierarchies that the coding agent is unlikely to invent from text alone.
+
+This changes what the design stage is for:
+
+- It should not simply regenerate generic SaaS heroes, centered card grids, glassmorphism, or stock landing-page composition in raster form.
+- It should seek visual value that justifies using an image model at all: stronger art direction, more memorable composition, more material richness, or spatial structures that are difficult to specify textually.
+- It must still preserve semantic frontend implementation: the image stage expands the concept space, while HTML/CSS/JS keep text, controls, accessibility, and runtime behavior real.
+
+For the research design, the meaningful comparison is not only:
+
+```text
+text-only vs image-first
+```
+
+but also:
+
+```text
+text-only baseline
+vs image-first with conventional visual prompting
+vs image-first with explicit anti-template / exploratory aesthetic guidance
+```
+
+That distinction matters because early smoke tests showed that a generic "polished frontend concept" prompt produced results that looked too similar to ordinary code-generated UIs. The image model only becomes a true methodological intervention when the harness tells it what visual territory it is expected to open up.
+
 ## Recommended Placement In The Harness
 
 Current flow:
@@ -135,6 +165,22 @@ The bridge between image generation and coding:
     "approved_concept": ".harness/design/approved_concept.png",
     "background_ui": ".harness/design/background_ui.png"
   },
+  "aesthetic_intent": {
+    "design_hypothesis": "Use image-first composition to escape generic dashboard sameness.",
+    "reason_for_image_first": "Text-only coding tends to reuse safe card-grid layouts.",
+    "distinctive_features_to_preserve": [
+      "poster-like asymmetry",
+      "image-led hierarchy"
+    ],
+    "non_css_visual_value": [
+      "layered print texture",
+      "rich material treatment"
+    ],
+    "generic_patterns_to_avoid": [
+      "centered SaaS hero",
+      "generic card grid"
+    ]
+  },
   "responsive_strategy": {
     "desktop": "background image plus semantic overlay controls",
     "mobile": "crop-safe central composition with stacked overlay controls"
@@ -179,6 +225,33 @@ More explicit machine-readable geometry and component intent:
 ```
 
 This is useful because the generator should not infer all spatial relationships from pixels alone.
+
+### `design_tokens.json.visual_experiment`
+
+The planner should also expose the research intent upstream so the design stage does not have to invent it from scratch:
+
+```json
+{
+  "visual_experiment": {
+    "design_hypothesis": "Use image-first composition to escape generic dashboard sameness.",
+    "reason_for_image_first": "Text-only coding tends to reuse safe card-grid layouts.",
+    "desired_break_from_web_templates": [
+      "poster-like asymmetry",
+      "non-card-based spatial hierarchy"
+    ],
+    "visual_opportunities_beyond_css": [
+      "print texture",
+      "collage depth"
+    ],
+    "forbidden_generic_patterns": [
+      "centered card grid",
+      "generic SaaS hero"
+    ]
+  }
+}
+```
+
+This makes the image-first stage an explicit research intervention rather than an unstructured request for "better visuals."
 
 ### `asset_manifest.json`
 
@@ -282,6 +355,7 @@ Use the approved image-first design contract when implementing the frontend.
 Preserve the composition of `.harness/design/background_ui.png`.
 Overlay editable HTML text and interactive controls according to `layout_contract.json`.
 Do not rasterize functional text or controls into the background image.
+Preserve the aesthetic intent declared in `design_brief.json` and do not collapse authored visual traits back into generic web defaults.
 ```
 
 For file placement, the generator should copy or reference approved assets into `frontend/public/assets/` or `frontend/src/assets/`.
@@ -448,6 +522,18 @@ text-only plan + approved concept reference
 text-only plan + approved concept + text-free background UI + layout contract
 ```
 
+### Variant C
+
+```text
+带明确 anti-template / exploratory aesthetic 指导的 image-first
+```
+
+### Variant C
+
+```text
+image-first with explicit anti-template / exploratory aesthetic guidance
+```
+
 ### Compare
 
 - first-round acceptance rate
@@ -457,8 +543,52 @@ text-only plan + approved concept + text-free background UI + layout contract
 - manual preference judgments
 - UI task success rate
 - implementation cost
+- template-escape score
+- image-native visual value
 
-The most important comparison is not only whether the page looks better, but whether the image-first path reduces ambiguity enough to lower repair cost while preserving functional success.
+The most important comparison is not only whether the page looks better, but whether the image-first path expands visual range enough to reduce template convergence while preserving functional success and engineering discipline.
+
+## Current Implementation Status And Findings
+
+### Implemented
+
+- Added `--design-mode text-only|image-first`.
+- Added a `design` checkpoint between planning and build.
+- Added `.harness/design/` contract files:
+  - `design_brief.json`
+  - `layout_contract.json`
+  - `asset_manifest.json`
+- Added current design outcomes:
+  - `image_backed_ui`
+  - `concept_reference_only`
+  - `text_only_fallback`
+- Generator now reads the design contract in both generate and repair modes.
+- Evaluator required reads and visual review context now include the design contract when present.
+- Added a live image-generation adapter for Right Code draw + `gpt-image-2`.
+- Added propagation of research intent:
+  - planner requires `design_tokens.json.visual_experiment`
+  - design stage converts that into `design_brief.json.aesthetic_intent`
+  - generator guidance now preserves design hypotheses and forbids collapse back into declared generic patterns
+
+### Live API Findings
+
+- The documented `gpt-image-2` endpoint was successfully exercised through `/v1/images/generations`.
+- A first concept image and a second reference-guided background image were both generated successfully.
+- The documented optional `image` field was proven usable in practice for reference-guided regeneration.
+- In the current local environment, `https://www.right.codes/draw` failed TLS handshake while `https://right.codes/draw` worked; the implementation therefore uses the reachable non-`www` host as the default base URL.
+
+### Early Design Finding
+
+- A generic "polished frontend concept image" prompt produced visuals that remained too close to ordinary AI-coded web layouts.
+- This confirmed that image-first value is not automatic: the harness must explicitly state the aesthetic and experimental role of the image model.
+- The current branch now encodes that role in planner output, design-stage prompting, and downstream implementation guidance.
+
+### Not Yet Implemented
+
+- A separate design-review agent with bounded retries.
+- Dense, machine-derived layout regions / safe zones from the approved image.
+- Reference-image-aware visual scoring that actually compares screenshots against `approved_concept.png` and `background_ui.png`.
+- A completed end-to-end image-first harness run against a benchmark task set.
 
 ## Implementation Roadmap
 
@@ -568,6 +698,46 @@ That gives the harness a concrete visual target without sacrificing the existing
 4. 让编码 agent 在这张稳定视觉底图之上实现真实页面，从而使图像资产可以可靠嵌入最终页面。
 
 这个能力更适合作为 `plan` 与 `build` 之间新增的 **Design** 阶段，而不是塞进现有 generator 里的临时技巧。
+
+## 研究动机：扩展可达视觉空间
+
+在这个项目中，引入 image-first design 的目的，**不是**把同一种网页再做得“稍微漂亮一点”。
+
+更强的研究假设是：
+
+> 纯文本驱动的 web-coding agent 往往会收敛到一组熟悉而狭窄的网页模式；加入图像生成阶段，可以把系统能够到达的视觉设计空间向外扩展，引入仅靠文本难以稳定产生的作者性构图、材质感、图像主导结构与非模板化层级。
+
+因此，design 阶段不应只是：
+
+- 把通用 SaaS hero、居中卡片网格、glassmorphism 或库存式 landing page 构图再栅格化一次；
+
+而应主动寻找：
+
+- 只有引入图像模型才真正有价值的视觉贡献；
+- 更强的 art direction；
+- 更难通过纯文字精确指定的材质、空间关系与图像层次；
+- 能让结果摆脱 AI 模板化网页分布的视觉策略。
+
+同时，它仍必须保留真正的前端实现原则：
+
+- 图像阶段负责扩展概念空间；
+- HTML/CSS/JS 仍然负责真实文字、控件、可访问性与运行时交互。
+
+对实验设计而言，真正有意义的比较不应只有：
+
+```text
+text-only vs image-first
+```
+
+还应包括：
+
+```text
+text-only baseline
+vs 常规提示下的 image-first
+vs 带有明确 anti-template / exploratory aesthetic 指导的 image-first
+```
+
+这一点很重要，因为早期 smoke test 已经显示：如果只要求模型“生成一个 polished frontend concept”，结果仍会非常接近普通 code agent 生成的网页。只有 harness 明确告诉图像模型它要打开哪一块新的视觉空间，image-first 才真正构成方法上的干预。
 
 ## 在 Harness 中的推荐位置
 
@@ -679,6 +849,22 @@ Design 阶段应在规划完成之后、Sprint 1 开始实现之前只运行一�
     "approved_concept": ".harness/design/approved_concept.png",
     "background_ui": ".harness/design/background_ui.png"
   },
+  "aesthetic_intent": {
+    "design_hypothesis": "用 image-first 构图摆脱通用 dashboard 的同质化。",
+    "reason_for_image_first": "纯文本编码往往会复用安全的卡片网格布局。",
+    "distinctive_features_to_preserve": [
+      "海报式非对称",
+      "图像主导层级"
+    ],
+    "non_css_visual_value": [
+      "叠层印刷质感",
+      "丰富材质处理"
+    ],
+    "generic_patterns_to_avoid": [
+      "居中 SaaS hero",
+      "通用卡片网格"
+    ]
+  },
   "responsive_strategy": {
     "desktop": "background image plus semantic overlay controls",
     "mobile": "crop-safe central composition with stacked overlay controls"
@@ -723,6 +909,33 @@ Design 阶段应在规划完成之后、Sprint 1 开始实现之前只运行一�
 ```
 
 这样做的意义在于：generator 不应该只靠像素反推全部空间关系。
+
+### `design_tokens.json.visual_experiment`
+
+planner 还应在更上游显式给出研究意图，使 design 阶段不必临时猜测：
+
+```json
+{
+  "visual_experiment": {
+    "design_hypothesis": "用 image-first 构图摆脱通用 dashboard 的同质化。",
+    "reason_for_image_first": "纯文本编码往往会复用安全的卡片网格布局。",
+    "desired_break_from_web_templates": [
+      "海报式非对称",
+      "非卡片化空间层级"
+    ],
+    "visual_opportunities_beyond_css": [
+      "印刷纹理",
+      "拼贴纵深"
+    ],
+    "forbidden_generic_patterns": [
+      "居中卡片网格",
+      "通用 SaaS hero"
+    ]
+  }
+}
+```
+
+这样 image-first 就不再只是“让图更好看”，而是一个显式的研究干预。
 
 ### `asset_manifest.json`
 
@@ -826,6 +1039,7 @@ Use the approved image-first design contract when implementing the frontend.
 Preserve the composition of `.harness/design/background_ui.png`.
 Overlay editable HTML text and interactive controls according to `layout_contract.json`.
 Do not rasterize functional text or controls into the background image.
+Preserve the aesthetic intent declared in `design_brief.json` and do not collapse authored visual traits back into generic web defaults.
 ```
 
 在文件放置上，generator 应将批准后的资产复制或引用到 `frontend/public/assets/` 或 `frontend/src/assets/`。
@@ -1001,8 +1215,52 @@ text-only plan + approved concept + text-free background UI + layout contract
 - 人工偏好判断
 - UI 任务成功率
 - 实现成本
+- template-escape score
+- image-native visual value
 
-最重要的对比不只是页面是否更好看，而是 image-first 路径是否足以降低歧义、减少 repair 成本，同时仍保持功能成功率。
+最重要的对比不只是页面是否更好看，而是 image-first 路径是否真正扩展了视觉范围、减少了模板化收敛，同时仍保持功能成功率与工程纪律。
+
+## 当前实现状态与探索结论
+
+### 已实现
+
+- 新增 `--design-mode text-only|image-first`
+- 在 planning 与 build 之间新增 `design` checkpoint
+- 新增 `.harness/design/` 契约文件：
+  - `design_brief.json`
+  - `layout_contract.json`
+  - `asset_manifest.json`
+- 当前支持三种设计状态：
+  - `image_backed_ui`
+  - `concept_reference_only`
+  - `text_only_fallback`
+- generator 在 generate 与 repair 模式下都会读取 design contract
+- evaluator required reads 与视觉评审上下文在存在 design contract 时都会携带它
+- 已接入 Right Code draw + `gpt-image-2` 的真实生图适配层
+- 已将研究意图写入链路：
+  - planner 强制产出 `design_tokens.json.visual_experiment`
+  - design stage 将其转为 `design_brief.json.aesthetic_intent`
+  - generator 会继承设计假设，并被要求避免退化回声明过的通用模式
+
+### 真实 API 探索结论
+
+- 已通过 `/v1/images/generations` 成功调用 `gpt-image-2`
+- 已成功生成首张 concept image 与第二张参考图驱动的 background image
+- 文档中的可选 `image` 字段在实践中已被验证可用于参考图再生成
+- 在当前本地环境中，`https://www.right.codes/draw` 会 TLS 握手失败，而 `https://right.codes/draw` 可正常工作；实现中已将后者设为默认 base URL
+
+### 早期设计发现
+
+- 如果 concept prompt 只要求“polished frontend concept image”，生成结果仍会非常接近普通 AI coding 产出的网页
+- 这说明 image-first 的价值不会自动出现；harness 必须明确表达图像模型的审美职责与实验职责
+- 当前分支已把这层意图写进 planner 输出、design-stage prompt 与后续实现指导
+
+### 尚未实现
+
+- 独立的 design-review agent 与有界重试
+- 从 approved image 中推导出的密集布局区域 / safe zone
+- 真正将 `approved_concept.png` 与 `background_ui.png` 纳入图像级视觉评分
+- 面向 benchmark task set 的完整 end-to-end image-first 实验
 
 ## 实施路线图
 

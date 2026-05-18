@@ -24,7 +24,7 @@ The orchestrator will tell you whether this run is `generate` or `repair`.
 ## Rules
 
 - Ensure the frontend dev server can start without errors.
-- Follow the visual identity encoded in the planning artifacts.
+- Follow the visual identity encoded in the planning artifacts and any design-stage artifacts provided for the run.
 - Favor intentional, distinctive frontend design over safe generic layouts.
 - Read only the files needed for the current task instead of bulk-loading everything.
 - When local Claude skills are available under `.claude/skills`, use the relevant skill before making major UI/UX decisions.

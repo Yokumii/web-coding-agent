@@ -8,6 +8,7 @@ from typing import Any
 
 from src.agents.visual_review import apply_dedicated_visual_review, render_feedback_from_grades
 from src.agents.sdk_runner import AgentRunStats
+from src.agents.design_stage import run_design_stage
 from src.agents.evaluator import run_evaluator
 from src.agents.generator import run_generator
 from src.agents.planner import run_planner
@@ -33,6 +34,7 @@ def _save_checkpoint(
     generator_mode: str | None = None,
     last_verdict: str | None = None,
     accepted_sprints_payload: dict[str, Any] | None = None,
+    design_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Persist the harness checkpoint.
 
@@ -47,7 +49,7 @@ def _save_checkpoint(
     if accepted_sprints_payload is None:
         accepted_sprints_payload = file_comm.read_accepted_sprints() or {}
 
-    file_comm.write_state({
+    state = {
         "last_completed_phase": phase,
         "round_num": round_num,
         "prompt": prompt,
@@ -59,7 +61,10 @@ def _save_checkpoint(
         "accepted_sprints_payload": accepted_sprints_payload,
         "last_verdict": last_verdict,
         "timestamp": datetime.now().isoformat(),
-    })
+    }
+    if design_metadata:
+        state.update(design_metadata)
+    file_comm.write_state(state)
     logger.debug(f"Checkpoint saved: {phase} (round {round_num})")
 
 
@@ -218,6 +223,8 @@ def _resume_phase_kind(phase: str | None) -> str | None:
         return None
     if phase == "plan":
         return "plan"
+    if phase == "design":
+        return "design"
     if phase.startswith("build_r"):
         return "build"
     if phase.startswith("evaluate_r"):
@@ -503,6 +510,44 @@ def _resolve_start_round(
     return 1
 
 
+def _default_design_metadata(requested_mode: str) -> dict[str, Any]:
+    if requested_mode == "image-first":
+        return {
+            "requested_design_mode": "image-first",
+            "design_mode": "pending",
+            "design_status": "pending",
+            "approved_concept_path": None,
+            "background_ui_path": None,
+        }
+    return {
+        "requested_design_mode": "text-only",
+        "design_mode": "text_only",
+        "design_status": "not_requested",
+        "approved_concept_path": None,
+        "background_ui_path": None,
+    }
+
+
+def _restore_design_metadata(
+    existing_state: dict[str, Any] | None,
+    requested_mode: str,
+) -> dict[str, Any]:
+    metadata = _default_design_metadata(requested_mode)
+    if not existing_state:
+        return metadata
+
+    for key in (
+        "requested_design_mode",
+        "design_mode",
+        "design_status",
+        "approved_concept_path",
+        "background_ui_path",
+    ):
+        if key in existing_state:
+            metadata[key] = existing_state[key]
+    return metadata
+
+
 async def run_harness(
     user_prompt: str,
     workdir: Path,
@@ -523,6 +568,12 @@ async def run_harness(
     existing_state = file_comm.read_state()
     resume_from = None
     phase_metrics = _copy_phase_metrics((existing_state or {}).get("phase_metrics"))
+    requested_design_mode = (
+        str((existing_state or {}).get("requested_design_mode") or config.design_mode)
+        if resume
+        else config.design_mode
+    )
+    design_metadata = _restore_design_metadata(existing_state, requested_design_mode)
     if resume and existing_state:
         resume_from = existing_state["last_completed_phase"]
         user_prompt = existing_state.get("prompt", user_prompt)
@@ -543,7 +594,7 @@ async def run_harness(
     logger.info(f"Workdir: {workdir}")
 
     # Phase 1: Plan
-    if _resume_phase_kind(resume_from) not in ("plan", "build", "evaluate"):
+    if _resume_phase_kind(resume_from) not in ("plan", "design", "build", "evaluate"):
         logger.info("[bold cyan]═" * 40)
         logger.info("[bold cyan]PHASE 1: PLAN")
         planner_started_at = time.perf_counter()
@@ -560,6 +611,7 @@ async def run_harness(
             cost_tracker,
             phase_metrics=phase_metrics,
             last_verdict="planned",
+            design_metadata=design_metadata,
         )
 
         if plan_only:
@@ -574,6 +626,24 @@ async def run_harness(
             return
     else:
         logger.info("[bold cyan]PHASE 1: PLAN[/] — [dim]skipped (checkpoint)[/]")
+
+    if requested_design_mode == "image-first":
+        if _resume_phase_kind(resume_from) not in ("design", "build", "evaluate"):
+            logger.info("[bold cyan]PHASE 1.5: DESIGN")
+            design_result = await run_design_stage(config, file_comm, workdir)
+            design_metadata = design_result.metadata
+            _save_checkpoint(
+                file_comm,
+                "design",
+                0,
+                user_prompt,
+                cost_tracker,
+                phase_metrics=phase_metrics,
+                last_verdict=design_metadata["design_status"],
+                design_metadata=design_metadata,
+            )
+        else:
+            logger.info("[bold cyan]PHASE 1.5: DESIGN[/] - skipped (checkpoint)")
 
     start_round = _resolve_start_round(resume_from, existing_state, file_comm)
 
@@ -672,6 +742,7 @@ async def run_harness(
                 current_sprint=sprint_num,
                 generator_mode=mode,
                 last_verdict="awaiting_review",
+                design_metadata=design_metadata,
             )
 
             if cost_tracker.is_over_budget():
@@ -791,6 +862,7 @@ async def run_harness(
                 generator_mode="repair" if recommendation == "repair" else "generate",
                 last_verdict=last_verdict,
                 accepted_sprints_payload=next_accepted_sprints,
+                design_metadata=design_metadata,
             )
             file_comm.write_accepted_sprints(next_accepted_sprints)
             accepted_sprints = next_accepted_sprints

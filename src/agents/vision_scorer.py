@@ -236,6 +236,10 @@ def _build_review_context(
 ) -> str:
     spec_text = file_comm.read_spec().strip()
     design_tokens = file_comm.read_design_tokens() or {}
+    design_brief = file_comm.read_design_brief()
+    layout_contract = file_comm.read_layout_contract()
+    asset_manifest = file_comm.read_asset_manifest()
+    has_design_contract = design_brief is not None
 
     payload = {
         "task": "Evaluate the visual appearance of the current sprint screenshots.",
@@ -270,6 +274,16 @@ def _build_review_context(
             "Return only valid JSON.",
         ],
     }
+    if has_design_contract:
+        payload["design_contract"] = {
+            "design_brief": design_brief,
+            "layout_contract": layout_contract or {},
+            "asset_manifest": asset_manifest or {"assets": []},
+        }
+        payload["instructions"].insert(
+            1,
+            "When a design contract is present, judge whether the screenshots preserve its declared visual strategy, hierarchy, and overlay intent.",
+        )
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 

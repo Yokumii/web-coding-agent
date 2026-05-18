@@ -49,6 +49,22 @@ class HarnessConfig:
     sdk_max_buffer_size: int = field(
         default_factory=lambda: int(os.getenv("SDK_MAX_BUFFER_SIZE", str(8 * 1024 * 1024)))
     )
+    design_mode: str = field(default_factory=lambda: os.getenv("DESIGN_MODE", "text-only"))
+    design_image_api_key: str = field(
+        default_factory=lambda: os.getenv("DESIGN_IMAGE_API_KEY", "")
+    )
+    design_image_base_url: str = field(
+        default_factory=lambda: os.getenv("DESIGN_IMAGE_BASE_URL", "https://right.codes/draw")
+    )
+    design_image_model: str = field(
+        default_factory=lambda: os.getenv("DESIGN_IMAGE_MODEL", "gpt-image-2")
+    )
+    design_image_size: str = field(
+        default_factory=lambda: os.getenv("DESIGN_IMAGE_SIZE", "1024x1024")
+    )
+    design_image_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("DESIGN_IMAGE_TIMEOUT_SECONDS", "180"))
+    )
 
     max_budget_usd: float = 150.0
     planner_budget_usd: float = 2.0

@@ -10,6 +10,7 @@ import pytest
 from src.agents.vision_scorer import (
     _build_anthropic_request,
     _build_chat_completions_url,
+    _build_review_context,
     _build_messages_url,
     _build_openai_request,
     _extract_anthropic_message_text,
@@ -97,6 +98,39 @@ def test_build_anthropic_request_uses_messages_shape(tmp_path: Path):
     assert payload["system"]
     assert payload["messages"][0]["content"][0] == {"type": "text", "text": "Review this screenshot."}
     assert payload["messages"][0]["content"][1]["type"] == "image"
+
+
+def test_build_review_context_includes_design_contract_when_present(tmp_path: Path):
+    from src.orchestration.file_comm import FileComm
+
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_spec("# Spec\n")
+    file_comm.write_design_tokens({"theme_name": "x"})
+    file_comm.write_design_brief(
+        {
+            "visual_strategy": "concept_reference_only",
+            "reference_files": {
+                "approved_concept": ".harness/design/approved_concept.png",
+            },
+        }
+    )
+    file_comm.write_layout_contract({"viewport_targets": ["1440x900"]})
+    file_comm.write_asset_manifest({"assets": []})
+
+    context = _build_review_context(
+        file_comm=file_comm,
+        sprint_num=1,
+        sprint_context={"title": "Core", "goal": "Ship core UI."},
+        screenshot_names=[".harness/round_1_home.png"],
+    )
+    payload = _json.loads(context)
+
+    assert payload["design_contract"]["design_brief"]["visual_strategy"] == (
+        "concept_reference_only"
+    )
+    assert payload["design_contract"]["layout_contract"]["viewport_targets"] == ["1440x900"]
+    assert payload["design_contract"]["asset_manifest"] == {"assets": []}
+    assert "When a design contract is present" in payload["instructions"][1]
 
 
 def test_extract_openai_message_text_supports_string_and_block_formats():

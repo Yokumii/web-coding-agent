@@ -72,6 +72,7 @@ def _validate_design_tokens(tokens: dict[str, Any]) -> None:
         "motion",
         "style_rules",
         "anti_patterns",
+        "visual_experiment",
     )
     for key in required_keys:
         if key not in tokens:
@@ -86,6 +87,26 @@ def _validate_design_tokens(tokens: dict[str, Any]) -> None:
     _require_non_empty_list("design_tokens.json.style_rules", tokens["style_rules"])
     if not isinstance(tokens["anti_patterns"], list):
         raise RuntimeError("Planner wrote invalid design_tokens.json: anti_patterns must be an array.")
+    visual_experiment = _require_dict(
+        "design_tokens.json.visual_experiment", tokens["visual_experiment"]
+    )
+    _require_non_empty_string(
+        "design_tokens.json.visual_experiment.design_hypothesis",
+        visual_experiment.get("design_hypothesis"),
+    )
+    _require_non_empty_string(
+        "design_tokens.json.visual_experiment.reason_for_image_first",
+        visual_experiment.get("reason_for_image_first"),
+    )
+    for key in (
+        "desired_break_from_web_templates",
+        "visual_opportunities_beyond_css",
+        "forbidden_generic_patterns",
+    ):
+        _require_non_empty_list(
+            f"design_tokens.json.visual_experiment.{key}",
+            visual_experiment.get(key),
+        )
 
 
 def _validate_feature_list(feature_list: dict[str, Any]) -> None:

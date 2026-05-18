@@ -232,6 +232,50 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
 
 
 @pytest.mark.anyio
+async def test_evaluator_reads_design_contract_when_present(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_evaluator_context(file_comm)
+    file_comm.write_design_brief({"visual_strategy": "concept_reference_only"})
+    file_comm.write_layout_contract({"viewport_targets": ["1440x900"]})
+    file_comm.write_asset_manifest({"assets": []})
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        file_comm.write_grades(1, _passing_grades(1))
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.3,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.3,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.evaluator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_evaluator(
+        HarnessConfig(evaluator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        app_url="http://127.0.0.1:4173",
+    )
+
+    assert "- .harness/design/design_brief.json" in captured["prompt"]
+    assert "- .harness/design/layout_contract.json" in captured["prompt"]
+    assert "- .harness/design/asset_manifest.json" in captured["prompt"]
+
+
+@pytest.mark.anyio
 async def test_evaluator_reads_written_grade_file_and_uses_overall_verdict(
     monkeypatch, tmp_path: Path
 ):
