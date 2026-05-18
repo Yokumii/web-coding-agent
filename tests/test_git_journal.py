@@ -4,6 +4,7 @@ import asyncio
 import shutil
 from pathlib import Path
 
+import anyio
 import pytest
 
 from src.orchestration.git_journal import (
@@ -248,3 +249,32 @@ async def test_commit_round_returns_failure_when_subprocess_startup_raises(
 
     # Restore so subsequent test setup/teardown is unaffected.
     monkeypatch.setattr(asyncio, "create_subprocess_exec", real_create)
+
+
+@pytest.mark.anyio
+async def test_commit_round_survives_leaked_anyio_cancellation(
+    monkeypatch, tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+
+    expected = CommitResult(
+        success=True,
+        commit_hash="abc1234",
+        message="synthetic commit",
+        was_empty=False,
+    )
+
+    async def fake_commit_round_once(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        return expected
+
+    monkeypatch.setattr("src.orchestration.git_journal._commit_round_once", fake_commit_round_once)
+
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        result = await commit_round(frontend, round_n=1, sprint_num=1, mode="generate")
+
+    assert result is expected
+    assert asyncio.current_task() is not None
+    assert asyncio.current_task().cancelling() == 0

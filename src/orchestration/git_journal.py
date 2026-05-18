@@ -36,6 +36,18 @@ build/
 """
 
 
+def _clear_current_task_cancellation() -> int:
+    task = asyncio.current_task()
+    if task is None:
+        return 0
+
+    cleared = 0
+    while task.cancelling():
+        task.uncancel()
+        cleared += 1
+    return cleared
+
+
 async def _run_git(*args: str, cwd: Path) -> tuple[int, str, str]:
     """Run `git <args>` in cwd, capturing stdout/stderr as text.
 
@@ -135,7 +147,7 @@ def build_commit_message(
     return title + "\n" + "\n".join(body) + "\n"
 
 
-async def commit_round(
+async def _commit_round_once(
     frontend_dir: Path,
     *,
     round_n: int,
@@ -208,3 +220,63 @@ async def commit_round(
         message=message,
         was_empty=was_empty,
     )
+
+
+async def commit_round(
+    frontend_dir: Path,
+    *,
+    round_n: int,
+    sprint_num: int,
+    mode: str,
+    prior_grade: dict[str, Any] | None = None,
+    accepted: list[int] | None = None,
+) -> CommitResult:
+    """Run the round commit while suppressing leaked parent-task cancellation.
+
+    Some SDK cleanup paths can leak an AnyIO cancel scope into the harness
+    task after the generator has already produced a usable result. If that
+    leaked cancellation lands on the first git await, the harness should log
+    a commit failure and continue rather than abort the whole round.
+    """
+    commit_task = asyncio.create_task(
+        _commit_round_once(
+            frontend_dir,
+            round_n=round_n,
+            sprint_num=sprint_num,
+            mode=mode,
+            prior_grade=prior_grade,
+            accepted=accepted,
+        ),
+        name="commit_round",
+    )
+
+    try:
+        while True:
+            try:
+                return await asyncio.shield(commit_task)
+            except asyncio.CancelledError:
+                _clear_current_task_cancellation()
+                if commit_task.done():
+                    break
+
+        if commit_task.cancelled():
+            return CommitResult(
+                success=False,
+                commit_hash=None,
+                message=build_commit_message(
+                    round_n=round_n,
+                    sprint_num=sprint_num,
+                    mode=mode,
+                    prior_grade=prior_grade,
+                    accepted=accepted,
+                ),
+                error="commit round cancelled before completion",
+            )
+
+        exc = commit_task.exception()
+        if exc is not None:
+            raise exc
+        return commit_task.result()
+    finally:
+        if not commit_task.done():
+            commit_task.cancel()

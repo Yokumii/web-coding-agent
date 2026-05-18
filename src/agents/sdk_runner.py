@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -27,7 +28,9 @@ from src.orchestration.pricing import estimate_cost_usd
 LOCAL_AGENT_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"}
 LOCAL_AGENT_TOOLS_WITH_BASH = LOCAL_AGENT_TOOLS | {"Bash"}
 PLAYWRIGHT_TOOL_PREFIX = "mcp__playwright__"
-_DISALLOWED_SHELL_SNIPPETS = ("&&", "||", "|", ";", ">", "<", "$(", "`", "&", "\n", "\r")
+_DISALLOWED_SHELL_SNIPPETS = (">", "<", "$(", "`", "&", "\n", "\r")
+_DISALLOWED_READONLY_SHELL_OPERATORS = ("&&", "||", "|", ";", "&")
+_SHELL_OPERATOR_PATTERN = re.compile(r"(\&\&|\|\||[|;&])")
 # Token check kept for documentation; the real gate is the allowlist below.
 _DISALLOWED_BASH_COMMANDS = {
     "rm",
@@ -46,6 +49,7 @@ _DISALLOWED_BASH_COMMANDS = {
 }
 _ALLOWED_BASH_COMMANDS = {
     "cat",
+    "cd",
     "cp",
     "find",
     "git",
@@ -64,6 +68,7 @@ _ALLOWED_BASH_COMMANDS = {
     "python3",
     "rg",
     "sed",
+    "sort",
     "tail",
     "touch",
     "tsc",
@@ -120,6 +125,7 @@ _READONLY_ALLOWED_BASH_COMMANDS = frozenset({
     "python",
     "python3",
     "rg",
+    "sort",
     "tail",
     "wc",
     "which",
@@ -587,14 +593,43 @@ def _validate_bash_command(command: str) -> list[str]:
     if not stripped:
         raise ValueError("empty command")
 
-    for snippet in _DISALLOWED_SHELL_SNIPPETS:
-        if snippet in stripped:
-            raise ValueError(f"shell control operator not allowed: {snippet}")
+    if "\n" in stripped or "\r" in stripped:
+        raise ValueError("shell control operator not allowed: newline")
+    if "$(" in stripped:
+        raise ValueError("shell control operator not allowed: $(")
+    if "`" in stripped:
+        raise ValueError("shell control operator not allowed: `")
+    if ">" in stripped:
+        raise ValueError("shell control operator not allowed: >")
+    if "<" in stripped:
+        raise ValueError("shell control operator not allowed: <")
+    if re.search(r"(^|[^&])&([^&]|$)", stripped):
+        raise ValueError("shell control operator not allowed: &")
 
-    argv = shlex.split(stripped)
-    if not argv:
+    segments = _split_bash_segments(stripped)
+    if not segments:
         raise ValueError("empty command")
 
+    for argv in segments:
+        _validate_bash_argv(argv)
+    return segments[0]
+
+
+def _split_bash_segments(command: str) -> list[list[str]]:
+    parts = _SHELL_OPERATOR_PATTERN.split(command)
+    segments: list[list[str]] = []
+    for part in parts:
+        stripped = part.strip()
+        if not stripped or stripped in {"&&", "||", "|", ";", "&"}:
+            continue
+        argv = shlex.split(stripped)
+        if not argv:
+            raise ValueError("empty command")
+        segments.append(argv)
+    return segments
+
+
+def _validate_bash_argv(argv: list[str]) -> None:
     executable = argv[0]
     if executable in _DISALLOWED_BASH_COMMANDS:
         raise ValueError(f"command not allowed: {executable}")
@@ -614,8 +649,6 @@ def _validate_bash_command(command: str) -> list[str]:
             raise ValueError(f"absolute paths not allowed in bash command: {token}")
         if ".." in token_path.parts:
             raise ValueError(f"path escapes workdir in bash command: {token}")
-
-    return argv
 
 
 def _validate_git_argv(argv: list[str]) -> None:
@@ -655,6 +688,10 @@ def _validate_bash_command_readonly(command: str) -> list[str]:
       (no ``install``/``test``/``build`` that would execute scripts and
       write to ``node_modules``/``dist``)
     """
+    for snippet in _DISALLOWED_READONLY_SHELL_OPERATORS:
+        if snippet in command:
+            raise ValueError(f"shell control operator not allowed: {snippet}")
+
     argv = _validate_bash_command(command)
     executable = argv[0]
     if executable not in _READONLY_ALLOWED_BASH_COMMANDS:

@@ -42,10 +42,56 @@ async def test_permission_callback_denies_disallowed_bash(tmp_path: Path):
         workdir=tmp_path,
         allow_bash=True,
         allow_playwright=False,
+        bash_profile="read_only",
     )
     result = await callback("Bash", {"command": "pwd && ls"}, None)
     assert result.behavior == "deny"
     assert "shell control operator not allowed" in result.message
+
+
+@pytest.mark.anyio
+async def test_permission_callback_allows_compound_bash_in_full_profile(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+        bash_profile="full",
+    )
+    result = await callback(
+        "Bash",
+        {"command": "cd frontend && npm run build"},
+        None,
+    )
+    assert result.behavior == "allow"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_allows_pipeline_bash_in_full_profile(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+        bash_profile="full",
+    )
+    result = await callback(
+        "Bash",
+        {"command": "find frontend/src -type f | head -40"},
+        None,
+    )
+    assert result.behavior == "allow"
+
+
+@pytest.mark.anyio
+async def test_permission_callback_still_denies_background_bash_in_full_profile(tmp_path: Path):
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=True,
+        allow_playwright=False,
+        bash_profile="full",
+    )
+    result = await callback("Bash", {"command": "npm run dev &"}, None)
+    assert result.behavior == "deny"
+    assert "shell control operator not allowed: &" in result.message
 
 
 @pytest.mark.anyio
@@ -834,7 +880,7 @@ async def test_bash_pretool_hook_denies_disallowed_in_full_profile(tmp_path: Pat
     spec = out["hookSpecificOutput"]
     assert spec["permissionDecision"] == "deny"
     assert spec["hookEventName"] == "PreToolUse"
-    assert "shell control" in spec["permissionDecisionReason"]
+    assert "absolute paths not allowed" in spec["permissionDecisionReason"]
 
 
 @pytest.mark.anyio

@@ -393,6 +393,193 @@ async def test_successful_evaluation_survives_cancellation_during_stack_close(mo
 
 
 @pytest.mark.anyio
+async def test_successful_evaluation_survives_delayed_cancellation_after_stack_close(
+    monkeypatch, tmp_path: Path
+):
+    parent_task: asyncio.Task | None = None
+
+    class DelayedCancellingAppStack(DummyAppStack):
+        async def close(self) -> None:
+            self.closed = True
+            assert parent_task is not None
+            asyncio.get_running_loop().call_soon(parent_task.cancel)
+
+    stack = DelayedCancellingAppStack()
+
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_sprint_plan(
+            {
+                "total_sprints": 1,
+                "sprints": [
+                    {
+                        "number": 1,
+                        "title": "Core flow",
+                        "goal": "Ship the first sprint.",
+                        "feature_ids": ["F001"],
+                        "deliverables": ["Primary UI."],
+                        "exit_criteria": ["Primary flow works."],
+                    }
+                ],
+            }
+        )
+        file_comm.write_accepted_sprints(
+            {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+        )
+        _write_feature_list(file_comm)
+        return 0.1
+
+    async def fake_generator(*args, **kwargs):
+        return 0.2
+
+    async def fake_evaluator(*args, **kwargs):
+        nonlocal parent_task
+        parent_task = asyncio.current_task()
+        return (
+            True,
+            {
+                "round": 1,
+                "sprint": 1,
+                "mode_recommendation": "complete",
+                "overall_passed": True,
+                "criteria": {
+                    "design_quality": {"score": 7.0},
+                    "functionality": {"score": 7.0},
+                    "originality": {"score": 6.0},
+                    "craft": {"score": 7.0},
+                },
+            },
+            0.3,
+        )
+
+    async def fake_start_app_stack(workdir, harness_dir, config, round_num):
+        return stack
+
+    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
+        return _visual_manifest(round_num), _stats(0.05)
+
+    async def fake_visual_review(**kwargs):
+        await asyncio.sleep(0)
+        grades = kwargs["grades"]
+        grades["appearance_review"] = {
+            "screenshots": [".harness/visual_round_1_home.png"],
+            "render_stability": 4,
+            "content_relevance": 4,
+            "layout_harmony": 4,
+            "modernness_memorability": 4,
+            "token_adherence": 4,
+            "notes": "Captured separately.",
+        }
+        return grades, _stats(0.0)
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+    monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
+    monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
+    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
+    monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
+    monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
+
+    await run_harness("build something", tmp_path, HarnessConfig(max_rounds=1))
+
+    assert stack.closed is True
+    state = FileComm(tmp_path / ".harness").read_state()
+    assert state is not None
+    assert state["last_completed_phase"] == "evaluate_r1"
+    assert state["last_verdict"] == "completed"
+    await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
+async def test_successful_evaluation_survives_cancellation_during_visual_review(
+    monkeypatch, tmp_path: Path
+):
+    parent_task: asyncio.Task | None = None
+    stack = DummyAppStack()
+
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_sprint_plan(
+            {
+                "total_sprints": 1,
+                "sprints": [
+                    {
+                        "number": 1,
+                        "title": "Core flow",
+                        "goal": "Ship the first sprint.",
+                        "feature_ids": ["F001"],
+                        "deliverables": ["Primary UI."],
+                        "exit_criteria": ["Primary flow works."],
+                    }
+                ],
+            }
+        )
+        file_comm.write_accepted_sprints(
+            {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+        )
+        _write_feature_list(file_comm)
+        return 0.1
+
+    async def fake_generator(*args, **kwargs):
+        return 0.2
+
+    async def fake_evaluator(*args, **kwargs):
+        nonlocal parent_task
+        parent_task = asyncio.current_task()
+        return (
+            True,
+            {
+                "round": 1,
+                "sprint": 1,
+                "mode_recommendation": "complete",
+                "overall_passed": True,
+                "criteria": {
+                    "design_quality": {"score": 7.0},
+                    "functionality": {"score": 7.0},
+                    "originality": {"score": 6.0},
+                    "craft": {"score": 7.0},
+                },
+            },
+            0.3,
+        )
+
+    async def fake_start_app_stack(workdir, harness_dir, config, round_num):
+        return stack
+
+    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
+        return _visual_manifest(round_num), _stats(0.05)
+
+    async def fake_visual_review(**kwargs):
+        assert parent_task is not None
+        parent_task.cancel()
+        await asyncio.sleep(0)
+        grades = kwargs["grades"]
+        grades["appearance_review"] = {
+            "screenshots": [".harness/visual_round_1_home.png"],
+            "render_stability": 4,
+            "content_relevance": 4,
+            "layout_harmony": 4,
+            "modernness_memorability": 4,
+            "token_adherence": 4,
+            "notes": "Captured separately.",
+        }
+        return grades, _stats(0.0)
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+    monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
+    monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
+    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
+    monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
+    monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
+
+    await run_harness("build something", tmp_path, HarnessConfig(max_rounds=1))
+
+    assert stack.closed is True
+    state = FileComm(tmp_path / ".harness").read_state()
+    assert state is not None
+    assert state["last_completed_phase"] == "evaluate_r1"
+    assert state["last_verdict"] == "completed"
+    await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
 async def test_checkpoint_records_phase_metrics_with_tokens_and_durations(monkeypatch, tmp_path: Path):
     stack = DummyAppStack()
 

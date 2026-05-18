@@ -138,6 +138,71 @@ async def _close_app_stack_safely(app_stack) -> None:
             close_task.cancel()
 
 
+async def _drain_post_success_cancellation(*, phase: str) -> None:
+    """Clear delayed cancellations leaked after a successful SDK phase.
+
+    Some async-generator finalizers schedule parent-task cancellation one
+    event-loop turn *after* the successful result and stack cleanup have
+    already completed. If the harness proceeds directly, that stale
+    cancellation can strike the next unrelated await and abort checkpoint
+    persistence after a phase that already finished successfully.
+    """
+    suppressed = 0
+    while True:
+        try:
+            await asyncio.sleep(0)
+            break
+        except asyncio.CancelledError:
+            cleared = _clear_current_task_cancellation()
+            suppressed += max(cleared, 1)
+
+    if suppressed > 0:
+        logger.warning(
+            f"[bold yellow]Suppressed leaked cancellation after {phase} success "
+            "while finalizing round state.[/]"
+        )
+
+
+async def _await_post_success_step(awaitable, *, phase: str):
+    """Wait for a post-success async step without letting leaked cancellation win.
+
+    After a successful SDK-backed phase, delayed parent-task cancellation can
+    still arrive during later awaits that are only housekeeping for that
+    already-successful round. Run those awaits in a child task, shield them,
+    and keep clearing leaked parent cancellation until the child task finishes.
+    """
+    task = asyncio.create_task(awaitable, name=f"post_success:{phase}")
+    suppressed = 0
+    try:
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                cleared = _clear_current_task_cancellation()
+                suppressed += max(cleared, 1)
+                if task.done():
+                    break
+
+        if task.cancelled():
+            raise RuntimeError(f"{phase} task was cancelled")
+
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+
+        if suppressed > 0:
+            logger.warning(
+                f"[bold yellow]Suppressed leaked cancellation while awaiting {phase} "
+                "after evaluation success.[/]"
+            )
+
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 def _copy_phase_metrics(existing: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     if not isinstance(existing, dict):
         return {}
@@ -672,12 +737,16 @@ async def run_harness(
                 )
             finally:
                 await _close_app_stack_safely(app_stack)
-            visual_capture_result = await run_visual_capture(
-                config,
-                file_comm,
-                workdir,
-                round_num=round_num,
-                app_url=app_stack.frontend_url,
+            await _drain_post_success_cancellation(phase=f"evaluator round {round_num}")
+            visual_capture_result = await _await_post_success_step(
+                run_visual_capture(
+                    config,
+                    file_comm,
+                    workdir,
+                    round_num=round_num,
+                    app_url=app_stack.frontend_url,
+                ),
+                phase=f"visual capture round {round_num}",
             )
             passed, grades, evaluator_stats = evaluator_result
             visual_manifest, visual_capture_stats = visual_capture_result
@@ -689,16 +758,25 @@ async def run_harness(
             cost_tracker.add(f"visual_capture_r{round_num}", visual_capture_stats.cost_usd)
             phase_metrics[f"evaluator_r{round_num}"] = evaluator_stats.to_dict()
             phase_metrics[f"visual_capture_r{round_num}"] = visual_capture_stats.to_dict()
+            await _drain_post_success_cancellation(
+                phase=f"visual capture round {round_num}"
+            )
             visual_score_started_at = time.perf_counter()
-            grades, visual_score_stats = await apply_dedicated_visual_review(
-                config=config,
-                file_comm=file_comm,
-                workdir=workdir,
-                round_num=round_num,
-                sprint_num=sprint_num,
-                sprint_context=sprint_context,
-                grades=grades,
-                manifest=visual_manifest,
+            grades, visual_score_stats = await _await_post_success_step(
+                apply_dedicated_visual_review(
+                    config=config,
+                    file_comm=file_comm,
+                    workdir=workdir,
+                    round_num=round_num,
+                    sprint_num=sprint_num,
+                    sprint_context=sprint_context,
+                    grades=grades,
+                    manifest=visual_manifest,
+                ),
+                phase=f"visual review round {round_num}",
+            )
+            await _drain_post_success_cancellation(
+                phase=f"visual review round {round_num}"
             )
             if visual_score_stats is not None:
                 visual_score_stats = _coerce_agent_run_stats(visual_score_stats).with_wall_duration(
