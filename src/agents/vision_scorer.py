@@ -53,10 +53,10 @@ def _validate_screenshot_path(relative_path: str, workdir: Path) -> Path:
     """Reject screenshot paths that escape workdir / aren't .png /
     aren't under .harness/.
 
-    Without this, a manifest written by a compromised visual_capture
-    agent could point at arbitrary files (``.aws/credentials`` etc.)
-    which the vision scorer would then base64-encode and POST to the
-    external vision endpoint.
+    Without this, a manifest written by a compromised evaluator could
+    point at arbitrary files (``.aws/credentials`` etc.) which the
+    vision scorer would then base64-encode and POST to the external
+    vision endpoint.
     """
     candidate = Path(relative_path)
     if candidate.is_absolute():

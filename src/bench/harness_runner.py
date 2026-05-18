@@ -25,11 +25,7 @@ async def arun_harness_for_sample(
     extra_args: list[str],
     log_dir: Path,
 ) -> HarnessRecord:
-    """Run harness for one sample as a subprocess. Async entrypoint.
-
-    The concurrent runner calls this directly. The sync `run_harness_for_sample`
-    wrapper exists for backwards compatibility with the old serial code path.
-    """
+    """Run harness for one sample as a subprocess."""
     workdir = (run_dir / "samples" / sample.id).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -75,25 +71,6 @@ async def arun_harness_for_sample(
             finished_at=finished_at,
         )
     return record
-
-
-def run_harness_for_sample(
-    sample: SampleRecord,
-    *,
-    run_dir: Path,
-    project_root: Path,
-    extra_args: list[str],
-    log_dir: Path,
-) -> HarnessRecord:
-    """Sync facade over arun_harness_for_sample. Kept for any non-async caller
-    and for tests written against the original API."""
-    return asyncio.run(arun_harness_for_sample(
-        sample,
-        run_dir=run_dir,
-        project_root=project_root,
-        extra_args=extra_args,
-        log_dir=log_dir,
-    ))
 
 
 def _load_record_from_state(

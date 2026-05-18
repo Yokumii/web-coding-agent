@@ -31,22 +31,6 @@ PLAYWRIGHT_TOOL_PREFIX = "mcp__playwright__"
 _DISALLOWED_SHELL_SNIPPETS = (">", "<", "$(", "`", "&", "\n", "\r")
 _DISALLOWED_READONLY_SHELL_OPERATORS = ("&&", "||", "|", ";", "&")
 _SHELL_OPERATOR_PATTERN = re.compile(r"(\&\&|\|\||[|;&])")
-# Token check kept for documentation; the real gate is the allowlist below.
-_DISALLOWED_BASH_COMMANDS = {
-    "rm",
-    "rmdir",
-    "sudo",
-    "chmod",
-    "chown",
-    "kill",
-    "pkill",
-    "open",
-    "xdg-open",
-    "curl",
-    "wget",
-    "ssh",
-    "scp",
-}
 _ALLOWED_BASH_COMMANDS = {
     "cat",
     "cd",
@@ -631,8 +615,6 @@ def _split_bash_segments(command: str) -> list[list[str]]:
 
 def _validate_bash_argv(argv: list[str]) -> None:
     executable = argv[0]
-    if executable in _DISALLOWED_BASH_COMMANDS:
-        raise ValueError(f"command not allowed: {executable}")
     if executable not in _ALLOWED_BASH_COMMANDS:
         raise ValueError(f"command not in allowlist: {executable}")
 

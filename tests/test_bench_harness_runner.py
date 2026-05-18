@@ -10,7 +10,6 @@ from src.bench.harness_runner import (
     HarnessSubprocessResult,
     _load_record_from_state,
     arun_harness_for_sample,
-    run_harness_for_sample,
 )
 from src.bench.manifest import HarnessRecord, SampleRecord
 
@@ -44,7 +43,8 @@ def _write_state(workdir: Path, *, last_verdict: str = "completed",
     (harness_dir / "harness_state.json").write_text(json.dumps(state))
 
 
-def test_run_harness_for_sample_success(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.anyio
+async def test_run_harness_for_sample_success(tmp_path: Path, monkeypatch) -> None:
     record = _record("000001")
     run_dir = tmp_path / "runs" / "r1"
     log_dir = run_dir / "logs"
@@ -58,7 +58,7 @@ def test_run_harness_for_sample_success(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr("src.bench.harness_runner._ainvoke", fake_ainvoke)
 
-    result = run_harness_for_sample(
+    result = await arun_harness_for_sample(
         record,
         run_dir=run_dir,
         project_root=tmp_path,
@@ -73,7 +73,8 @@ def test_run_harness_for_sample_success(tmp_path: Path, monkeypatch) -> None:
     assert result.error is None
 
 
-def test_run_harness_for_sample_subprocess_failure(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.anyio
+async def test_run_harness_for_sample_subprocess_failure(tmp_path: Path, monkeypatch) -> None:
     record = _record("000002")
     run_dir = tmp_path / "runs" / "r1"
     log_dir = run_dir / "logs"
@@ -84,7 +85,7 @@ def test_run_harness_for_sample_subprocess_failure(tmp_path: Path, monkeypatch) 
 
     monkeypatch.setattr("src.bench.harness_runner._ainvoke", fake_ainvoke)
 
-    result = run_harness_for_sample(
+    result = await arun_harness_for_sample(
         record,
         run_dir=run_dir,
         project_root=tmp_path,
@@ -97,7 +98,8 @@ def test_run_harness_for_sample_subprocess_failure(tmp_path: Path, monkeypatch) 
     assert result.last_verdict is None
 
 
-def test_run_harness_for_sample_missing_state(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.anyio
+async def test_run_harness_for_sample_missing_state(tmp_path: Path, monkeypatch) -> None:
     record = _record("000003")
     run_dir = tmp_path / "runs" / "r1"
     log_dir = run_dir / "logs"
@@ -108,7 +110,7 @@ def test_run_harness_for_sample_missing_state(tmp_path: Path, monkeypatch) -> No
 
     monkeypatch.setattr("src.bench.harness_runner._ainvoke", fake_ainvoke)
 
-    result = run_harness_for_sample(
+    result = await arun_harness_for_sample(
         record,
         run_dir=run_dir,
         project_root=tmp_path,
@@ -120,7 +122,8 @@ def test_run_harness_for_sample_missing_state(tmp_path: Path, monkeypatch) -> No
     assert result.error and "harness_state.json" in result.error
 
 
-def test_run_harness_for_sample_log_path_captured(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.anyio
+async def test_run_harness_for_sample_log_path_captured(tmp_path: Path, monkeypatch) -> None:
     record = _record("000004")
     run_dir = tmp_path / "runs" / "r1"
     log_dir = run_dir / "logs"
@@ -137,7 +140,7 @@ def test_run_harness_for_sample_log_path_captured(tmp_path: Path, monkeypatch) -
 
     monkeypatch.setattr("src.bench.harness_runner._ainvoke", fake_ainvoke)
 
-    run_harness_for_sample(
+    await arun_harness_for_sample(
         record,
         run_dir=run_dir,
         project_root=tmp_path,

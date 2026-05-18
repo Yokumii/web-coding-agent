@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.agents.visual_capture import run_visual_capture
 from src.agents.visual_review import apply_dedicated_visual_review, render_feedback_from_grades
 from src.agents.sdk_runner import AgentRunStats
 from src.agents.evaluator import run_evaluator
@@ -263,29 +262,6 @@ def _select_generator_mode(
                     return "repair"
 
     return "generate"
-
-
-def _update_accepted_sprints_after_evaluation(
-    file_comm: FileComm,
-    *,
-    round_num: int,
-    sprint_num: int,
-    recommendation: str,
-) -> dict:
-    """DEPRECATED — kept for backward compatibility with old call sites.
-
-    New code computes the next state in memory via
-    ``_compute_accepted_sprints_after_evaluation`` so that the checkpoint
-    can be written first and the file second.
-    """
-    next_state = _compute_accepted_sprints_after_evaluation(
-        file_comm,
-        round_num=round_num,
-        sprint_num=sprint_num,
-        recommendation=recommendation,
-    )
-    file_comm.write_accepted_sprints(next_state)
-    return next_state
 
 
 def _compute_accepted_sprints_after_evaluation(
@@ -738,29 +714,26 @@ async def run_harness(
             finally:
                 await _close_app_stack_safely(app_stack)
             await _drain_post_success_cancellation(phase=f"evaluator round {round_num}")
-            visual_capture_result = await _await_post_success_step(
-                run_visual_capture(
-                    config,
-                    file_comm,
-                    workdir,
-                    round_num=round_num,
-                    app_url=app_stack.frontend_url,
-                ),
-                phase=f"visual capture round {round_num}",
-            )
             passed, grades, evaluator_stats = evaluator_result
-            visual_manifest, visual_capture_stats = visual_capture_result
+            # The evaluator captured the screenshots itself during its Phase C
+            # and wrote `.harness/visual_manifest_round_N.json` before returning.
+            # Read it directly; fall back to globbing the PNGs if the evaluator
+            # skipped the manifest write but the screenshots are on disk.
+            visual_manifest = file_comm.read_visual_manifest(round_num)
+            if not visual_manifest:
+                matches = sorted(file_comm.dir.glob(f"visual_round_{round_num}_*.png"))
+                if matches:
+                    visual_manifest = {
+                        "round": round_num,
+                        "app_url": "",
+                        "screenshots": [f".harness/{path.name}" for path in matches],
+                        "notes": "",
+                    }
             evaluator_stats = _coerce_agent_run_stats(evaluator_stats).with_wall_duration(
                 int((time.perf_counter() - evaluate_started_at) * 1000)
             )
-            visual_capture_stats = _coerce_agent_run_stats(visual_capture_stats)
             cost_tracker.add(f"evaluator_r{round_num}", evaluator_stats.cost_usd)
-            cost_tracker.add(f"visual_capture_r{round_num}", visual_capture_stats.cost_usd)
             phase_metrics[f"evaluator_r{round_num}"] = evaluator_stats.to_dict()
-            phase_metrics[f"visual_capture_r{round_num}"] = visual_capture_stats.to_dict()
-            await _drain_post_success_cancellation(
-                phase=f"visual capture round {round_num}"
-            )
             visual_score_started_at = time.perf_counter()
             grades, visual_score_stats = await _await_post_success_step(
                 apply_dedicated_visual_review(
@@ -880,45 +853,3 @@ def _reset_frontend_dir(workdir: Path) -> None:
         return
     shutil.rmtree(frontend_dir)
     logger.info("[bold]Frontend cleared[/] — pass --keep-frontend to preserve it.")
-
-
-async def _gather_or_cancel(
-    evaluator_coro,
-    visual_capture_coro,
-) -> tuple[Any, Any]:
-    """Run two coroutines concurrently; cancel the sibling on first failure.
-
-    Plain ``asyncio.gather`` propagates the first exception but leaves the
-    other task running until the event loop closes: with the
-    visual_capture task still owning a Playwright MCP subprocess, that is
-    a process leak. This helper instead waits for FIRST_EXCEPTION, cancels
-    any pending sibling, awaits its cancellation, then re-raises the
-    original exception so callers see the same error type as before.
-    """
-    evaluator_task = asyncio.create_task(evaluator_coro, name="evaluator")
-    visual_capture_task = asyncio.create_task(visual_capture_coro, name="visual_capture")
-    tasks = {evaluator_task, visual_capture_task}
-
-    try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-    except BaseException:
-        # If our wait itself is cancelled (e.g. caller is being cancelled),
-        # propagate cancellation to children before re-raising.
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
-    for task in pending:
-        task.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-
-    # Re-raise the first real exception (preserve type, unlike TaskGroup).
-    for task in done:
-        exc = task.exception()
-        if exc is not None:
-            raise exc
-
-    return evaluator_task.result(), visual_capture_task.result()

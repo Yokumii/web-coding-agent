@@ -20,15 +20,6 @@ class DummyAppStack:
         self.closed = True
 
 
-def _visual_manifest(round_num: int) -> dict:
-    return {
-        "round": round_num,
-        "app_url": "http://127.0.0.1:5173",
-        "screenshots": [f".harness/visual_round_{round_num}_home.png"],
-        "notes": "top view",
-    }
-
-
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -122,17 +113,12 @@ async def test_resume_from_build_checkpoint_skips_planner_and_build(monkeypatch,
         calls.append(("start_app_stack", round_num))
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        calls.append(("visual_capture", round_num))
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -141,7 +127,6 @@ async def test_resume_from_build_checkpoint_skips_planner_and_build(monkeypatch,
     assert ("planner", None) not in calls
     assert ("generator", 2) not in calls
     assert ("start_app_stack", 2) in calls
-    assert ("visual_capture", 2) in calls
     assert ("evaluator", 2) in calls
     assert stack.closed is True
 
@@ -179,17 +164,12 @@ async def test_resume_from_evaluate_checkpoint_starts_next_build_round(monkeypat
         calls.append(("start_app_stack", round_num))
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        calls.append(("visual_capture", round_num))
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -198,7 +178,6 @@ async def test_resume_from_evaluate_checkpoint_starts_next_build_round(monkeypat
     assert ("planner", None) not in calls
     assert ("generator", 2) in calls
     assert ("start_app_stack", 2) in calls
-    assert ("visual_capture", 2) in calls
     assert ("evaluator", 2) in calls
     assert stack.closed is True
 
@@ -253,9 +232,6 @@ async def test_successful_evaluation_preserves_completed_checkpoint_and_closes_s
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         grades = kwargs["grades"]
         grades["appearance_review"] = {
@@ -272,7 +248,6 @@ async def test_successful_evaluation_preserves_completed_checkpoint_and_closes_s
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -287,7 +262,6 @@ async def test_successful_evaluation_preserves_completed_checkpoint_and_closes_s
         "planner": 0.1,
         "generator_r1": 0.2,
         "evaluator_r1": 0.3,
-        "visual_capture_r1": 0.05,
         "visual_score_r1": 0.0,
     }
 
@@ -358,9 +332,6 @@ async def test_successful_evaluation_survives_cancellation_during_stack_close(mo
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         grades = kwargs["grades"]
         grades["appearance_review"] = {
@@ -377,7 +348,6 @@ async def test_successful_evaluation_survives_cancellation_during_stack_close(mo
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -454,9 +424,6 @@ async def test_successful_evaluation_survives_delayed_cancellation_after_stack_c
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         await asyncio.sleep(0)
         grades = kwargs["grades"]
@@ -474,7 +441,6 @@ async def test_successful_evaluation_survives_delayed_cancellation_after_stack_c
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -543,9 +509,6 @@ async def test_successful_evaluation_survives_cancellation_during_visual_review(
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         assert parent_task is not None
         parent_task.cancel()
@@ -565,7 +528,6 @@ async def test_successful_evaluation_survives_cancellation_during_visual_review(
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -629,9 +591,6 @@ async def test_checkpoint_records_phase_metrics_with_tokens_and_durations(monkey
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05, duration_ms=900, duration_api_ms=700, token_usage={"input_tokens": 55, "output_tokens": 11})
-
     async def fake_visual_review(**kwargs):
         grades = kwargs["grades"]
         grades["appearance_review"] = {
@@ -648,7 +607,6 @@ async def test_checkpoint_records_phase_metrics_with_tokens_and_durations(monkey
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -673,12 +631,6 @@ async def test_checkpoint_records_phase_metrics_with_tokens_and_durations(monkey
     assert state["phase_metrics"]["generator_r1"]["wall_duration_ms"] is not None
     assert state["phase_metrics"]["evaluator_r1"]["cost_usd"] == 0.3
     assert state["phase_metrics"]["evaluator_r1"]["duration_ms"] == 3400
-    assert state["phase_metrics"]["visual_capture_r1"]["cost_usd"] == 0.05
-    assert state["phase_metrics"]["visual_capture_r1"]["duration_api_ms"] == 700
-    assert state["phase_metrics"]["visual_capture_r1"]["token_usage"] == {
-        "input_tokens": 55,
-        "output_tokens": 11,
-    }
     assert state["phase_metrics"]["visual_score_r1"]["duration_ms"] == 650
     assert state["phase_metrics"]["visual_score_r1"]["token_usage"] == {
         "input_tokens": 44,
@@ -770,16 +722,12 @@ async def test_passed_sprint_advances_to_next_sprint_in_generate_mode(monkeypatc
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -897,16 +845,12 @@ async def test_failed_sprint_keeps_same_target_and_next_round_repairs(monkeypatc
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -1009,16 +953,12 @@ async def test_failed_ui_checks_mark_only_affected_features_for_repair(monkeypat
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -1120,16 +1060,12 @@ async def test_failed_evaluation_resume_uses_repair_mode_from_checkpoint(monkeyp
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 
@@ -1211,16 +1147,15 @@ async def test_fresh_run_clears_stale_harness_artifacts(monkeypatch, tmp_path: P
     assert not (traces_dir / "planner.jsonl").exists()
 
 
-# --- evaluator failure must still close the app stack before manifest collection ---
+# --- evaluator failure must still close the app stack ---
 
 
 @pytest.mark.anyio
-async def test_evaluator_failure_skips_visual_capture_and_closes_stack(
+async def test_evaluator_failure_aborts_round_and_closes_stack(
     monkeypatch, tmp_path: Path
 ):
-    """When run_evaluator raises, manifest collection must not run and the
-    app stack must still be closed."""
-    visual_capture_called = {"value": False}
+    """When run_evaluator raises, the round aborts before the manifest is
+    read or the vision review runs, and the app stack must still be closed."""
     stack = DummyAppStack()
 
     async def fake_planner(config, user_prompt, file_comm, workdir):
@@ -1251,10 +1186,6 @@ async def test_evaluator_failure_skips_visual_capture_and_closes_stack(
     async def fake_evaluator(*args, **kwargs):
         raise RuntimeError("evaluator boom")
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        visual_capture_called["value"] = True
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
@@ -1264,7 +1195,6 @@ async def test_evaluator_failure_skips_visual_capture_and_closes_stack(
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr(
         "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
     )
@@ -1273,7 +1203,6 @@ async def test_evaluator_failure_skips_visual_capture_and_closes_stack(
     with pytest.raises(RuntimeError, match="evaluator boom"):
         await run_harness("build something", tmp_path, HarnessConfig(max_rounds=1))
 
-    assert visual_capture_called["value"] is False
     assert stack.closed is True
 
 
@@ -1376,16 +1305,12 @@ async def test_resume_reconciles_advanced_accepted_sprints_against_build_checkpo
     async def fake_start_app_stack(*args, **kwargs):
         return DummyAppStack()
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr(
         "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
     )
@@ -1474,16 +1399,12 @@ async def test_evaluate_checkpoint_is_written_before_accepted_sprints_file(
     async def fake_start_app_stack(*args, **kwargs):
         return DummyAppStack()
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr(
         "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
     )
@@ -1512,9 +1433,9 @@ async def test_budget_check_after_evaluate_stops_subsequent_rounds(
     monkeypatch, tmp_path: Path
 ):
     """Without an evaluate-phase budget check, the harness could blow
-    far past max_budget_usd in a single round (evaluator + visual_capture
-    + visual_score all add cost). The fix re-runs is_over_budget after
-    those three settle, before the next round begins.
+    far past max_budget_usd in a single round (evaluator + visual_score
+    both add cost). The fix re-runs is_over_budget after the evaluate
+    block settles, before the next round begins.
     """
     rounds_started: list[int] = []
     stack = DummyAppStack()
@@ -1545,7 +1466,7 @@ async def test_budget_check_after_evaluate_stops_subsequent_rounds(
     async def fake_generator(*args, **kwargs):
         rounds_started.append(kwargs["round_num"])
         # Build cost is small; the over-budget condition only crosses
-        # the threshold once visual_capture / visual_score are added.
+        # the threshold once visual_score is added.
         return 0.05
 
     async def fake_evaluator(*args, **kwargs):
@@ -1569,16 +1490,12 @@ async def test_budget_check_after_evaluate_stops_subsequent_rounds(
     async def fake_start_app_stack(*args, **kwargs):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.1)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.1)
 
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr(
         "src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review
     )
@@ -1734,9 +1651,6 @@ async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: P
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
-    async def fake_visual_capture(config, file_comm, workdir, round_num, app_url):
-        return _visual_manifest(round_num), _stats(0.05)
-
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
@@ -1744,7 +1658,6 @@ async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: P
     monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.harness.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.harness.run_evaluator", fake_evaluator)
-    monkeypatch.setattr("src.orchestration.harness.run_visual_capture", fake_visual_capture)
     monkeypatch.setattr("src.orchestration.harness.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.harness.start_app_stack", fake_start_app_stack)
 

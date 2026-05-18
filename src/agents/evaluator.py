@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
-from src.agents.visual_capture import build_visual_capture_requirements
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
@@ -42,6 +41,36 @@ def _ensure_local_claude_skills(workdir: Path) -> None:
         skills_dir.symlink_to(_LOCAL_CLAUDE_SKILLS_DIR, target_is_directory=True)
     except OSError:
         shutil.copytree(_LOCAL_CLAUDE_SKILLS_DIR, skills_dir)
+
+
+def _build_visual_capture_requirements(*, round_num: int, app_url: str) -> list[str]:
+    """Phase C prompt fragment: the evaluator captures screenshots inline and
+    writes ``.harness/visual_manifest_round_N.json`` for the downstream VLM."""
+    return [
+        "Phase C: Deferred Visual Review Capture",
+        f"- During this evaluator run, capture `.harness/visual_round_{round_num}_home.png` at the top of the page.",
+        f"- If the page meaningfully scrolls, also capture `.harness/visual_round_{round_num}_mid.png` from a middle section.",
+        f"- If the page meaningfully scrolls, also capture `.harness/visual_round_{round_num}_bottom.png` near the bottom section.",
+        f"- Write `.harness/visual_manifest_round_{round_num}.json` with this schema:",
+        json.dumps(
+            {
+                "round": round_num,
+                "app_url": app_url,
+                "screenshots": [
+                    f".harness/visual_round_{round_num}_home.png",
+                    f".harness/visual_round_{round_num}_mid.png",
+                    f".harness/visual_round_{round_num}_bottom.png",
+                ],
+                "notes": "short paragraph describing what was captured",
+            },
+            indent=2,
+        ),
+        "- Only include screenshots that were actually created.",
+        "- Use only relative paths such as `.harness/visual_round_1_home.png`.",
+        "- Save screenshots via the browser screenshot tool filename argument.",
+        "- Write the manifest with the Write tool only.",
+        "- Keep the appearance verdict as a placeholder for the downstream VLM review; do not treat this capture step as the final visual score.",
+    ]
 
 
 async def run_evaluator(
@@ -266,7 +295,7 @@ def _build_evaluator_prompt(
         f"2. .harness/grade_round_{round_num}.json",
         f"3. .harness/visual_manifest_round_{round_num}.json",
         "",
-        *build_visual_capture_requirements(round_num=round_num, app_url=app_url),
+        *_build_visual_capture_requirements(round_num=round_num, app_url=app_url),
         "",
         "If `.claude/skills/webapp-testing/SKILL.md` exists in the workdir, consult and use it for browser testing and evaluation strategy.",
         "Use paths relative to the workdir when calling file tools; do not use absolute paths.",

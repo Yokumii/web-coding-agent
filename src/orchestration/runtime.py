@@ -224,12 +224,11 @@ def _build_subprocess_env() -> dict[str, str]:
 
     A frontend dev server is fully under the generator's control. Vite's
     define plugin or any third-party plugin can inline ``process.env``
-    into the bundle, after which an evaluator screenshot or
-    visual_capture HTML dump would exfiltrate the secret. We therefore
-    drop any env var whose name looks key/token/secret-shaped. The list
-    is a deny-pattern rather than an allowlist because an allowlist
-    breaks legit npm scripts that depend on locale, proxy, editor, or
-    CI signals.
+    into the bundle, after which an evaluator screenshot or HTML dump
+    would exfiltrate the secret. We therefore drop any env var whose
+    name looks key/token/secret-shaped. The list is a deny-pattern
+    rather than an allowlist because an allowlist breaks legit npm
+    scripts that depend on locale, proxy, editor, or CI signals.
     """
     env = {
         name: value

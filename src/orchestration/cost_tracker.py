@@ -24,11 +24,11 @@ class CostTracker:
         """Record the cost for a phase, replacing any prior entry.
 
         Each phase key (``planner`` / ``generator_rN`` / ``evaluator_rN`` /
-        ``visual_capture_rN`` / ``visual_score_rN``) is added exactly once
-        per harness run for a successful phase, so a repeat ``add`` for
-        the same key means we are re-running the phase on resume. Using
-        replace-semantics avoids double-counting between the cost
-        restored from the previous state file and the fresh re-run cost.
+        ``visual_score_rN``) is added exactly once per harness run for a
+        successful phase, so a repeat ``add`` for the same key means we
+        are re-running the phase on resume. Using replace-semantics
+        avoids double-counting between the cost restored from the previous
+        state file and the fresh re-run cost.
         """
         self.breakdown[agent_name] = cost_usd
         self.total_cost = sum(self.breakdown.values())
