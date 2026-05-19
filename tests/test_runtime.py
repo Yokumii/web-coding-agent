@@ -8,6 +8,7 @@ import pytest
 
 from src.agents.sdk_runner import build_playwright_mcp_args
 from src.config import HarnessConfig
+from src.orchestration import runtime
 from src.orchestration.runtime import (
     ManagedProcess,
     RunningAppStack,
@@ -79,8 +80,27 @@ def test_ensure_port_available_escalates_to_sigkill(monkeypatch):
 
     assert sent_signals == [
         (4321, signal.SIGTERM),
-        (4321, signal.SIGKILL),
+        (4321, runtime.FORCE_KILL_SIGNAL),
     ]
+
+
+def test_find_listening_pids_windows_parses_netstat(monkeypatch):
+    class FakeResult:
+        returncode = 0
+        stderr = ""
+        stdout = "\n".join(
+            [
+                "  Proto  Local Address          Foreign Address        State           PID",
+                "  TCP    127.0.0.1:5173         0.0.0.0:0              LISTENING       4321",
+                "  TCP    127.0.0.1:3000         0.0.0.0:0              LISTENING       9999",
+                "  TCP    [::]:5173              [::]:0                 LISTENING       4321",
+            ]
+        )
+
+    monkeypatch.setattr(runtime, "IS_WINDOWS", True)
+    monkeypatch.setattr("src.orchestration.runtime.subprocess.run", lambda *args, **kwargs: FakeResult())
+
+    assert runtime.find_listening_pids(5173) == [4321]
 
 
 class DummyProcess:
@@ -190,14 +210,13 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
     )
 
     assert process.process.pid == 4242
-    assert captured["kwargs"].get("start_new_session") is True, (
-        "start_process must launch in a new POSIX session so stop_process can "
-        "kill the whole process group, otherwise vite/esbuild children orphan."
-    )
+    assert captured["kwargs"].get("start_new_session") is (not runtime.IS_WINDOWS)
 
 
 @pytest.mark.anyio
 async def test_stop_process_sigterms_the_process_group(monkeypatch, tmp_path: Path):
+    if runtime.IS_WINDOWS:
+        pytest.skip("POSIX process-group signaling is unavailable on Windows")
     sent: list[tuple] = []
 
     class FakeProc:
@@ -239,6 +258,8 @@ async def test_stop_process_sigterms_the_process_group(monkeypatch, tmp_path: Pa
 
 @pytest.mark.anyio
 async def test_stop_process_escalates_to_sigkill_after_timeout(monkeypatch, tmp_path: Path):
+    if runtime.IS_WINDOWS:
+        pytest.skip("POSIX process-group signaling is unavailable on Windows")
     sent: list[tuple] = []
     wait_calls = {"count": 0}
 
@@ -278,7 +299,42 @@ async def test_stop_process_escalates_to_sigkill_after_timeout(monkeypatch, tmp_
     await stop_process(managed)
 
     assert ("killpg", 7777, signal.SIGTERM) in sent
-    assert ("killpg", 7777, signal.SIGKILL) in sent
+    assert ("killpg", 7777, runtime.FORCE_KILL_SIGNAL) in sent
+
+
+@pytest.mark.anyio
+async def test_stop_process_falls_back_to_direct_child_on_windows(monkeypatch, tmp_path: Path):
+    sent: list[tuple] = []
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 9001
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+        def wait(self, timeout=None):
+            self._alive = False
+            return 0
+
+        def terminate(self):
+            sent.append(("terminate",))
+            self._alive = False
+
+        def kill(self):
+            sent.append(("kill",))
+            self._alive = False
+
+    monkeypatch.setattr(runtime, "IS_WINDOWS", True)
+
+    log_path = tmp_path / "log.txt"
+    log_file = log_path.open("w")
+    managed = ManagedProcess("frontend", FakeProc(), log_path, log_file)
+
+    await stop_process(managed)
+
+    assert sent == [("terminate",)]
 
 
 # --- dev server env must not leak API keys / tokens ---

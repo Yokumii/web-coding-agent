@@ -37,22 +37,22 @@ class FileComm:
 
     def _read_text(self, name: str) -> str:
         path = self._path(name)
-        return path.read_text() if path.exists() else ""
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def _write_text(self, name: str, content: str) -> Path:
         path = self._path(name)
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def _read(self, model: type[T], **params: Any) -> T | None:
         path = self._path(model.filename(**params))
         if not path.exists():
             return None
-        return model.model_validate_json(path.read_text())
+        return model.model_validate_json(path.read_text(encoding="utf-8"))
 
     def _write(self, payload: _Artifact, **params: Any) -> Path:
         path = self._path(payload.filename(**params))
-        path.write_text(payload.model_dump_json(indent=2))
+        path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
         return path
 
     # ---- Markdown 产物 ----
