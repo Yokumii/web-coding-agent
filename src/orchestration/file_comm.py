@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from typing import Any, TypeVar
+
+from src.orchestration.schemas import (
+    ALL_ARTIFACT_MODELS,
+    AcceptedSprints,
+    DesignTokens,
+    FeatureList,
+    Grades,
+    HarnessState,
+    SprintPlan,
+    UIVerificationPlan,
+    VisualManifest,
+    _Artifact,
+)
+
+T = TypeVar("T", bound=_Artifact)
+_TEXT_ARTIFACTS = ("spec.md", "progress.md", "build_log.md")
+_ROUND_TEXT_PATTERNS = ("feedback_round_*.md",)
+_ROUND_IMAGE_PATTERNS = ("visual_round_*.png",)
+
+
+class FileComm:
+    """封装 `workdir/.harness` 目录下的文件读写。"""
+
+    def __init__(self, harness_dir: Path) -> None:
+        self.dir = harness_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- 通用路径与文本读写 ----
+
+    def _path(self, name: str) -> Path:
+        return self.dir / name
+
+    def _read_text(self, name: str) -> str:
+        path = self._path(name)
+        return path.read_text() if path.exists() else ""
+
+    def _write_text(self, name: str, content: str) -> Path:
+        path = self._path(name)
+        path.write_text(content)
+        return path
+
+    def _read(self, model: type[T], **params: Any) -> T | None:
+        path = self._path(model.filename(**params))
+        if not path.exists():
+            return None
+        return model.model_validate_json(path.read_text())
+
+    def _write(self, payload: _Artifact, **params: Any) -> Path:
+        path = self._path(payload.filename(**params))
+        path.write_text(payload.model_dump_json(indent=2))
+        return path
+
+    # ---- Markdown 产物 ----
+
+    def write_spec(self, content: str) -> Path:
+        return self._write_text("spec.md", content)
+
+    def read_spec(self) -> str:
+        return self._read_text("spec.md")
+
+    def write_progress(self, content: str) -> Path:
+        return self._write_text("progress.md", content)
+
+    def read_progress(self) -> str:
+        return self._read_text("progress.md")
+
+    def append_progress_entry(self, entry: str) -> Path:
+        existing = self.read_progress()
+        content = entry if not existing else f"{existing.rstrip()}\n\n{entry}"
+        return self.write_progress(content)
+
+    def write_feedback(self, round_num: int, content: str) -> Path:
+        return self._write_text(f"feedback_round_{round_num}.md", content)
+
+    def read_feedback(self, round_num: int) -> str:
+        return self._read_text(f"feedback_round_{round_num}.md")
+
+    def write_build_log(self, content: str) -> Path:
+        return self._write_text("build_log.md", content)
+
+    def read_build_log(self) -> str:
+        return self._read_text("build_log.md")
+
+    # ---- JSON 产物 ----
+
+    def write_design_tokens(self, tokens: dict[str, Any]) -> Path:
+        return self._write(DesignTokens.model_validate(tokens))
+
+    def read_design_tokens(self) -> dict[str, Any] | None:
+        model = self._read(DesignTokens)
+        return model.model_dump() if model else None
+
+    def write_feature_list(self, feature_list: dict[str, Any]) -> Path:
+        return self._write(FeatureList.model_validate(feature_list))
+
+    def read_feature_list(self) -> dict[str, Any] | None:
+        model = self._read(FeatureList)
+        return model.model_dump() if model else None
+
+    def write_sprint_plan(self, sprint_plan: dict[str, Any]) -> Path:
+        return self._write(SprintPlan.model_validate(sprint_plan))
+
+    def read_sprint_plan(self) -> dict[str, Any] | None:
+        model = self._read(SprintPlan)
+        return model.model_dump() if model else None
+
+    def write_ui_verification_plan(self, verification_plan: dict[str, Any]) -> Path:
+        return self._write(UIVerificationPlan.model_validate(verification_plan))
+
+    def read_ui_verification_plan(self) -> dict[str, Any] | None:
+        model = self._read(UIVerificationPlan)
+        return model.model_dump() if model else None
+
+    def write_accepted_sprints(self, accepted_sprints: dict[str, Any]) -> Path:
+        return self._write(AcceptedSprints.model_validate(accepted_sprints))
+
+    def read_accepted_sprints(self) -> dict[str, Any] | None:
+        model = self._read(AcceptedSprints)
+        return model.model_dump() if model else None
+
+    def write_grades(self, round_num: int, grades: dict[str, Any]) -> Path:
+        return self._write(Grades.model_validate(grades), round_num=round_num)
+
+    def read_grades(self, round_num: int) -> dict[str, Any] | None:
+        model = self._read(Grades, round_num=round_num)
+        return model.model_dump() if model else None
+
+    def write_visual_manifest(self, round_num: int, payload: dict[str, Any]) -> Path:
+        return self._write(VisualManifest.model_validate(payload), round_num=round_num)
+
+    def read_visual_manifest(self, round_num: int) -> dict[str, Any] | None:
+        model = self._read(VisualManifest, round_num=round_num)
+        return model.model_dump() if model else None
+
+    def write_state(self, state: dict[str, Any]) -> Path:
+        return self._write(HarnessState.model_validate(state))
+
+    def read_state(self) -> dict[str, Any] | None:
+        model = self._read(HarnessState)
+        return model.model_dump() if model else None
+
+    # ---- 运行重置 ----
+
+    def _unlink_matching(self, *patterns: str) -> None:
+        for pattern in patterns:
+            for path in self.dir.glob(pattern):
+                path.unlink(missing_ok=True)
+
+    def reset_run_artifacts(self) -> None:
+        """在新一轮执行前清理本轮临时产物。"""
+        for name in _TEXT_ARTIFACTS:
+            self._path(name).unlink(missing_ok=True)
+        self._unlink_matching(*_ROUND_TEXT_PATTERNS, *_ROUND_IMAGE_PATTERNS)
+
+        # 通过 schema 注册表删除 JSON 产物。
+        for model in ALL_ARTIFACT_MODELS:
+            try:
+                static_name = model.filename()
+            except TypeError:
+                # 轮次相关文件需要 round_num 参数，这里改用 glob 删除。
+                template = model.filename(round_num=0)
+                pattern = template.replace("_0.json", "_*.json")
+                self._unlink_matching(pattern)
+            else:
+                self._path(static_name).unlink(missing_ok=True)
+
+        for subdir in ("logs", "traces"):
+            path = self._path(subdir)
+            if path.exists():
+                shutil.rmtree(path)

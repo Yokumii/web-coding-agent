@@ -1,0 +1,42 @@
+.env*
+!.env.example
+workdir/
+examples/
+runs/
+.claude/settings.local.json
+.playwright-mcp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+app.log
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/

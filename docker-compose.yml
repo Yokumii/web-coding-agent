@@ -1,0 +1,75 @@
+# docker-compose.yml — single-service harness with OS-level isolation.
+#
+# Usage:
+#   docker compose run --rm harness "<prompt>" --workdir /app/workdir --plan-only
+#   docker compose run --rm harness "<prompt>" --workdir /app/workdir --playwright-headless
+#
+# .env in the project root is loaded automatically by compose for variable
+# interpolation (ANTHROPIC_API_KEY etc.). It is NOT auto-mounted into the
+# container — we forward only the keys we need via `environment:` below.
+
+services:
+  harness:
+    image: web-coding-agent:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Lifecycle / namespace knobs.
+    init: true                 # PID 1 reaper; reaps zombie chromium / vite children
+    ipc: host                  # Chromium recommends host IPC to avoid OOM crashes
+
+    # OS-level isolation.
+    read_only: true            # root FS is immutable; only tmpfs + bind mounts are writable
+    tmpfs:
+      - /tmp:exec,size=512m
+      - /home/pwuser/.claude:size=256m  # claude-agent-sdk session jsonl
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Resource limits (single-host compose accepts these top-level fields).
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2.0
+
+    # List form (`- VAR`) forwards a key only when it is set on the host,
+    # so unset host env → key absent in container → src/config.py's
+    # `os.getenv(KEY, default)` returns the actual default. A map form
+    # with `KEY: "${KEY:-}"` would set unset vars to empty strings and
+    # silently bypass every fallback — e.g. an empty
+    # EVALUATOR_VISION_ENDPOINT_TYPE would crash vision_scorer.py.
+    environment:
+      # Credentials & endpoint URLs.
+      - ANTHROPIC_API_KEY
+      - ANTHROPIC_BASE_URL
+      - EVALUATOR_VISION_API_KEY
+      - EVALUATOR_VISION_BASE_URL
+      # Endpoint-shape switch — controls anthropic vs openai-compatible payload.
+      - EVALUATOR_VISION_ENDPOINT_TYPE
+      # Model overrides.
+      - PLANNER_MODEL
+      - GENERATOR_MODEL
+      - EVALUATOR_MODEL
+      - EVALUATOR_VISION_MODEL
+      # Int-typed runtime knobs.
+      - EVALUATOR_VISION_MAX_TOKENS
+      - SDK_MAX_BUFFER_SIZE
+      # FRONTEND_PORT is deliberately NOT forwarded — the port mapping
+      # below is hardcoded to 5173. Changing the port requires editing
+      # both --frontend-port and the ports: line.
+
+    # Bind mount: harness output lives on host so the caller can inspect
+    # it after `docker compose run --rm` exits. HARNESS_WORKDIR lets
+    # callers swap the host directory per prompt (unset → ./workdir).
+    volumes:
+      - ${HARNESS_WORKDIR:-./workdir}:/app/workdir:rw
+
+    # Dev server binds to 127.0.0.1 inside the container
+    # (src/orchestration/runtime.py::HOST); map to host loopback only.
+    ports:
+      - "127.0.0.1:5173:5173"
+
+    # No `command:` — caller appends positional prompt + flags to
+    # `docker compose run harness ...`; ENTRYPOINT from the Dockerfile.

@@ -1,0 +1,538 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from claude_agent_sdk.types import ResultMessage
+
+from src.agents.generator import _describe_failures, run_generator
+from src.config import HarnessConfig
+from src.orchestration.file_comm import FileComm
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+def _write_generator_context(file_comm: FileComm) -> None:
+    file_comm.write_sprint_plan(
+        {
+            "total_sprints": 2,
+            "sprints": [
+                {
+                    "number": 1,
+                    "title": "Core counter",
+                    "goal": "Ship the primary counter flow.",
+                    "feature_ids": ["F001"],
+                    "deliverables": ["Visible counter UI."],
+                    "exit_criteria": ["Counter increments correctly."],
+                },
+                {
+                    "number": 2,
+                    "title": "Refine interactions",
+                    "goal": "Repair and polish the interaction flow.",
+                    "feature_ids": ["F002"],
+                    "deliverables": ["Repair evaluator findings."],
+                    "exit_criteria": ["Reset works correctly."],
+                },
+            ],
+        }
+    )
+    file_comm.write_accepted_sprints(
+        {
+            "accepted": [],
+            "current_target": 1,
+            "last_evaluated_round": 0,
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    stats = await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+    )
+
+    # claude-sonnet-4-6 at $3 per 1M input tokens
+    # → 100_000 * 3 / 1e6 = $0.30.
+    assert stats.cost_usd == 0.3
+    assert stats.duration_ms == 1
+    assert "Mode: generate" in captured["prompt"]
+    assert "Sprint: 1" in captured["prompt"]
+    assert "Sprint Title: Core counter" in captured["prompt"]
+    assert "Target Feature IDs: F001" in captured["prompt"]
+    assert "Required Reads:" in captured["prompt"]
+    assert "- .harness/sprint_plan.json" in captured["prompt"]
+    assert "- .harness/feature_list.json" in captured["prompt"]
+    assert "- .harness/design_tokens.json" in captured["prompt"]
+    assert "- .harness/accepted_sprints.json" in captured["prompt"]
+    assert ".harness/feedback_round_1.md" not in captured["prompt"]
+    assert ".harness/grade_round_1.json" not in captured["prompt"]
+    assert "Do not implement future sprint functionality or unrelated refactors." in captured["prompt"]
+    assert "preserve accepted work" in captured["prompt"]
+    assert ".claude/skills/ui-ux-pro-max/SKILL.md" in captured["prompt"]
+    assert "npm --prefix frontend run build" in captured["prompt"]
+    assert "cd frontend && npm run build" in captured["prompt"]
+    assert "never run `npm run build` from the workdir root" in captured["prompt"]
+    assert "Read the planning bundle first" not in captured["prompt"]
+    assert ".harness/spec.md" not in captured["prompt"]
+    assert ".harness/ui_verification_plan.json" not in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_feedback(1, "Fix reset interaction.")
+    file_comm.write_grades(
+        1,
+        {
+            "round": 1,
+            "overall_passed": False,
+            "criteria": {
+                "design_quality": {"score": 6.0, "passed": True},
+                "functionality": {"score": 5.0, "passed": False, "notes": "increment broken"},
+                "originality": {"score": 5.0, "passed": True},
+                "craft": {"score": 6.0, "passed": True},
+            },
+            "ui_checks": [
+                {
+                    "check_id": "UI-001",
+                    "feature_id": "F001",
+                    "critical": True,
+                    "status": "fail",
+                    "task": "Click increment once.",
+                    "expected_result": "Counter increments by one.",
+                    "notes": "Counter does not change after click.",
+                },
+                {
+                    "check_id": "UI-099",
+                    "feature_id": "F999",
+                    "critical": False,
+                    "status": "fail",
+                    "task": "Unrelated future sprint check.",
+                    "expected_result": "Future feature visible.",
+                    "notes": "future sprint thing",
+                },
+                {
+                    "check_id": "UI-002",
+                    "feature_id": "F001",
+                    "critical": False,
+                    "status": "partial",
+                    "task": "Audio output check.",
+                    "expected_result": "Click plays audio.",
+                    "notes": "Sound missing on click.",
+                },
+            ],
+            "target_exit_criteria_results": [
+                {
+                    "criterion_id": "EXIT-01-01",
+                    "feature_id": "F001",
+                    "critical": True,
+                    "passed": False,
+                    "criterion": "Counter increments correctly.",
+                    "notes": "increment regression",
+                }
+            ],
+        },
+    )
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    stats = await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+    )
+
+    # claude-sonnet-4-6 at $3 per 1M input tokens → 100_000 * 3 / 1e6 = $0.30.
+    assert stats.cost_usd == 0.3
+    assert stats.duration_ms == 1
+    assert "Mode: repair" in captured["prompt"]
+    assert "Sprint: 1" in captured["prompt"]
+    assert "Sprint Title: Core counter" in captured["prompt"]
+    assert "Repair Scope: Fix evaluator-reported issues for the current sprint only" in captured["prompt"]
+    assert "## Previous evaluation findings" in captured["prompt"]
+    # Failed criterion below threshold is inlined.
+    assert "functionality" in captured["prompt"]
+    assert "increment broken" in captured["prompt"]
+    # Failed UI check for the current sprint is inlined; future-sprint check is filtered out.
+    assert "Counter does not change after click." in captured["prompt"]
+    assert "UI-099" not in captured["prompt"]
+    assert "future sprint thing" not in captured["prompt"]
+    # Failed exit criterion is inlined.
+    assert "increment regression" in captured["prompt"]
+    # No self-report file is referenced anymore.
+    assert "repair_targets_round_" not in captured["prompt"]
+    assert "repair_report_round_" not in captured["prompt"]
+    assert "Repair Completion Protocol" not in captured["prompt"]
+    assert "next evaluation round verifies your work" in captured["prompt"]
+    assert "Required Reads:" in captured["prompt"]
+    assert ".harness/feedback_round_1.md" in captured["prompt"]
+    assert ".harness/grade_round_1.json" in captured["prompt"]
+    assert "- .harness/sprint_plan.json" in captured["prompt"]
+    assert "- .harness/design_tokens.json" in captured["prompt"]
+    assert "- .harness/accepted_sprints.json" in captured["prompt"]
+    assert ".claude/skills/ui-ux-pro-max/SKILL.md" in captured["prompt"]
+    assert "Do not implement new features from future sprints." in captured["prompt"]
+    assert "Do not start work for the next sprint." in captured["prompt"]
+    assert "npm --prefix frontend run build" in captured["prompt"]
+    assert "cd frontend && npm run build" in captured["prompt"]
+    assert "never run `npm run build` from the workdir root" in captured["prompt"]
+    assert ".harness/spec.md" not in captured["prompt"]
+    assert ".harness/feature_list.json" not in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_generate_mode_reads_previous_feedback_when_present(
+    monkeypatch, tmp_path: Path
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_feedback(1, "Preserve the accepted nav spacing.")
+    file_comm.write_grades(
+        1,
+        {
+            "round": 1,
+            "overall_passed": True,
+            "criteria": {
+                "design_quality": {"score": 7.0, "passed": True},
+                "functionality": {"score": 7.0, "passed": True},
+                "originality": {"score": 6.0, "passed": True},
+                "craft": {"score": 7.0, "passed": True},
+            },
+            "mode_recommendation": "generate_next_sprint",
+        },
+    )
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=2,
+        sprint_num=2,
+        mode="generate",
+    )
+
+    assert ".harness/feedback_round_1.md" in captured["prompt"]
+    assert ".harness/grade_round_1.json" in captured["prompt"]
+    assert "avoid regressions" in captured["prompt"]
+    assert "without re-opening already accepted sprint scope" in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_exposes_repo_local_claude_skills_to_workdir(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+
+    source_skills = tmp_path / "source-skills"
+    (source_skills / "ui-ux-pro-max").mkdir(parents=True)
+    (source_skills / "ui-ux-pro-max" / "SKILL.md").write_text("# local skill\n")
+    monkeypatch.setattr("src.agents.generator._LOCAL_CLAUDE_SKILLS_DIR", source_skills)
+
+    async def fake_run_sdk_agent(**kwargs):
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+    )
+
+    exposed = tmp_path / ".claude" / "skills"
+    assert exposed.exists()
+    if exposed.is_symlink():
+        assert exposed.resolve() == source_skills.resolve()
+    else:
+        assert (exposed / "ui-ux-pro-max" / "SKILL.md").read_text() == "# local skill\n"
+
+
+@pytest.mark.anyio
+async def test_generator_raises_when_expected_dirs_are_missing(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+
+    async def fake_run_sdk_agent(**kwargs):
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                result="I created some files elsewhere.",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    with pytest.raises(RuntimeError, match="frontend"):
+        await run_generator(
+            HarnessConfig(),
+            file_comm,
+            tmp_path,
+            round_num=1,
+            sprint_num=1,
+            mode="generate",
+        )
+
+    assert "I created some files elsewhere." in file_comm.read_build_log()
+
+
+# --- empty frontend dir must not be treated as success ---
+
+
+@pytest.mark.anyio
+async def test_generator_raises_when_frontend_dir_is_empty(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    # Frontend dir exists but contains no package.json — agent exited too early.
+    (tmp_path / "frontend").mkdir()
+
+    async def fake_run_sdk_agent(**kwargs):
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                result="created folder",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    with pytest.raises(RuntimeError, match="package.json"):
+        await run_generator(
+            HarnessConfig(),
+            file_comm,
+            tmp_path,
+            round_num=1,
+            sprint_num=1,
+            mode="generate",
+        )
+
+
+# --- repair mode must not silently degrade to no-direction generate ---
+
+
+@pytest.mark.anyio
+async def test_generator_repair_raises_when_previous_grade_missing(
+    monkeypatch, tmp_path: Path
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    # NB: grade_round_1.json deliberately not written.
+
+    sdk_called = {"value": False}
+
+    async def fake_run_sdk_agent(**kwargs):
+        sdk_called["value"] = True
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.0,
+                result="should not run",
+            ),
+            0.0,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    with pytest.raises(RuntimeError, match="grade_round_1"):
+        await run_generator(
+            HarnessConfig(),
+            file_comm,
+            tmp_path,
+            round_num=2,
+            sprint_num=1,
+            mode="repair",
+        )
+
+    assert sdk_called["value"] is False, "Repair must not call the SDK when its inputs are missing"
+
+
+# --- _describe_failures unit tests ---
+
+
+def test_describe_failures_includes_failed_criterion():
+    grades = {
+        "criteria": {
+            "design_quality": {"score": 4, "notes": "weak hero"},
+            "functionality": {"score": 8, "notes": "ok"},
+        }
+    }
+    text = _describe_failures(grades, sprint_context={"feature_ids": []})
+    assert "design_quality" in text
+    assert "weak hero" in text
+    # Passing criterion not included.
+    assert "functionality" not in text
+
+
+def test_describe_failures_includes_failed_ui_check():
+    grades = {
+        "criteria": {},
+        "ui_checks": [
+            {"feature_id": "F-001", "status": "fail", "notes": "broken"},
+            {"feature_id": "F-001", "status": "pass", "notes": "fine"},
+        ],
+    }
+    text = _describe_failures(grades, sprint_context={"feature_ids": ["F-001"]})
+    assert "F-001" in text
+    assert "broken" in text
+    assert "fine" not in text
+
+
+def test_describe_failures_filters_ui_checks_outside_sprint_feature_ids():
+    grades = {
+        "criteria": {},
+        "ui_checks": [
+            {"feature_id": "F-001", "status": "fail", "notes": "in scope"},
+            {"feature_id": "F-999", "status": "fail", "notes": "future sprint"},
+        ],
+    }
+    text = _describe_failures(grades, sprint_context={"feature_ids": ["F-001"]})
+    assert "in scope" in text
+    assert "future sprint" not in text
+
+
+def test_describe_failures_includes_failed_exit_criterion():
+    grades = {
+        "criteria": {},
+        "target_exit_criteria_results": [
+            {"feature_id": "F-001", "passed": False, "notes": "regression"},
+            {"feature_id": "F-001", "passed": True, "notes": "ok"},
+        ],
+    }
+    text = _describe_failures(grades, sprint_context={"feature_ids": ["F-001"]})
+    assert "regression" in text
+    assert "ok" not in text
+
+
+def test_describe_failures_empty_returns_fallback():
+    text = _describe_failures({}, sprint_context={"feature_ids": []})
+    assert "no specific failures" in text

@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from src.config import HarnessConfig
+
+
+def test_harness_config_uses_model_environment_variables(monkeypatch):
+    monkeypatch.setenv("PLANNER_MODEL", "planner-env-model")
+    monkeypatch.setenv("GENERATOR_MODEL", "generator-env-model")
+    monkeypatch.setenv("EVALUATOR_MODEL", "evaluator-env-model")
+    monkeypatch.setenv("EVALUATOR_VISION_MODEL", "vision-env-model")
+    monkeypatch.setenv("EVALUATOR_VISION_API_KEY", "vision-key")
+    monkeypatch.setenv("EVALUATOR_VISION_BASE_URL", "https://vision.example.com")
+    monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
+    monkeypatch.setenv("EVALUATOR_VISION_MAX_TOKENS", "1500")
+    monkeypatch.setenv("MAX_BUDGET_USD", "42.5")
+    monkeypatch.setenv("MAX_ROUNDS", "7")
+    monkeypatch.setenv("FRONTEND_PORT", "4321")
+    monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "true")
+
+    config = HarnessConfig()
+
+    assert config.planner_model == "planner-env-model"
+    assert config.generator_model == "generator-env-model"
+    assert config.evaluator_model == "evaluator-env-model"
+    assert config.evaluator_vision_model == "vision-env-model"
+    assert config.evaluator_vision_api_key == "vision-key"
+    assert config.evaluator_vision_base_url == "https://vision.example.com"
+    assert config.evaluator_vision_endpoint_type == "openai"
+    assert config.evaluator_vision_max_tokens == 1500
+    assert config.max_budget_usd == 42.5
+    assert config.max_rounds == 7
+    assert config.frontend_port == 4321
+    assert config.playwright_headless is True
+
+
+def test_harness_config_uses_sdk_buffer_environment_variable(monkeypatch):
+    monkeypatch.setenv("SDK_MAX_BUFFER_SIZE", str(12 * 1024 * 1024))
+
+    config = HarnessConfig()
+
+    assert config.sdk_max_buffer_size == 12 * 1024 * 1024
+
+
+def test_harness_config_playwright_headless_accepts_falsey_env(monkeypatch):
+    monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "off")
+
+    config = HarnessConfig()
+
+    assert config.playwright_headless is False

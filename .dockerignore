@@ -1,0 +1,35 @@
+# Virtualenvs / build artifacts (platform-specific, must rebuild inside container)
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Project-local secrets and runtime state
+.env
+workdir/
+examples/
+
+# Editor / OS noise
+.git/
+.gitignore
+.claude/
+.playwright-mcp/
+.DS_Store
+*.swp
+*.swo
+
+# Documentation that doesn't ship in the image
+README.md
+LICENSE
+
+# Docker meta (avoid recursive copy)
+Dockerfile
+.dockerignore
+docker-compose.yml
+Makefile

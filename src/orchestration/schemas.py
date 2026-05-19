@@ -1,0 +1,290 @@
+"""定义 `.harness/*.json` 各类产物的 Pydantic 模型。"""
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class _Artifact(BaseModel):
+    """所有 `.harness` JSON 产物的基类。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:  # pragma: no cover - overridden
+        raise NotImplementedError(
+            f"{cls.__name__}.filename(**params) was not overridden"
+        )
+
+
+# ---- 规划阶段产物 -----------------------------------------------------------
+
+
+class DesignTokens(_Artifact):
+    """`design_tokens.json`，记录 planner 生成的设计系统定义。"""
+
+    theme_name: str
+    color: dict[str, Any]
+    typography: dict[str, Any]
+    spacing: dict[str, Any]
+    radius: dict[str, Any]
+    motion: dict[str, Any]
+    style_rules: list[Any]
+    anti_patterns: list[Any]
+    # 这些字段在历史执行记录中出现过，因此保留为可选项。
+    themes: dict[str, Any] | None = None
+    shadow: dict[str, Any] | None = None
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "design_tokens.json"
+
+
+class Feature(BaseModel):
+    """`feature_list.json` 中的单个功能项。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    priority: str
+    depends_on: list[Any]
+    description: str
+    acceptance_criteria: list[Any]
+    # `status` 初始由 planner 写为 planned，运行过程中会被 harness 更新。
+    status: str
+    sprint: int = Field(ge=1)
+
+
+class FeatureList(_Artifact):
+    """`feature_list.json`，记录全部规划功能。"""
+
+    features: list[Feature]
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "feature_list.json"
+
+
+class Sprint(BaseModel):
+    """`sprint_plan.json` 中的单个 sprint。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    number: int = Field(ge=1)
+    title: str
+    goal: str
+    feature_ids: list[str] = Field(min_length=1)
+    deliverables: list[str] = Field(min_length=1)
+    exit_criteria: list[str] = Field(min_length=1)
+
+
+class SprintPlan(_Artifact):
+    """`sprint_plan.json`，按顺序描述各个 sprint。"""
+
+    total_sprints: int = Field(ge=1)
+    sprints: list[Sprint]
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "sprint_plan.json"
+
+
+class UIVerificationCheck(BaseModel):
+    """`ui_verification_plan.json` 中的一条 UI 检查项。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    feature_id: str
+    task: str
+    expected_result: str
+    critical: bool
+    category: str
+
+
+class UIVerificationSprint(BaseModel):
+    """`ui_verification_plan.json` 中的单个 sprint 节点。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sprint: int = Field(ge=1)
+    checks: list[UIVerificationCheck]
+
+
+class UIVerificationPlan(_Artifact):
+    """`ui_verification_plan.json`，记录按 sprint 划分的 UI 检查项。"""
+
+    sprints: list[UIVerificationSprint]
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "ui_verification_plan.json"
+
+
+# ---- 每轮产物 ---------------------------------------------------------------
+
+
+class Criterion(BaseModel):
+    """`Grades.criteria` 中的一项评分结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: float
+    passed: bool
+    notes: str = ""
+
+
+class UICheck(BaseModel):
+    """`grade_round_N.json::ui_checks` 中的一条检查结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    check_id: str
+    feature_id: str
+    critical: bool
+    task: str
+    expected_result: str
+    # 历史上出现过额外状态，因此保持为 str，避免过早收紧。
+    status: str
+    notes: str = ""
+
+
+class ExitCriterionResult(BaseModel):
+    """`Grades` 中的一条目标 sprint 退出条件检查结果。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    criterion_id: str
+    feature_id: str
+    critical: bool
+    criterion: str
+    passed: bool
+    notes: str = ""
+
+
+class AppearanceReview(BaseModel):
+    """`Grades` 中由视觉评分模块写入的外观评分块。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    screenshots: list[str] = Field(default_factory=list)
+    render_stability: int | float | None = None
+    content_relevance: int | float | None = None
+    layout_harmony: int | float | None = None
+    modernness_memorability: int | float | None = None
+    token_adherence: int | float | None = None
+    notes: str = ""
+
+
+PhaseResultValue = Literal["pass", "fail", "skipped"]
+
+
+class Grades(_Artifact):
+    """`grade_round_N.json`，记录 evaluator 与视觉评分的综合结果。"""
+
+    round: int = Field(ge=1)
+    criteria: dict[str, Criterion]
+    overall_passed: bool
+
+    sprint: int | None = None
+    mode_recommendation: str | None = None
+    phase_results: dict[str, str] | None = None
+    sprint_passed: bool | None = None
+    regression_passed: bool | None = None
+    target_exit_criteria_results: list[ExitCriterionResult] | None = None
+    ui_checks: list[UICheck] | None = None
+    appearance_review: AppearanceReview | None = None
+    bugs_found: list[Any] = Field(default_factory=list)
+    regressions_found: list[Any] = Field(default_factory=list)
+    missing_features: list[Any] = Field(default_factory=list)
+    repair_instructions: list[Any] = Field(default_factory=list)
+
+    @classmethod
+    def filename(cls, *, round_num: int, **params: Any) -> str:
+        return f"grade_round_{round_num}.json"
+
+
+class VisualManifest(_Artifact):
+    """`visual_manifest_round_N.json`，记录截图清单与捕获元数据。"""
+
+    round: int = Field(ge=1)
+    app_url: str
+    screenshots: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+    @classmethod
+    def filename(cls, *, round_num: int, **params: Any) -> str:
+        return f"visual_manifest_round_{round_num}.json"
+
+
+# ---- 跨轮状态 ---------------------------------------------------------------
+
+
+class AcceptedSprints(_Artifact):
+    """`accepted_sprints.json`，记录已验收 sprint 与当前目标。"""
+
+    accepted: list[int] = Field(default_factory=list)
+    current_target: int = Field(ge=0)
+    last_evaluated_round: int = Field(ge=0)
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "accepted_sprints.json"
+
+
+class HarnessState(_Artifact):
+    """`harness_state.json`，用于恢复执行的检查点文件。"""
+
+    last_completed_phase: str | None = None
+    round_num: int | None = None
+    prompt: str | None = None
+    costs: dict[str, float] | None = None
+    phase_metrics: dict[str, dict[str, Any]] | None = None
+    current_sprint: int | None = None
+    generator_mode: str | None = None
+    accepted_sprints: list[int] | None = None
+    accepted_sprints_payload: dict[str, Any] | None = None
+    last_verdict: str | None = None
+    timestamp: str | None = None
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "harness_state.json"
+
+
+# ---- 注册表 -----------------------------------------------------------------
+
+
+ALL_ARTIFACT_MODELS: list[type[_Artifact]] = [
+    DesignTokens,
+    FeatureList,
+    SprintPlan,
+    UIVerificationPlan,
+    AcceptedSprints,
+    Grades,
+    VisualManifest,
+    HarnessState,
+]
+
+
+__all__ = [
+    "AcceptedSprints",
+    "AppearanceReview",
+    "Criterion",
+    "DesignTokens",
+    "ExitCriterionResult",
+    "Feature",
+    "FeatureList",
+    "Grades",
+    "HarnessState",
+    "Sprint",
+    "SprintPlan",
+    "UICheck",
+    "UIVerificationCheck",
+    "UIVerificationPlan",
+    "UIVerificationSprint",
+    "VisualManifest",
+    "ALL_ARTIFACT_MODELS",
+]
