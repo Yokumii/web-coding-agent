@@ -104,15 +104,18 @@ async def run_evaluator(
     if not grades:
         grades = _extract_grades_from_response(response)
 
-    passed = _determine_passed(grades)
-    status = "[bold green]PASSED[/]" if passed else "[bold red]FAILED[/]"
     if permission_denials:
         logger.warning(
             f"[bold yellow]Evaluator[/] completed with permission denials: {permission_denials}"
         )
-    logger.info(f"[bold yellow]Evaluator[/] round {round_num} {status}. Cost: ${total_cost:.4f}")
+    logger.info(
+        f"[bold yellow]Evaluator[/] round {round_num} completed raw evaluation. "
+        f"Cost: ${total_cost:.4f}"
+    )
 
-    return passed, grades or {}, build_agent_run_stats(response, model=config.evaluator_model)
+    return _determine_passed(grades), grades or {}, build_agent_run_stats(
+        response, model=config.evaluator_model
+    )
 
 
 def _get_current_sprint_context(file_comm: FileComm) -> tuple[int, dict[str, Any]]:

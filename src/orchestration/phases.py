@@ -11,7 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from src.agents.evaluator import run_evaluator
+from src.agents.evaluator import _determine_passed, run_evaluator
 from src.agents.generator import run_generator
 from src.agents.planner import run_planner
 from src.agents.sdk_runner import AgentRunStats
@@ -249,20 +249,49 @@ async def run_build_phase(
 
 def _resolve_recommendation(
     ctx: HarnessContext,
-    round_num: int,
     sprint_num: int,
     passed: bool,
     grades: dict[str, Any],
 ) -> str:
-    """在 evaluator 缺少 recommendation 时补齐默认决策。"""
+    """根据归一化后的通过状态生成唯一 recommendation。"""
     rec = grades.get("mode_recommendation")
-    if isinstance(rec, str) and rec:
-        return rec
     if not passed:
+        if isinstance(rec, str) and rec and rec != "repair":
+            logger.warning(
+                f"[bold yellow]Evaluator[/] reported recommendation={rec!r} "
+                f"for failed sprint {sprint_num}; normalizing to 'repair'."
+            )
         return "repair"
-    if sprint_num >= ctx.sprint_state.total_sprints:
-        return "complete"
-    return "generate_next_sprint"
+
+    expected = "complete" if sprint_num >= ctx.sprint_state.total_sprints else "generate_next_sprint"
+    if isinstance(rec, str) and rec and rec != expected:
+        logger.warning(
+            f"[bold yellow]Evaluator[/] reported recommendation={rec!r} "
+            f"for passed sprint {sprint_num}; normalizing to {expected!r}."
+        )
+    return expected
+
+
+def _normalize_grades_and_recommendation(
+    ctx: HarnessContext,
+    *,
+    sprint_num: int,
+    grades: dict[str, Any],
+) -> tuple[dict[str, Any], bool, str]:
+    """统一评分文件中的 passed / recommendation 字段，避免日志与推进状态分叉。"""
+    passed = _determine_passed(grades)
+    recommendation = _resolve_recommendation(
+        ctx,
+        sprint_num=sprint_num,
+        passed=passed,
+        grades=grades,
+    )
+
+    grades["overall_passed"] = passed
+    if "sprint_passed" in grades:
+        grades["sprint_passed"] = passed
+    grades["mode_recommendation"] = recommendation
+    return grades, passed, recommendation
 
 
 def _build_verdict(recommendation: str) -> Verdict:
@@ -334,7 +363,15 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
         ctx.file_comm.write_grades(round_num, grades)
         ctx.file_comm.write_feedback(round_num, render_feedback_from_grades(grades))
 
-    recommendation = _resolve_recommendation(ctx, round_num, sprint_num, passed, grades)
+    grades, passed, recommendation = _normalize_grades_and_recommendation(
+        ctx,
+        sprint_num=sprint_num,
+        grades=grades,
+    )
+
+    final_status = "[bold green]PASSED[/]" if passed else "[bold red]FAILED[/]"
+    logger.info(f"[bold yellow]Evaluator[/] round {round_num} final verdict {final_status}.")
+
     ctx.sprint_state.mark_sprint_outcome(sprint_num, recommendation=recommendation, grades=grades)
 
     # 先在内存中计算 accepted_sprints 的下一版内容，确保检查点先落盘。

@@ -84,6 +84,15 @@ def _make_ctx(tmp_path: Path) -> HarnessContext:
     )
 
 
+class _DummyAppStack:
+    def __init__(self, frontend_url: str = "http://127.0.0.1:5173") -> None:
+        self.frontend_url = frontend_url
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def test_module_imports():
     assert phases.__name__ == "src.orchestration.phases"
 
@@ -178,3 +187,90 @@ async def test_run_build_phase_survives_delayed_cancellation(monkeypatch, tmp_pa
     assert state is not None
     assert state["last_completed_phase"] == "build_r1"
     await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
+async def test_run_evaluate_phase_normalizes_inconsistent_pass_and_recommendation(
+    monkeypatch, tmp_path: Path
+):
+    ctx = _make_ctx(tmp_path)
+    stack = _DummyAppStack()
+
+    async def fake_run_evaluator(*args, **kwargs):
+        del args, kwargs
+        return (
+            True,
+            {
+                "round": 1,
+                "sprint": 1,
+                "mode_recommendation": "generate_next_sprint",
+                "overall_passed": True,
+                "sprint_passed": True,
+                "criteria": {
+                    "design_quality": {"score": 7.0, "passed": True},
+                    "functionality": {"score": 7.0, "passed": True},
+                    "originality": {"score": 6.0, "passed": True},
+                    "craft": {"score": 7.0, "passed": True},
+                },
+                "target_exit_criteria_results": [
+                    {
+                        "criterion_id": "EXIT-01-01",
+                        "feature_id": "F001",
+                        "critical": True,
+                        "criterion": "S1 works.",
+                        "passed": True,
+                        "notes": "looks good",
+                    }
+                ],
+                "ui_checks": [
+                    {
+                        "check_id": "UI-001",
+                        "feature_id": "F001",
+                        "critical": True,
+                        "task": "critical check",
+                        "expected_result": "works",
+                        "status": "partial",
+                        "notes": "still incomplete",
+                    }
+                ],
+                "phase_results": {
+                    "render_gate": "pass",
+                    "ui_functionality": "partial",
+                    "appearance": "pass",
+                    "source_inspection": "pass",
+                },
+            },
+            _stats(0.3),
+        )
+
+    async def fake_start_app_stack(*args, **kwargs):
+        del args, kwargs
+        return stack
+
+    async def fake_visual_review(**kwargs):
+        return kwargs["grades"], _stats(0.0)
+
+    monkeypatch.setattr("src.orchestration.phases.run_evaluator", fake_run_evaluator)
+    monkeypatch.setattr("src.orchestration.phases.start_app_stack", fake_start_app_stack)
+    monkeypatch.setattr("src.orchestration.phases.apply_dedicated_visual_review", fake_visual_review)
+
+    verdict = await run_evaluate_phase(ctx, 1)
+
+    assert verdict is Verdict.failed_review
+    assert stack.closed is True
+    assert ctx.file_comm.read_accepted_sprints() == {
+        "accepted": [],
+        "current_target": 1,
+        "last_evaluated_round": 1,
+    }
+
+    grades = ctx.file_comm.read_grades(1)
+    assert grades is not None
+    assert grades["overall_passed"] is False
+    assert grades["sprint_passed"] is False
+    assert grades["mode_recommendation"] == "repair"
+
+    state = ctx.file_comm.read_state()
+    assert state is not None
+    assert state["last_completed_phase"] == "evaluate_r1"
+    assert state["last_verdict"] == "failed_review"
