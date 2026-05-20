@@ -14,6 +14,7 @@ from src.orchestration.runtime import (
     RunningAppStack,
     build_frontend_command,
     ensure_port_available,
+    resolve_command_executable,
     start_app_stack,
     start_process,
     stop_process,
@@ -39,6 +40,25 @@ def test_build_frontend_command_prefers_pnpm_lockfile(tmp_path: Path):
         "5173",
         "--strictPort",
     ]
+
+
+def test_resolve_command_executable_uses_path_lookup(monkeypatch):
+    monkeypatch.setattr(
+        "src.orchestration.runtime.shutil.which",
+        lambda name: f"C:/bin/{name}.cmd",
+    )
+
+    assert resolve_command_executable(["npm", "run", "dev"]) == [
+        "C:/bin/npm.cmd",
+        "run",
+        "dev",
+    ]
+
+
+def test_resolve_command_executable_keeps_unknown_command(monkeypatch):
+    monkeypatch.setattr("src.orchestration.runtime.shutil.which", lambda name: None)
+
+    assert resolve_command_executable(["custom-tool", "arg"]) == ["custom-tool", "arg"]
 
 
 def test_playwright_mcp_params_default_to_isolated_mode():
@@ -180,6 +200,7 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
         def poll(self):
             return None
 
+    monkeypatch.setattr("src.orchestration.runtime.shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr("src.orchestration.runtime.subprocess.Popen", FakePopen)
 
     log_path = tmp_path / "frontend.log"
@@ -191,6 +212,7 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
     )
 
     assert process.process.pid == 4242
+    assert captured["command"] == ["/usr/bin/echo", "hi"]
     assert captured["kwargs"].get("start_new_session") is (not runtime.IS_WINDOWS)
 
 

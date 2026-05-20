@@ -558,12 +558,19 @@ The most important comparison is not only whether the page looks better, but whe
   - `design_brief.json`
   - `layout_contract.json`
   - `asset_manifest.json`
+- Expanded the artifact contents beyond placeholders:
+  - `design_brief.json` now carries semantic overlay regions, visual success criteria, implementation rules, and aesthetic intent.
+  - `layout_contract.json` now carries semantic regions, safe zones, forbidden overlay zones, asset-fit policy, and responsive rules.
+  - `asset_manifest.json` now carries production asset usage, suggested frontend copy paths, implementation notes, and image generation records.
 - Added current design outcomes:
   - `image_backed_ui`
   - `concept_reference_only`
   - `text_only_fallback`
 - Generator now reads the design contract in both generate and repair modes.
+- Generator guidance now tells the implementation agent how to use layout regions, safe zones, and production image assets without rasterizing functional UI.
 - Evaluator required reads and visual review context now include the design contract when present.
+- Evaluator prompts now explicitly check design strategy, semantic overlay placement, safe zones, and required asset usage.
+- Vision scoring now attaches existing `.harness/design/*.png` reference images to the VLM request, allowing screenshot review against `approved_concept.png` and `background_ui.png`.
 - Added a live image-generation adapter for Right Code draw + `gpt-image-2`.
 - Added propagation of research intent:
   - planner requires `design_tokens.json.visual_experiment`
@@ -586,8 +593,7 @@ The most important comparison is not only whether the page looks better, but whe
 ### Not Yet Implemented
 
 - A separate design-review agent with bounded retries.
-- Dense, machine-derived layout regions / safe zones from the approved image.
-- Reference-image-aware visual scoring that actually compares screenshots against `approved_concept.png` and `background_ui.png`.
+- Dense, machine-derived layout regions / safe zones from the approved image. The current contract is semantic and planner-derived rather than pixel-derived.
 - A completed end-to-end image-first harness run against a benchmark task set.
 
 ## Implementation Roadmap
@@ -1230,12 +1236,19 @@ text-only plan + approved concept + text-free background UI + layout contract
   - `design_brief.json`
   - `layout_contract.json`
   - `asset_manifest.json`
+- 契约内容已不再是空壳：
+  - `design_brief.json` 包含语义 overlay 区域、视觉成功标准、实现规则与审美意图
+  - `layout_contract.json` 包含语义区域、safe zone、禁止覆盖区域、资产适配策略与响应式规则
+  - `asset_manifest.json` 包含生产资产用途、建议复制到前端的路径、实现说明与图像生成记录
 - 当前支持三种设计状态：
   - `image_backed_ui`
   - `concept_reference_only`
   - `text_only_fallback`
 - generator 在 generate 与 repair 模式下都会读取 design contract
+- generator guidance 会说明如何使用布局区域、safe zone 与生产图像资产，同时避免把功能 UI 栅格化进图片
 - evaluator required reads 与视觉评审上下文在存在 design contract 时都会携带它
+- evaluator prompt 会显式检查设计策略、语义 overlay 放置、safe zone 与必需资产使用
+- vision scoring 现在会把已有的 `.harness/design/*.png` 参考图一起发送给 VLM，从而可以将实现截图与 `approved_concept.png` / `background_ui.png` 对照
 - 已接入 Right Code draw + `gpt-image-2` 的真实生图适配层
 - 已将研究意图写入链路：
   - planner 强制产出 `design_tokens.json.visual_experiment`
@@ -1258,8 +1271,7 @@ text-only plan + approved concept + text-free background UI + layout contract
 ### 尚未实现
 
 - 独立的 design-review agent 与有界重试
-- 从 approved image 中推导出的密集布局区域 / safe zone
-- 真正将 `approved_concept.png` 与 `background_ui.png` 纳入图像级视觉评分
+- 从 approved image 中推导出的密集布局区域 / safe zone。目前的 contract 是语义化、由规划产物推导，而不是像素级推导
 - 面向 benchmark task set 的完整 end-to-end image-first 实验
 
 ## 实施路线图

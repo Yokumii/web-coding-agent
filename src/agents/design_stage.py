@@ -27,6 +27,7 @@ def _build_design_brief(
     visual_strategy: str,
     reference_files: dict[str, str],
     aesthetic_intent: dict[str, Any],
+    overlay_regions: list[dict[str, Any]],
     fallback_reason: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -38,11 +39,19 @@ def _build_design_brief(
             "desktop": "Use the design contract as the primary composition reference.",
             "mobile": "Preserve hierarchy while adapting to a single-column layout.",
         },
-        "overlay_regions": [],
+        "overlay_regions": overlay_regions,
+        "visual_success_criteria": [
+            "The implementation should be recognizably derived from the image-first concept or design hypothesis.",
+            "The page should avoid default AI-web layout shortcuts listed in aesthetic_intent.generic_patterns_to_avoid.",
+            "Generated imagery should contribute composition, texture, material quality, or spatial structure that CSS-only prompting would likely miss.",
+            "Functional text, controls, and state feedback must remain editable, accessible HTML.",
+        ],
         "implementation_rules": [
             "Keep user-visible text in HTML, not baked into raster assets.",
             "Keep interactive controls as semantic HTML elements.",
             "Use any background image as a visual layer, not as a replacement for functional UI.",
+            "Preserve authored visual traits from aesthetic_intent even when adapting for responsiveness.",
+            "If a raster asset conflicts with usability, preserve the design idea in code rather than hiding controls inside the image.",
         ],
     }
     if fallback_reason is not None:
@@ -50,15 +59,125 @@ def _build_design_brief(
     return payload
 
 
-def _build_layout_contract(*, image_backed: bool) -> dict[str, Any]:
+def _feature_overlays(file_comm: FileComm) -> list[dict[str, Any]]:
+    feature_list = file_comm.read_feature_list() or {}
+    features = feature_list.get("features", [])
+    overlays: list[dict[str, Any]] = []
+    if not isinstance(features, list):
+        return overlays
+
+    bounds_cycle = [
+        "primary content area",
+        "primary action cluster",
+        "secondary information band",
+        "status or result area",
+        "navigation or mode area",
+        "supporting detail area",
+    ]
+    for index, feature in enumerate(features[:6], start=1):
+        if not isinstance(feature, dict):
+            continue
+        feature_id = str(feature.get("id", f"F{index:03d}")).strip() or f"F{index:03d}"
+        overlays.append(
+            {
+                "id": f"feature_{feature_id.lower()}",
+                "kind": "feature_overlay",
+                "feature_id": feature_id,
+                "label": str(feature.get("name", feature_id)).strip() or feature_id,
+                "bounds_hint": bounds_cycle[(index - 1) % len(bounds_cycle)],
+                "priority": "high" if index <= 3 else "medium",
+                "html_responsibility": "Render feature text, controls, and state in semantic DOM.",
+            }
+        )
+    return overlays
+
+
+def _build_overlay_regions(file_comm: FileComm) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "primary_title_and_context",
+            "kind": "text",
+            "bounds_hint": "highest-contrast title area from the concept",
+            "priority": "high",
+            "html_responsibility": "Editable heading, short context copy, and any required status text.",
+        },
+        {
+            "id": "primary_controls",
+            "kind": "interactive_controls",
+            "bounds_hint": "main action area with sufficient spacing and contrast",
+            "priority": "high",
+            "html_responsibility": "Buttons, inputs, filters, navigation, and other interactive controls.",
+        },
+        {
+            "id": "dynamic_feedback",
+            "kind": "state_feedback",
+            "bounds_hint": "result, confirmation, error, or live data area",
+            "priority": "high",
+            "html_responsibility": "Live values, validation messages, empty states, and result summaries.",
+        },
+        *_feature_overlays(file_comm),
+    ]
+
+
+def _build_layout_regions(file_comm: FileComm, *, image_backed: bool) -> list[dict[str, Any]]:
+    regions: list[dict[str, Any]] = [
+        {
+            "id": "image_composition_layer",
+            "role": "raster_visual_structure" if image_backed else "design_hypothesis_structure",
+            "desktop_bounds": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            "mobile_behavior": "crop_or_recompose_without_hiding_controls",
+        },
+        {
+            "id": "primary_content_layer",
+            "role": "main_semantic_overlay",
+            "desktop_bounds": {"x": 0.06, "y": 0.10, "w": 0.52, "h": 0.70},
+            "mobile_behavior": "full_width_stack_first",
+        },
+        {
+            "id": "interaction_layer",
+            "role": "primary_controls_and_state",
+            "desktop_bounds": {"x": 0.60, "y": 0.16, "w": 0.34, "h": 0.64},
+            "mobile_behavior": "stack_after_primary_content",
+        },
+    ]
+    for overlay in _feature_overlays(file_comm):
+        regions.append(
+            {
+                "id": overlay["id"],
+                "role": "feature_semantic_overlay",
+                "feature_id": overlay["feature_id"],
+                "desktop_bounds": "derive from matching concept area",
+                "mobile_behavior": "preserve order and interaction affordance in stacked layout",
+            }
+        )
+    return regions
+
+
+def _build_layout_contract(file_comm: FileComm, *, image_backed: bool) -> dict[str, Any]:
     return {
         "viewport_targets": ["1440x900", "390x844"],
-        "regions": [],
-        "safe_zones": [],
-        "forbidden_overlay_zones": [],
+        "regions": _build_layout_regions(file_comm, image_backed=image_backed),
+        "safe_zones": [
+            {
+                "id": "semantic_text_safe_zone",
+                "purpose": "Keep headings, labels, controls, and state text readable over the raster layer.",
+                "rule": "Use contrast overlays, masks, or local layout shifts when the image area is visually busy.",
+            }
+        ],
+        "forbidden_overlay_zones": [
+            {
+                "id": "pure_visual_detail",
+                "purpose": "Do not place essential controls on decorative texture or high-detail imagery.",
+            }
+        ],
         "asset_fit": (
             {"background_ui": "cover_desktop_contain_mobile"} if image_backed else {}
         ),
+        "responsive_rules": [
+            "Desktop may use layered or asymmetric composition from the image concept.",
+            "Mobile must keep all required controls visible without relying on pixel-perfect background alignment.",
+            "If cropping is needed, crop decorative image areas before semantic overlay areas.",
+        ],
     }
 
 
@@ -66,6 +185,7 @@ def _build_asset_manifest(
     *,
     approved_concept_exists: bool,
     background_ui_usable: bool,
+    generation_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     assets: list[dict[str, Any]] = []
     if approved_concept_exists:
@@ -75,6 +195,10 @@ def _build_asset_manifest(
                 "path": _design_artifact_path("approved_concept.png"),
                 "usage": "visual_reference",
                 "required": False,
+                "implementation": {
+                    "copy_to_frontend": False,
+                    "rule": "Use for visual comparison and design intent, not as a production background.",
+                },
             }
         )
     if background_ui_usable:
@@ -84,9 +208,23 @@ def _build_asset_manifest(
                 "path": _design_artifact_path("background_ui.png"),
                 "usage": "full_bleed_background",
                 "required": True,
+                "suggested_frontend_path": "frontend/src/assets/design/background_ui.png",
+                "implementation": {
+                    "copy_to_frontend": True,
+                    "css_role": "decorative background layer behind semantic HTML overlays",
+                    "accessibility": "Treat as decorative unless the app spec explicitly requires image semantics.",
+                },
             }
         )
-    return {"assets": assets}
+    return {
+        "assets": assets,
+        "generation_records": generation_records,
+        "implementation_notes": [
+            "Copy required production assets into the frontend project before referencing them.",
+            "Keep concept-only assets out of production UI unless explicitly marked required.",
+            "All functional information must remain available without reading rasterized text.",
+        ],
+    }
 
 
 def _build_aesthetic_intent(file_comm: FileComm) -> dict[str, Any]:
@@ -168,20 +306,37 @@ async def _try_generate_missing_assets(
     file_comm: FileComm,
     approved_concept: Path,
     background_ui: Path,
-) -> None:
+) -> list[dict[str, Any]]:
+    generation_records: list[dict[str, Any]] = []
     if not config.design_image_api_key:
-        return
+        return generation_records
 
     if not approved_concept.exists():
         try:
-            await generate_image(
+            result = await generate_image(
                 config=config,
                 prompt=_build_concept_prompt(file_comm),
                 output_path=approved_concept,
                 reference_images=None,
             )
+            generation_records.append(
+                {
+                    "asset_id": "approved_concept",
+                    "generated": approved_concept.exists(),
+                    "model": config.design_image_model,
+                    "size": config.design_image_size,
+                    "usage": getattr(result, "usage", {}) if result is not None else {},
+                }
+            )
             logger.info("[bold magenta]DESIGN phase[/] generated approved concept image.")
         except Exception as exc:
+            generation_records.append(
+                {
+                    "asset_id": "approved_concept",
+                    "generated": False,
+                    "error": str(exc),
+                }
+            )
             logger.warning(
                 "[bold yellow]DESIGN phase[/] concept generation failed; "
                 f"continuing with fallback policy: {exc}"
@@ -189,18 +344,37 @@ async def _try_generate_missing_assets(
 
     if approved_concept.exists() and not background_ui.exists():
         try:
-            await generate_image(
+            result = await generate_image(
                 config=config,
                 prompt=_build_background_prompt(),
                 output_path=background_ui,
                 reference_images=[approved_concept],
             )
+            generation_records.append(
+                {
+                    "asset_id": "background_ui",
+                    "generated": background_ui.exists(),
+                    "model": config.design_image_model,
+                    "size": config.design_image_size,
+                    "reference_assets": ["approved_concept"],
+                    "usage": getattr(result, "usage", {}) if result is not None else {},
+                }
+            )
             logger.info("[bold magenta]DESIGN phase[/] generated text-free background image.")
         except Exception as exc:
+            generation_records.append(
+                {
+                    "asset_id": "background_ui",
+                    "generated": False,
+                    "reference_assets": ["approved_concept"],
+                    "error": str(exc),
+                }
+            )
             logger.warning(
                 "[bold yellow]DESIGN phase[/] background generation failed; "
                 f"continuing with fallback policy: {exc}"
             )
+    return generation_records
 
 
 async def run_design_stage(
@@ -214,7 +388,7 @@ async def run_design_stage(
     file_comm.design_dir.mkdir(parents=True, exist_ok=True)
     approved_concept = file_comm.design_dir / "approved_concept.png"
     background_ui = file_comm.design_dir / "background_ui.png"
-    await _try_generate_missing_assets(
+    generation_records = await _try_generate_missing_assets(
         config=config,
         file_comm=file_comm,
         approved_concept=approved_concept,
@@ -266,14 +440,16 @@ async def run_design_stage(
             visual_strategy=visual_strategy,
             reference_files=reference_files,
             aesthetic_intent=aesthetic_intent,
+            overlay_regions=_build_overlay_regions(file_comm),
             fallback_reason=fallback_reason,
         )
     )
-    file_comm.write_layout_contract(_build_layout_contract(image_backed=image_backed))
+    file_comm.write_layout_contract(_build_layout_contract(file_comm, image_backed=image_backed))
     file_comm.write_asset_manifest(
         _build_asset_manifest(
             approved_concept_exists=has_approved_concept,
             background_ui_usable=image_backed,
+            generation_records=generation_records,
         )
     )
 

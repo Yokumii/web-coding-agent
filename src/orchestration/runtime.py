@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +47,15 @@ def build_frontend_command(frontend_dir: Path, port: int) -> list[str]:
     if (frontend_dir / "yarn.lock").exists():
         return ["yarn", "dev", "--host", HOST, "--port", str(port), "--strictPort"]
     return ["npm", "run", "dev", "--", "--host", HOST, "--port", str(port), "--strictPort"]
+
+
+def resolve_command_executable(command: list[str]) -> list[str]:
+    if not command:
+        raise ValueError("empty process command")
+    executable = shutil.which(command[0])
+    if executable is None:
+        return command
+    return [executable, *command[1:]]
 
 
 def find_listening_pids(port: int) -> list[int]:
@@ -206,8 +216,9 @@ def start_process(
 ) -> ManagedProcess:
     log_file = log_path.open("w", encoding="utf-8")
     env = _build_subprocess_env()
+    resolved_command = resolve_command_executable(command)
     process = subprocess.Popen(
-        command,
+        resolved_command,
         cwd=str(cwd),
         env=env,
         stdin=subprocess.DEVNULL,

@@ -93,6 +93,67 @@ def _validate_screenshot_path(relative_path: str, workdir: Path) -> Path:
     return resolved
 
 
+def _validate_design_reference_path(relative_path: str, workdir: Path) -> Path:
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError(
+            f"design reference path must stay under workdir: {relative_path!r}"
+        )
+
+    workdir_resolved = workdir.resolve()
+    resolved = (workdir_resolved / candidate).resolve()
+    try:
+        resolved.relative_to(workdir_resolved / ".harness" / "design")
+    except ValueError as exc:
+        raise ValueError(
+            f"design reference image must live under .harness/design/: {relative_path!r}"
+        ) from exc
+
+    if resolved.suffix.lower() != ".png":
+        raise ValueError(
+            f"design reference image must have .png extension: {relative_path!r}"
+        )
+    return resolved
+
+
+def _collect_existing_design_reference_paths(
+    file_comm: FileComm,
+    workdir: Path,
+) -> list[str]:
+    candidates: list[str] = []
+    design_brief = file_comm.read_design_brief() or {}
+    reference_files = design_brief.get("reference_files")
+    if isinstance(reference_files, dict):
+        candidates.extend(str(path) for path in reference_files.values() if str(path).strip())
+
+    asset_manifest = file_comm.read_asset_manifest() or {}
+    assets = asset_manifest.get("assets")
+    if isinstance(assets, list):
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            usage = str(asset.get("usage", "")).strip()
+            if usage not in {"visual_reference", "full_bleed_background"}:
+                continue
+            path = str(asset.get("path", "")).strip()
+            if path:
+                candidates.append(path)
+
+    references: list[str] = []
+    seen: set[str] = set()
+    for relative_path in candidates:
+        if relative_path in seen:
+            continue
+        try:
+            absolute_path = _validate_design_reference_path(relative_path, workdir)
+        except ValueError:
+            continue
+        if absolute_path.exists():
+            references.append(relative_path)
+            seen.add(relative_path)
+    return references
+
+
 def _normalize_endpoint_type(endpoint_type: str) -> str:
     normalized = endpoint_type.strip().lower()
     if normalized in {"anthropic", "openai"}:
@@ -233,6 +294,7 @@ def _build_review_context(
     sprint_num: int,
     sprint_context: dict[str, Any],
     screenshot_names: list[str],
+    design_reference_names: list[str] | None = None,
 ) -> str:
     spec_text = file_comm.read_spec().strip()
     design_tokens = file_comm.read_design_tokens() or {}
@@ -249,6 +311,7 @@ def _build_review_context(
         "deliverables": sprint_context.get("deliverables", []),
         "exit_criteria": sprint_context.get("exit_criteria", []),
         "screenshots": screenshot_names,
+        "design_reference_images": design_reference_names or [],
         "design_tokens": design_tokens,
         "spec_excerpt": spec_text[:8000],
         "response_schema": {
@@ -284,6 +347,11 @@ def _build_review_context(
             1,
             "When a design contract is present, judge whether the screenshots preserve its declared visual strategy, hierarchy, and overlay intent.",
         )
+        if design_reference_names:
+            payload["instructions"].insert(
+                2,
+                "The request includes design reference images after the screenshots; compare the implemented screenshots against those references without requiring pixel-perfect duplication.",
+            )
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -335,11 +403,25 @@ def _build_anthropic_content_blocks(
     *,
     workdir: Path,
     screenshot_paths: list[str],
+    reference_image_paths: list[str] | None = None,
     review_context: str,
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [{"type": "text", "text": review_context}]
     for relative_path in screenshot_paths:
         absolute_path = _validate_screenshot_path(relative_path, workdir)
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": _read_image_as_base64(absolute_path),
+                },
+            }
+        )
+    for relative_path in reference_image_paths or []:
+        absolute_path = _validate_design_reference_path(relative_path, workdir)
+        content.append({"type": "text", "text": f"Design reference image: {relative_path}"})
         content.append(
             {
                 "type": "image",
@@ -357,11 +439,23 @@ def _build_openai_content_blocks(
     *,
     workdir: Path,
     screenshot_paths: list[str],
+    reference_image_paths: list[str] | None = None,
     review_context: str,
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [{"type": "text", "text": review_context}]
     for relative_path in screenshot_paths:
         absolute_path = _validate_screenshot_path(relative_path, workdir)
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{_read_image_as_base64(absolute_path)}"
+                },
+            }
+        )
+    for relative_path in reference_image_paths or []:
+        absolute_path = _validate_design_reference_path(relative_path, workdir)
+        content.append({"type": "text", "text": f"Design reference image: {relative_path}"})
         content.append(
             {
                 "type": "image_url",
@@ -378,6 +472,7 @@ def _build_anthropic_request(
     config: HarnessConfig,
     workdir: Path,
     screenshot_paths: list[str],
+    reference_image_paths: list[str] | None = None,
     review_context: str,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
     return (
@@ -397,6 +492,7 @@ def _build_anthropic_request(
                     "content": _build_anthropic_content_blocks(
                         workdir=workdir,
                         screenshot_paths=screenshot_paths,
+                        reference_image_paths=reference_image_paths,
                         review_context=review_context,
                     ),
                 }
@@ -410,6 +506,7 @@ def _build_openai_request(
     config: HarnessConfig,
     workdir: Path,
     screenshot_paths: list[str],
+    reference_image_paths: list[str] | None = None,
     review_context: str,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
     return (
@@ -428,6 +525,7 @@ def _build_openai_request(
                     "content": _build_openai_content_blocks(
                         workdir=workdir,
                         screenshot_paths=screenshot_paths,
+                        reference_image_paths=reference_image_paths,
                         review_context=review_context,
                     ),
                 },
@@ -529,11 +627,13 @@ def _perform_visual_review_request(
     if not config.evaluator_vision_api_key:
         raise ValueError("missing evaluator vision API key")
 
+    reference_image_paths = _collect_existing_design_reference_paths(file_comm, workdir)
     review_context = _build_review_context(
         file_comm=file_comm,
         sprint_num=sprint_num,
         sprint_context=sprint_context,
         screenshot_names=screenshot_paths,
+        design_reference_names=reference_image_paths,
     )
     endpoint_type = _normalize_endpoint_type(config.evaluator_vision_endpoint_type)
     if endpoint_type == "anthropic":
@@ -541,6 +641,7 @@ def _perform_visual_review_request(
             config=config,
             workdir=workdir,
             screenshot_paths=screenshot_paths,
+            reference_image_paths=reference_image_paths,
             review_context=review_context,
         )
     else:
@@ -548,6 +649,7 @@ def _perform_visual_review_request(
             config=config,
             workdir=workdir,
             screenshot_paths=screenshot_paths,
+            reference_image_paths=reference_image_paths,
             review_context=review_context,
         )
 

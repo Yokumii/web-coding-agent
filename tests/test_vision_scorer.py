@@ -13,6 +13,7 @@ from src.agents.vision_scorer import (
     _build_review_context,
     _build_messages_url,
     _build_openai_request,
+    _collect_existing_design_reference_paths,
     _extract_anthropic_message_text,
     _extract_json_object,
     _extract_openai_message_text,
@@ -131,6 +132,93 @@ def test_build_review_context_includes_design_contract_when_present(tmp_path: Pa
     assert payload["design_contract"]["layout_contract"]["viewport_targets"] == ["1440x900"]
     assert payload["design_contract"]["asset_manifest"] == {"assets": []}
     assert "When a design contract is present" in payload["instructions"][1]
+
+
+def test_build_review_context_tracks_design_reference_images(tmp_path: Path):
+    from src.orchestration.file_comm import FileComm
+
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_design_brief({"visual_strategy": "image_backed_ui"})
+
+    context = _build_review_context(
+        file_comm=file_comm,
+        sprint_num=1,
+        sprint_context={"title": "Core", "goal": "Ship core UI."},
+        screenshot_names=[".harness/round_1_home.png"],
+        design_reference_names=[".harness/design/background_ui.png"],
+    )
+    payload = _json.loads(context)
+
+    assert payload["design_reference_images"] == [".harness/design/background_ui.png"]
+    assert "design reference images" in payload["instructions"][2]
+
+
+def test_collect_existing_design_reference_paths_filters_to_design_pngs(tmp_path: Path):
+    from src.orchestration.file_comm import FileComm
+
+    file_comm = FileComm(tmp_path / ".harness")
+    design_dir = tmp_path / ".harness" / "design"
+    design_dir.mkdir(parents=True)
+    (design_dir / "approved_concept.png").write_bytes(b"concept")
+    (design_dir / "background_ui.png").write_bytes(b"background")
+    file_comm.write_design_brief(
+        {
+            "reference_files": {
+                "approved_concept": ".harness/design/approved_concept.png",
+            }
+        }
+    )
+    file_comm.write_asset_manifest(
+        {
+            "assets": [
+                {
+                    "id": "background_ui",
+                    "path": ".harness/design/background_ui.png",
+                    "usage": "full_bleed_background",
+                },
+                {
+                    "id": "unsafe",
+                    "path": "frontend/logo.png",
+                    "usage": "visual_reference",
+                },
+            ]
+        }
+    )
+
+    assert _collect_existing_design_reference_paths(file_comm, tmp_path) == [
+        ".harness/design/approved_concept.png",
+        ".harness/design/background_ui.png",
+    ]
+
+
+def test_build_openai_request_attaches_design_reference_images(tmp_path: Path):
+    harness_dir = tmp_path / ".harness"
+    design_dir = harness_dir / "design"
+    design_dir.mkdir(parents=True)
+    (harness_dir / "round_1_home.png").write_bytes(b"screen")
+    (design_dir / "background_ui.png").write_bytes(b"background")
+    config = HarnessConfig(
+        evaluator_vision_model="gpt-4o-mini",
+        evaluator_vision_api_key="test-key",
+        evaluator_vision_base_url="https://api.openai.com",
+        evaluator_vision_endpoint_type="openai",
+    )
+
+    _, _, payload = _build_openai_request(
+        config=config,
+        workdir=tmp_path,
+        screenshot_paths=[".harness/round_1_home.png"],
+        reference_image_paths=[".harness/design/background_ui.png"],
+        review_context="Review.",
+    )
+
+    content = payload["messages"][1]["content"]
+    assert content[1]["type"] == "image_url"
+    assert content[2] == {
+        "type": "text",
+        "text": "Design reference image: .harness/design/background_ui.png",
+    }
+    assert content[3]["type"] == "image_url"
 
 
 def test_extract_openai_message_text_supports_string_and_block_formats():

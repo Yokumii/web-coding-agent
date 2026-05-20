@@ -729,6 +729,76 @@ async def test_run_sdk_agent_waits_for_stream_close_despite_parent_cancellation(
 
 
 @pytest.mark.anyio
+async def test_run_sdk_agent_retries_startup_cancellation_once(monkeypatch, tmp_path: Path):
+    attempts = {"count": 0}
+
+    class StartupCancelStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            return None
+
+    class SuccessStream:
+        def __init__(self) -> None:
+            self.sent = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.0,
+                result="done",
+            )
+
+        async def aclose(self):
+            return None
+
+    def fake_query(*, prompt, options):
+        del prompt, options
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            return StartupCancelStream()
+        return SuccessStream()
+
+    monkeypatch.setattr("src.agents.sdk_runner.query", fake_query)
+
+    result, cost, assistant_text, permission_denials = await run_sdk_agent(
+        prompt="hello",
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=5,
+        allow_bash=False,
+    )
+
+    assert attempts["count"] == 2
+    assert result.result == "done"
+    assert cost == 0.0
+    assert assistant_text == ""
+    assert permission_denials == []
+    await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
 async def test_permission_trace_is_written(tmp_path: Path):
     trace_path = tmp_path / "permissions.jsonl"
     callback = make_tool_permission_callback(

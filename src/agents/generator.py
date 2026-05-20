@@ -330,6 +330,8 @@ def _build_design_stage_guidance(file_comm: FileComm) -> str:
     lines = [
         "Design Stage Guidance:",
         "- Read the design-stage artifacts before making layout decisions.",
+        "- Treat `layout_contract.json` as the source of semantic overlay regions, responsive behavior, and safe zones.",
+        "- Treat `asset_manifest.json` as the source of which raster assets are production assets and where they should be copied.",
     ]
     if isinstance(aesthetic_intent, dict):
         hypothesis = str(aesthetic_intent.get("design_hypothesis", "")).strip()
@@ -362,7 +364,8 @@ def _build_design_stage_guidance(file_comm: FileComm) -> str:
             [
                 "- Preserve the approved composition using the design contract and asset manifest.",
                 "- Keep user-visible text and interactive controls as semantic HTML overlays.",
-                "- Copy any required assets from `.harness/design/` into the frontend project before referencing them in code.",
+                "- Copy required production assets from `.harness/design/` into the frontend project before referencing them in code.",
+                "- Use the image layer for composition, material, and texture; rebuild all functional labels, controls, and state in HTML.",
             ]
         )
     elif visual_strategy == "concept_reference_only":

@@ -239,6 +239,7 @@ def _build_evaluator_prompt(
     exit_criteria = sprint_context.get("exit_criteria", [])
     ui_checks = _get_current_sprint_ui_checks(file_comm, sprint_num)
     exit_criterion_map = _build_exit_criterion_feature_map(file_comm, sprint_num, sprint_context)
+    has_design_contract = file_comm.read_design_brief() is not None
 
     lines = [
         f"Application URL: {app_url}",
@@ -295,6 +296,17 @@ def _build_evaluator_prompt(
         "Required Reads:",
         *[f"- {path}" for path in required_reads],
         "",
+        *(
+            [
+                "Design Contract Assessment:",
+                "- Check whether the implementation follows design_brief.json visual_strategy and aesthetic_intent.",
+                "- Check whether semantic text and controls are placed according to layout_contract.json overlay regions and safe zones.",
+                "- Check whether required production assets in asset_manifest.json are copied into the frontend and used as decorative visual layers, not as inaccessible functional UI.",
+                "",
+            ]
+            if has_design_contract
+            else []
+        ),
         "Assessment Order:",
         "1. Phase A: Render Gate",
         "2. Phase B: UI Functionality Verification",

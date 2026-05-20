@@ -31,40 +31,24 @@ async def test_design_stage_records_text_only_fallback_when_assets_are_missing(t
         "approved_concept_path": None,
         "background_ui_path": None,
     }
-    assert file_comm.read_design_brief() == {
-        "requested_mode": "image-first",
-        "visual_strategy": "text_only_fallback",
-        "reference_files": {},
-        "aesthetic_intent": {
-            "design_hypothesis": (
-                "Use image-first generation to expand the visual space beyond "
-                "what a code-only frontend agent would usually invent from text."
-            ),
-            "reason_for_image_first": (
-                "Text-only prompting often converges on safe, generic web layouts."
-            ),
-            "distinctive_features_to_preserve": [],
-            "non_css_visual_value": [],
-            "generic_patterns_to_avoid": [
-                "generic SaaS hero composition",
-                "centered card grid",
-                "glassmorphism defaults",
-            ],
-        },
-        "responsive_strategy": {
-            "desktop": "Use the design contract as the primary composition reference.",
-            "mobile": "Preserve hierarchy while adapting to a single-column layout.",
-        },
-        "overlay_regions": [],
-        "implementation_rules": [
-            "Keep user-visible text in HTML, not baked into raster assets.",
-            "Keep interactive controls as semantic HTML elements.",
-            "Use any background image as a visual layer, not as a replacement for functional UI.",
-        ],
-        "fallback_reason": "image_assets_unavailable",
-    }
+    brief = file_comm.read_design_brief()
+    assert brief["requested_mode"] == "image-first"
+    assert brief["visual_strategy"] == "text_only_fallback"
+    assert brief["reference_files"] == {}
+    assert brief["aesthetic_intent"]["generic_patterns_to_avoid"] == [
+        "generic SaaS hero composition",
+        "centered card grid",
+        "glassmorphism defaults",
+    ]
+    assert [region["id"] for region in brief["overlay_regions"][:3]] == [
+        "primary_title_and_context",
+        "primary_controls",
+        "dynamic_feedback",
+    ]
+    assert brief["visual_success_criteria"]
+    assert brief["fallback_reason"] == "image_assets_unavailable"
     assert file_comm.read_layout_contract()["asset_fit"] == {}
-    assert file_comm.read_asset_manifest() == {"assets": []}
+    assert file_comm.read_asset_manifest()["assets"] == []
 
 
 @pytest.mark.anyio
@@ -94,22 +78,28 @@ async def test_design_stage_adopts_preseeded_image_assets(tmp_path: Path):
     assert file_comm.read_layout_contract()["asset_fit"] == {
         "background_ui": "cover_desktop_contain_mobile"
     }
-    assert file_comm.read_asset_manifest() == {
-        "assets": [
-            {
-                "id": "approved_concept",
-                "path": ".harness/design/approved_concept.png",
-                "usage": "visual_reference",
-                "required": False,
-            },
-            {
-                "id": "background_ui",
-                "path": ".harness/design/background_ui.png",
-                "usage": "full_bleed_background",
-                "required": True,
-            },
-        ]
-    }
+    manifest = file_comm.read_asset_manifest()
+    assert [
+        (asset["id"], asset["path"], asset["usage"], asset["required"])
+        for asset in manifest["assets"]
+    ] == [
+        (
+            "approved_concept",
+            ".harness/design/approved_concept.png",
+            "visual_reference",
+            False,
+        ),
+        (
+            "background_ui",
+            ".harness/design/background_ui.png",
+            "full_bleed_background",
+            True,
+        ),
+    ]
+    assert manifest["assets"][1]["suggested_frontend_path"] == (
+        "frontend/src/assets/design/background_ui.png"
+    )
+    assert manifest["implementation_notes"]
 
 
 @pytest.mark.anyio
@@ -133,51 +123,27 @@ async def test_design_stage_keeps_approved_concept_as_reference_when_background_
         "approved_concept_path": ".harness/design/approved_concept.png",
         "background_ui_path": None,
     }
-    assert file_comm.read_design_brief() == {
-        "requested_mode": "image-first",
-        "visual_strategy": "concept_reference_only",
-        "reference_files": {
-            "approved_concept": ".harness/design/approved_concept.png",
-        },
-        "aesthetic_intent": {
-            "design_hypothesis": (
-                "Use image-first generation to expand the visual space beyond "
-                "what a code-only frontend agent would usually invent from text."
-            ),
-            "reason_for_image_first": (
-                "Text-only prompting often converges on safe, generic web layouts."
-            ),
-            "distinctive_features_to_preserve": [],
-            "non_css_visual_value": [],
-            "generic_patterns_to_avoid": [
-                "generic SaaS hero composition",
-                "centered card grid",
-                "glassmorphism defaults",
-            ],
-        },
-        "responsive_strategy": {
-            "desktop": "Use the design contract as the primary composition reference.",
-            "mobile": "Preserve hierarchy while adapting to a single-column layout.",
-        },
-        "overlay_regions": [],
-        "implementation_rules": [
-            "Keep user-visible text in HTML, not baked into raster assets.",
-            "Keep interactive controls as semantic HTML elements.",
-            "Use any background image as a visual layer, not as a replacement for functional UI.",
-        ],
-        "fallback_reason": "background_ui_unavailable",
+    brief = file_comm.read_design_brief()
+    assert brief["requested_mode"] == "image-first"
+    assert brief["visual_strategy"] == "concept_reference_only"
+    assert brief["reference_files"] == {
+        "approved_concept": ".harness/design/approved_concept.png",
     }
+    assert brief["overlay_regions"]
+    assert brief["fallback_reason"] == "background_ui_unavailable"
     assert file_comm.read_layout_contract()["asset_fit"] == {}
-    assert file_comm.read_asset_manifest() == {
-        "assets": [
-            {
-                "id": "approved_concept",
-                "path": ".harness/design/approved_concept.png",
-                "usage": "visual_reference",
-                "required": False,
-            },
-        ]
-    }
+    manifest = file_comm.read_asset_manifest()
+    assert [
+        (asset["id"], asset["path"], asset["usage"], asset["required"])
+        for asset in manifest["assets"]
+    ] == [
+        (
+            "approved_concept",
+            ".harness/design/approved_concept.png",
+            "visual_reference",
+            False,
+        ),
+    ]
 
 
 @pytest.mark.anyio
@@ -214,6 +180,23 @@ async def test_design_stage_generates_missing_assets_when_image_api_is_configure
     assert calls[1]["reference_images"] == [
         file_comm.design_dir / "approved_concept.png"
     ]
+    assert file_comm.read_asset_manifest()["generation_records"] == [
+        {
+            "asset_id": "approved_concept",
+            "generated": True,
+            "model": "gpt-image-2",
+            "size": "1024x1024",
+            "usage": {},
+        },
+        {
+            "asset_id": "background_ui",
+            "generated": True,
+            "model": "gpt-image-2",
+            "size": "1024x1024",
+            "reference_assets": ["approved_concept"],
+            "usage": {},
+        },
+    ]
 
 
 def test_design_stage_uses_visual_experiment_as_aesthetic_intent(tmp_path: Path):
@@ -239,3 +222,25 @@ def test_design_stage_uses_visual_experiment_as_aesthetic_intent(tmp_path: Path)
         "non_css_visual_value": ["ink texture"],
         "generic_patterns_to_avoid": ["centered card grid"],
     }
+
+
+def test_design_stage_maps_features_to_overlay_regions(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_feature_list(
+        {
+            "features": [
+                {"id": "F001", "name": "Search", "sprint": 1},
+                {"id": "F002", "name": "Compare", "sprint": 1},
+            ]
+        }
+    )
+
+    from src.agents.design_stage import _build_overlay_regions
+
+    overlays = _build_overlay_regions(file_comm)
+
+    assert {
+        (overlay.get("feature_id"), overlay.get("label"))
+        for overlay in overlays
+        if overlay.get("kind") == "feature_overlay"
+    } == {("F001", "Search"), ("F002", "Compare")}
