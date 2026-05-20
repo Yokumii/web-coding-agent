@@ -23,6 +23,11 @@ _EVALUATOR_REQUIRED_READS = [
     ".harness/ui_verification_plan.json",
     ".harness/accepted_sprints.json",
 ]
+_DESIGN_REQUIRED_READS = [
+    ".harness/design/design_brief.json",
+    ".harness/design/layout_contract.json",
+    ".harness/design/asset_manifest.json",
+]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LOCAL_CLAUDE_SKILLS_DIR = _REPO_ROOT / ".claude" / "skills"
 
@@ -136,6 +141,12 @@ def _get_accepted_sprints(file_comm: FileComm) -> dict[str, Any]:
     }
 
 
+def _design_required_reads(file_comm: FileComm) -> list[str]:
+    if file_comm.read_design_brief() is None:
+        return []
+    return list(_DESIGN_REQUIRED_READS)
+
+
 def _get_current_sprint_ui_checks(file_comm: FileComm, sprint_num: int) -> list[dict[str, Any]]:
     verification_plan = file_comm.read_ui_verification_plan() or {}
     for sprint in verification_plan.get("sprints", []):
@@ -205,6 +216,7 @@ def _build_evaluator_prompt(
 ) -> str:
     previous_round = round_num - 1
     required_reads = list(_EVALUATOR_REQUIRED_READS)
+    required_reads.extend(_design_required_reads(file_comm))
     if previous_round >= 1:
         previous_feedback = file_comm.dir / f"feedback_round_{previous_round}.md"
         previous_grades = file_comm.dir / f"grade_round_{previous_round}.json"
@@ -218,6 +230,7 @@ def _build_evaluator_prompt(
     exit_criteria = sprint_context.get("exit_criteria", [])
     ui_checks = _get_current_sprint_ui_checks(file_comm, sprint_num)
     exit_criterion_map = _build_exit_criterion_feature_map(file_comm, sprint_num, sprint_context)
+    has_design_contract = file_comm.read_design_brief() is not None
 
     lines = [
         f"Application URL: {app_url}",
@@ -288,6 +301,17 @@ def _build_evaluator_prompt(
         "",
         *_build_visual_capture_requirements(round_num=round_num, app_url=app_url),
         "",
+        *(
+            [
+                "Design Contract Assessment:",
+                "- Check whether the implementation follows `design_brief.json` visual_strategy and aesthetic_intent.",
+                "- Check whether semantic text and controls are placed according to `layout_contract.json` overlay regions and safe zones.",
+                "- Check whether required production assets in `asset_manifest.json` are copied into the frontend and used as decorative visual layers, not as inaccessible functional UI.",
+                "",
+            ]
+            if has_design_contract
+            else []
+        ),
         "If `.claude/skills/webapp-testing/SKILL.md` exists in the workdir, consult and use it for browser testing and evaluation strategy.",
         "Use paths relative to the workdir when calling file tools; do not use absolute paths.",
         "Treat `.` as the workdir root.",

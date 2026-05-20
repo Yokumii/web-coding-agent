@@ -12,6 +12,12 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     monkeypatch.setenv("EVALUATOR_VISION_BASE_URL", "https://vision.example.com")
     monkeypatch.setenv("EVALUATOR_VISION_ENDPOINT_TYPE", "openai")
     monkeypatch.setenv("EVALUATOR_VISION_MAX_TOKENS", "1500")
+    monkeypatch.setenv("DESIGN_MODE", "image-first")
+    monkeypatch.setenv("DESIGN_IMAGE_API_KEY", "draw-key")
+    monkeypatch.setenv("DESIGN_IMAGE_BASE_URL", "https://draw.example.com")
+    monkeypatch.setenv("DESIGN_IMAGE_MODEL", "gpt-image-2")
+    monkeypatch.setenv("DESIGN_IMAGE_SIZE", "1536x1024")
+    monkeypatch.setenv("DESIGN_IMAGE_TIMEOUT_SECONDS", "222")
     monkeypatch.setenv("MAX_BUDGET_USD", "42.5")
     monkeypatch.setenv("MAX_ROUNDS", "7")
     monkeypatch.setenv("FRONTEND_PORT", "4321")
@@ -27,6 +33,12 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     assert config.evaluator_vision_base_url == "https://vision.example.com"
     assert config.evaluator_vision_endpoint_type == "openai"
     assert config.evaluator_vision_max_tokens == 1500
+    assert config.design_mode == "image-first"
+    assert config.design_image_api_key == "draw-key"
+    assert config.design_image_base_url == "https://draw.example.com"
+    assert config.design_image_model == "gpt-image-2"
+    assert config.design_image_size == "1536x1024"
+    assert config.design_image_timeout_seconds == 222
     assert config.max_budget_usd == 42.5
     assert config.max_rounds == 7
     assert config.frontend_port == 4321

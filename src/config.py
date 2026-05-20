@@ -21,6 +21,11 @@ DEFAULT_MAX_EXIT_CRITERIA_PER_SPRINT = 5
 DEFAULT_FRONTEND_PORT = 5173
 DEFAULT_BACKEND_PORT = 8000
 DEFAULT_PLAYWRIGHT_HEADLESS = False
+DEFAULT_DESIGN_MODE = "text-only"
+DEFAULT_DESIGN_IMAGE_BASE_URL = "https://right.codes/draw"
+DEFAULT_DESIGN_IMAGE_MODEL = "gpt-image-2"
+DEFAULT_DESIGN_IMAGE_SIZE = "1024x1024"
+DEFAULT_DESIGN_IMAGE_TIMEOUT_SECONDS = 180
 DEFAULT_VISION_ENDPOINT_TYPE = "anthropic"
 DEFAULT_VISION_MAX_TOKENS = 1200
 DEFAULT_VISION_MAX_RETRIES = 3
@@ -116,6 +121,36 @@ class HarnessConfig:
         default_factory=lambda: _env_int(
             "SDK_MAX_BUFFER_SIZE",
             DEFAULT_SDK_MAX_BUFFER_SIZE,
+        )
+    )
+    design_mode: str = field(
+        default_factory=lambda: _env_str("DESIGN_MODE", DEFAULT_DESIGN_MODE)
+    )
+    design_image_api_key: str = field(
+        default_factory=lambda: _env_str("DESIGN_IMAGE_API_KEY")
+    )
+    design_image_base_url: str = field(
+        default_factory=lambda: _env_str(
+            "DESIGN_IMAGE_BASE_URL",
+            DEFAULT_DESIGN_IMAGE_BASE_URL,
+        )
+    )
+    design_image_model: str = field(
+        default_factory=lambda: _env_str(
+            "DESIGN_IMAGE_MODEL",
+            DEFAULT_DESIGN_IMAGE_MODEL,
+        )
+    )
+    design_image_size: str = field(
+        default_factory=lambda: _env_str(
+            "DESIGN_IMAGE_SIZE",
+            DEFAULT_DESIGN_IMAGE_SIZE,
+        )
+    )
+    design_image_timeout_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "DESIGN_IMAGE_TIMEOUT_SECONDS",
+            DEFAULT_DESIGN_IMAGE_TIMEOUT_SECONDS,
         )
     )
 

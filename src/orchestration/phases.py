@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from src.agents.evaluator import _determine_passed, run_evaluator
+from src.agents.design_stage import run_design_stage
 from src.agents.generator import run_generator
 from src.agents.planner import run_planner
 from src.agents.sdk_runner import AgentRunStats
@@ -88,11 +89,12 @@ def _save_checkpoint(
     generator_mode: str | None = None,
     last_verdict: str | None = None,
     accepted_sprints_payload: dict[str, Any] | None = None,
+    design_metadata: dict[str, Any] | None = None,
 ) -> None:
     """写入 harness 检查点。"""
     if accepted_sprints_payload is None:
         accepted_sprints_payload = ctx.file_comm.read_accepted_sprints() or {}
-    ctx.file_comm.write_state({
+    state = {
         "last_completed_phase": phase,
         "round_num": round_num,
         "prompt": ctx.user_prompt,
@@ -104,7 +106,10 @@ def _save_checkpoint(
         "accepted_sprints_payload": accepted_sprints_payload,
         "last_verdict": last_verdict,
         "timestamp": datetime.now().isoformat(),
-    })
+    }
+    if design_metadata:
+        state.update(design_metadata)
+    ctx.file_comm.write_state(state)
     logger.debug(f"Checkpoint saved: {phase} (round {round_num})")
 
 
@@ -120,6 +125,20 @@ async def run_planner_phase(ctx: HarnessContext) -> None:
         raw_stats = await run_planner(ctx.config, ctx.user_prompt, ctx.file_comm, ctx.workdir)
         _record_phase_stats(ctx, "planner", _coerce_stats(raw_stats), started_at=started)
         _save_checkpoint(ctx, "plan", 0, last_verdict="planned")
+
+
+async def run_design_phase(ctx: HarnessContext) -> dict[str, Any]:
+    """执行 design 阶段，并在完成后写入检查点。"""
+    logger.info("[bold magenta]PHASE 2: DESIGN")
+    result = await run_design_stage(ctx.config, ctx.file_comm, ctx.workdir)
+    _save_checkpoint(
+        ctx,
+        "design",
+        0,
+        last_verdict=result.metadata.get("design_status"),
+        design_metadata=result.metadata,
+    )
+    return result.metadata
 
 
 # ---- Build 阶段 ----
@@ -368,6 +387,9 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
         sprint_num=sprint_num,
         grades=grades,
     )
+    if isinstance(grades.get("criteria"), dict) and "round" in grades:
+        ctx.file_comm.write_grades(round_num, grades)
+        ctx.file_comm.write_feedback(round_num, render_feedback_from_grades(grades))
 
     final_status = "[bold green]PASSED[/]" if passed else "[bold red]FAILED[/]"
     logger.info(f"[bold yellow]Evaluator[/] round {round_num} final verdict {final_status}.")

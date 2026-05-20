@@ -536,3 +536,174 @@ def test_describe_failures_includes_failed_exit_criterion():
 def test_describe_failures_empty_returns_fallback():
     text = _describe_failures({}, sprint_context={"feature_ids": []})
     assert "no specific failures" in text
+
+
+@pytest.mark.anyio
+async def test_generator_includes_design_stage_reads_and_guidance_in_generate_mode(
+    monkeypatch, tmp_path: Path
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_design_brief(
+        {
+            "requested_mode": "image-first",
+            "visual_strategy": "image_backed_ui",
+            "reference_files": {"background_ui": ".harness/design/background_ui.png"},
+            "aesthetic_intent": {
+                "design_hypothesis": "Use poster-like asymmetry.",
+                "distinctive_features_to_preserve": ["poster-like asymmetry"],
+                "generic_patterns_to_avoid": ["centered card grid"],
+            },
+            "responsive_strategy": {"desktop": "Layered", "mobile": "Stacked"},
+            "overlay_regions": [{"id": "hero"}],
+            "visual_success_criteria": ["Preserve hierarchy."],
+            "implementation_rules": ["Keep text in HTML."],
+        }
+    )
+    file_comm.write_layout_contract(
+        {
+            "viewport_targets": ["1440x900"],
+            "regions": [{"id": "hero"}],
+            "safe_zones": [],
+            "forbidden_overlay_zones": [],
+            "asset_fit": {"background_ui": "cover"},
+            "responsive_rules": ["Keep controls visible."],
+        }
+    )
+    file_comm.write_asset_manifest(
+        {
+            "assets": [{"id": "background_ui"}],
+            "generation_records": [],
+            "implementation_notes": ["Copy production assets."],
+        }
+    )
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict[str, str] = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+    )
+
+    assert "- .harness/design/design_brief.json" in captured["prompt"]
+    assert "- .harness/design/layout_contract.json" in captured["prompt"]
+    assert "- .harness/design/asset_manifest.json" in captured["prompt"]
+    assert "Design Stage Guidance:" in captured["prompt"]
+    assert "Copy required production assets from `.harness/design/`" in captured["prompt"]
+    assert "centered card grid" in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_includes_design_stage_reads_in_repair_mode(
+    monkeypatch, tmp_path: Path
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_feedback(1, "Fix reset interaction.")
+    file_comm.write_grades(
+        1,
+        {
+            "round": 1,
+            "overall_passed": False,
+            "criteria": {
+                "design_quality": {"score": 6.0, "passed": True},
+                "functionality": {"score": 5.0, "passed": False, "notes": "increment broken"},
+                "originality": {"score": 5.0, "passed": True},
+                "craft": {"score": 6.0, "passed": True},
+            },
+        },
+    )
+    file_comm.write_design_brief(
+        {
+            "requested_mode": "image-first",
+            "visual_strategy": "text_only_fallback",
+            "reference_files": {},
+            "aesthetic_intent": {"design_hypothesis": "Use asymmetry."},
+            "responsive_strategy": {"desktop": "Layered", "mobile": "Stacked"},
+            "overlay_regions": [{"id": "hero"}],
+            "visual_success_criteria": ["Preserve hierarchy."],
+            "implementation_rules": ["Keep text in HTML."],
+            "fallback_reason": "image_assets_unavailable",
+        }
+    )
+    file_comm.write_layout_contract(
+        {
+            "viewport_targets": ["1440x900"],
+            "regions": [{"id": "hero"}],
+            "safe_zones": [],
+            "forbidden_overlay_zones": [],
+            "asset_fit": {},
+            "responsive_rules": ["Keep controls visible."],
+        }
+    )
+    file_comm.write_asset_manifest(
+        {
+            "assets": [],
+            "generation_records": [],
+            "implementation_notes": ["Copy production assets."],
+        }
+    )
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict[str, str] = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+    )
+
+    assert ".harness/design/design_brief.json" in captured["prompt"]
+    assert ".harness/design/layout_contract.json" in captured["prompt"]
+    assert ".harness/design/asset_manifest.json" in captured["prompt"]
+    assert "The design stage fell back to text-only" in captured["prompt"]

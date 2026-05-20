@@ -1,9 +1,9 @@
 """定义 `.harness/*.json` 各类产物的 Pydantic 模型。"""
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class _Artifact(BaseModel):
@@ -21,6 +21,21 @@ class _Artifact(BaseModel):
 # ---- 规划阶段产物 -----------------------------------------------------------
 
 
+NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class VisualExperiment(BaseModel):
+    """`design_tokens.json.visual_experiment` 的结构约束。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    design_hypothesis: NonEmptyString
+    reason_for_image_first: NonEmptyString
+    desired_break_from_web_templates: list[NonEmptyString] = Field(min_length=1)
+    visual_opportunities_beyond_css: list[NonEmptyString] = Field(min_length=1)
+    forbidden_generic_patterns: list[NonEmptyString] = Field(min_length=1)
+
+
 class DesignTokens(_Artifact):
     """`design_tokens.json`，记录 planner 生成的设计系统定义。"""
 
@@ -32,6 +47,7 @@ class DesignTokens(_Artifact):
     motion: dict[str, Any]
     style_rules: list[Any]
     anti_patterns: list[Any]
+    visual_experiment: VisualExperiment
     # 这些字段在历史执行记录中出现过，因此保留为可选项。
     themes: dict[str, Any] | None = None
     shadow: dict[str, Any] | None = None
@@ -121,6 +137,51 @@ class UIVerificationPlan(_Artifact):
     @classmethod
     def filename(cls, **params: Any) -> str:
         return "ui_verification_plan.json"
+
+
+class DesignBrief(_Artifact):
+    """`design/design_brief.json`，连接 design 阶段与 generator。"""
+
+    requested_mode: str
+    visual_strategy: str
+    reference_files: dict[str, str]
+    aesthetic_intent: dict[str, Any]
+    responsive_strategy: dict[str, Any]
+    overlay_regions: list[dict[str, Any]]
+    visual_success_criteria: list[str] = Field(default_factory=list)
+    implementation_rules: list[str] = Field(default_factory=list)
+    fallback_reason: str | None = None
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "design/design_brief.json"
+
+
+class LayoutContract(_Artifact):
+    """`design/layout_contract.json`，描述 overlay 区域与响应式约束。"""
+
+    viewport_targets: list[str]
+    regions: list[dict[str, Any]]
+    safe_zones: list[dict[str, Any]] = Field(default_factory=list)
+    forbidden_overlay_zones: list[dict[str, Any]] = Field(default_factory=list)
+    asset_fit: dict[str, Any] = Field(default_factory=dict)
+    responsive_rules: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "design/layout_contract.json"
+
+
+class AssetManifest(_Artifact):
+    """`design/asset_manifest.json`，记录 design 阶段输出资产。"""
+
+    assets: list[dict[str, Any]] = Field(default_factory=list)
+    generation_records: list[dict[str, Any]] = Field(default_factory=list)
+    implementation_notes: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def filename(cls, **params: Any) -> str:
+        return "design/asset_manifest.json"
 
 
 # ---- 每轮产物 ---------------------------------------------------------------
@@ -247,6 +308,11 @@ class HarnessState(_Artifact):
     accepted_sprints: list[int] | None = None
     accepted_sprints_payload: dict[str, Any] | None = None
     last_verdict: str | None = None
+    requested_design_mode: str | None = None
+    design_mode: str | None = None
+    design_status: str | None = None
+    approved_concept_path: str | None = None
+    background_ui_path: str | None = None
     timestamp: str | None = None
 
     @classmethod
@@ -262,6 +328,9 @@ ALL_ARTIFACT_MODELS: list[type[_Artifact]] = [
     FeatureList,
     SprintPlan,
     UIVerificationPlan,
+    DesignBrief,
+    LayoutContract,
+    AssetManifest,
     AcceptedSprints,
     Grades,
     VisualManifest,
@@ -273,18 +342,22 @@ __all__ = [
     "AcceptedSprints",
     "AppearanceReview",
     "Criterion",
+    "DesignBrief",
     "DesignTokens",
+    "AssetManifest",
     "ExitCriterionResult",
     "Feature",
     "FeatureList",
     "Grades",
     "HarnessState",
+    "LayoutContract",
     "Sprint",
     "SprintPlan",
     "UICheck",
     "UIVerificationCheck",
     "UIVerificationPlan",
     "UIVerificationSprint",
+    "VisualExperiment",
     "VisualManifest",
     "ALL_ARTIFACT_MODELS",
 ]

@@ -15,6 +15,13 @@ def _full_design_tokens(theme: str = "editorial") -> dict:
         "motion": {"duration_fast": 160},
         "style_rules": ["bold hierarchy"],
         "anti_patterns": [],
+        "visual_experiment": {
+            "design_hypothesis": "Use poster-like asymmetry.",
+            "reason_for_image_first": "Text-only outputs stay too templated.",
+            "desired_break_from_web_templates": ["poster-like asymmetry"],
+            "visual_opportunities_beyond_css": ["ink texture"],
+            "forbidden_generic_patterns": ["centered card grid"],
+        },
     }
 
 
@@ -121,6 +128,9 @@ def test_missing_files():
         assert comm.read_feature_list() is None
         assert comm.read_sprint_plan() is None
         assert comm.read_ui_verification_plan() is None
+        assert comm.read_design_brief() is None
+        assert comm.read_layout_contract() is None
+        assert comm.read_asset_manifest() is None
         assert comm.read_accepted_sprints() is None
         assert comm.read_progress() == ""
         assert comm.read_grades(99) is None
@@ -163,6 +173,42 @@ def test_planning_artifact_round_trip():
         assert comm.read_sprint_plan() == sprint_plan
         assert comm.read_ui_verification_plan() == verification_plan
         assert comm.read_accepted_sprints() == accepted_sprints
+
+
+def test_design_stage_artifact_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        comm = FileComm(Path(tmp) / ".harness")
+        design_brief = {
+            "requested_mode": "image-first",
+            "visual_strategy": "image_backed_ui",
+            "reference_files": {"background_ui": ".harness/design/background_ui.png"},
+            "aesthetic_intent": {"design_hypothesis": "Use asymmetry."},
+            "responsive_strategy": {"desktop": "Layered", "mobile": "Stacked"},
+            "overlay_regions": [{"id": "hero"}],
+            "visual_success_criteria": ["Preserve hierarchy."],
+            "implementation_rules": ["Keep text in HTML."],
+        }
+        layout_contract = {
+            "viewport_targets": ["1440x900"],
+            "regions": [{"id": "hero"}],
+            "safe_zones": [],
+            "forbidden_overlay_zones": [],
+            "asset_fit": {"background_ui": "cover"},
+            "responsive_rules": ["Keep controls visible."],
+        }
+        asset_manifest = {
+            "assets": [{"id": "background_ui"}],
+            "generation_records": [],
+            "implementation_notes": ["Copy production assets."],
+        }
+
+        comm.write_design_brief(design_brief)
+        comm.write_layout_contract(layout_contract)
+        comm.write_asset_manifest(asset_manifest)
+
+        assert comm.read_design_brief() == {**design_brief, "fallback_reason": None}
+        assert comm.read_layout_contract() == layout_contract
+        assert comm.read_asset_manifest() == asset_manifest
 
 
 def test_utf8_artifact_round_trip():
@@ -227,6 +273,9 @@ def test_reset_run_artifacts_clears_new_planning_files():
         assert comm.read_feature_list() is None
         assert comm.read_sprint_plan() is None
         assert comm.read_ui_verification_plan() is None
+        assert comm.read_design_brief() is None
+        assert comm.read_layout_contract() is None
+        assert comm.read_asset_manifest() is None
         assert comm.read_accepted_sprints() is None
         assert comm.read_progress() == ""
         assert comm.read_build_log() == ""
@@ -236,3 +285,4 @@ def test_reset_run_artifacts_clears_new_planning_files():
         assert comm.read_visual_manifest(1) is None
         assert not logs_dir.exists()
         assert not traces_dir.exists()
+        assert not (harness_dir / "design").exists()

@@ -13,6 +13,7 @@ from src.orchestration.phases import (
     HarnessContext,
     Verdict,
     run_build_phase,
+    run_design_phase,
     run_evaluate_phase,
     run_planner_phase,
 )
@@ -27,7 +28,7 @@ class ResumeError(RuntimeError):
 
 
 def _is_planner_checkpoint(phase: str | None) -> bool:
-    return _phase_kind(phase) in {"plan", "build", "evaluate"}
+    return _phase_kind(phase) in {"plan", "design", "build", "evaluate"}
 
 
 async def run_harness(
@@ -87,6 +88,18 @@ async def run_harness(
             return
     else:
         logger.info("[bold cyan]PHASE 1: PLAN[/] — [dim]skipped (checkpoint)[/]")
+
+    requested_design_mode = (
+        str(existing_state.get("requested_design_mode") or config.design_mode)
+        if resume and existing_state
+        else config.design_mode
+    )
+    if requested_design_mode == "image-first":
+        ctx.config.design_mode = requested_design_mode
+        if _phase_kind(skip_until_phase) not in {"design", "build", "evaluate"}:
+            await run_design_phase(ctx)
+        else:
+            logger.info("[bold magenta]PHASE 2: DESIGN[/] — [dim]skipped (checkpoint)[/]")
 
     ctx.sprint_state = SprintState.load(file_comm)
 
@@ -171,6 +184,8 @@ def _phase_kind(phase: str | None) -> str | None:
         return None
     if phase == "plan":
         return "plan"
+    if phase == "design":
+        return "design"
     if phase.startswith("build_r"):
         return "build"
     if phase.startswith("evaluate_r"):

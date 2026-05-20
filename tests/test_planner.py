@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,13 @@ def _write_valid_planning_bundle(file_comm: FileComm) -> None:
             "motion": {"duration_fast": 160},
             "style_rules": ["bold hierarchy"],
             "anti_patterns": ["generic cards"],
+            "visual_experiment": {
+                "design_hypothesis": "Use poster-like asymmetry.",
+                "reason_for_image_first": "Text-only outputs stay too templated.",
+                "desired_break_from_web_templates": ["poster-like asymmetry"],
+                "visual_opportunities_beyond_css": ["ink texture"],
+                "forbidden_generic_patterns": ["centered card grid"],
+            },
         }
     )
     file_comm.write_feature_list(
@@ -195,6 +203,13 @@ async def test_planner_raises_when_planning_bundle_is_malformed(monkeypatch, tmp
                 "motion": {"duration_fast": 160},
                 "style_rules": ["bold hierarchy"],
                 "anti_patterns": ["generic cards"],
+                "visual_experiment": {
+                    "design_hypothesis": "Use poster-like asymmetry.",
+                    "reason_for_image_first": "Text-only outputs stay too templated.",
+                    "desired_break_from_web_templates": ["poster-like asymmetry"],
+                    "visual_opportunities_beyond_css": ["ink texture"],
+                    "forbidden_generic_patterns": ["centered card grid"],
+                },
             }
         )
         file_comm.write_feature_list({"features": []})
@@ -252,6 +267,101 @@ async def test_planner_raises_when_planning_bundle_is_malformed(monkeypatch, tmp
     monkeypatch.setattr("src.agents.planner.run_sdk_agent", fake_run_sdk_agent)
 
     with pytest.raises(PlannerValidationError, match="F001"):
+        await run_planner(HarnessConfig(), "build a counter app", file_comm, tmp_path)
+
+
+@pytest.mark.anyio
+async def test_planner_rejects_missing_visual_experiment(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+
+    async def fake_run_sdk_agent(**kwargs):
+        file_comm.write_spec(_valid_spec_text())
+        (file_comm.dir / "design_tokens.json").write_text(
+            json.dumps(
+                {
+                    "theme_name": "editorial counter",
+                    "color": {"bg": "#111111"},
+                    "typography": {"display": "Space Grotesk"},
+                    "spacing": {"base": 8},
+                    "radius": {"card": 16},
+                    "motion": {"duration_fast": 160},
+                    "style_rules": ["bold hierarchy"],
+                    "anti_patterns": ["generic cards"],
+                    "visual_experiment": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        file_comm.write_feature_list(
+            {
+                "features": [
+                    {
+                        "id": "F001",
+                        "name": "Counter",
+                        "priority": "high",
+                        "depends_on": [],
+                        "description": "Count values.",
+                        "acceptance_criteria": ["Counter increments correctly."],
+                        "status": "planned",
+                        "sprint": 1,
+                    }
+                ]
+            }
+        )
+        file_comm.write_sprint_plan(
+            {
+                "total_sprints": 1,
+                "sprints": [
+                    {
+                        "number": 1,
+                        "title": "Core counter",
+                        "goal": "Ship the primary counter flow.",
+                        "feature_ids": ["F001"],
+                        "deliverables": ["Visible counter UI."],
+                        "exit_criteria": ["Counter increments correctly."],
+                    }
+                ],
+            }
+        )
+        file_comm.write_ui_verification_plan(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-001",
+                                "feature_id": "F001",
+                                "task": "Click increment once.",
+                                "expected_result": "Counter changes by one step.",
+                                "critical": True,
+                                "category": "core_interaction",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        file_comm.write_progress("# Progress")
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.1,
+                result=_valid_spec_text(),
+            ),
+            0.1,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.planner.run_sdk_agent", fake_run_sdk_agent)
+
+    with pytest.raises(PlannerValidationError, match="schema validation"):
         await run_planner(HarnessConfig(), "build a counter app", file_comm, tmp_path)
 
 
@@ -346,6 +456,13 @@ def _seed_valid_bundle(file_comm: FileComm) -> None:
             "motion": {"duration_fast": 160},
             "style_rules": ["bold hierarchy"],
             "anti_patterns": ["generic cards"],
+            "visual_experiment": {
+                "design_hypothesis": "Use poster-like asymmetry.",
+                "reason_for_image_first": "Text-only outputs stay too templated.",
+                "desired_break_from_web_templates": ["poster-like asymmetry"],
+                "visual_opportunities_beyond_css": ["ink texture"],
+                "forbidden_generic_patterns": ["centered card grid"],
+            },
         }
     )
     file_comm.write_feature_list(

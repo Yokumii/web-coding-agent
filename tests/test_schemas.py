@@ -20,10 +20,13 @@ from pydantic import ValidationError
 from src.orchestration.schemas import (
     ALL_ARTIFACT_MODELS,
     AcceptedSprints,
+    AssetManifest,
+    DesignBrief,
     DesignTokens,
     FeatureList,
     Grades,
     HarnessState,
+    LayoutContract,
     SprintPlan,
     UIVerificationPlan,
     VisualManifest,
@@ -49,6 +52,18 @@ def test_ui_verification_plan_filename():
     assert UIVerificationPlan.filename() == "ui_verification_plan.json"
 
 
+def test_design_brief_filename():
+    assert DesignBrief.filename() == "design/design_brief.json"
+
+
+def test_layout_contract_filename():
+    assert LayoutContract.filename() == "design/layout_contract.json"
+
+
+def test_asset_manifest_filename():
+    assert AssetManifest.filename() == "design/asset_manifest.json"
+
+
 def test_accepted_sprints_filename():
     assert AcceptedSprints.filename() == "accepted_sprints.json"
 
@@ -72,6 +87,9 @@ def test_all_artifact_models_registry_complete():
     assert FeatureList in ALL_ARTIFACT_MODELS
     assert SprintPlan in ALL_ARTIFACT_MODELS
     assert UIVerificationPlan in ALL_ARTIFACT_MODELS
+    assert DesignBrief in ALL_ARTIFACT_MODELS
+    assert LayoutContract in ALL_ARTIFACT_MODELS
+    assert AssetManifest in ALL_ARTIFACT_MODELS
     assert AcceptedSprints in ALL_ARTIFACT_MODELS
     assert Grades in ALL_ARTIFACT_MODELS
     assert VisualManifest in ALL_ARTIFACT_MODELS
@@ -94,6 +112,13 @@ def _minimal_design_tokens() -> dict:
         "motion": {"duration_fast": "150ms"},
         "style_rules": ["follow the tokens"],
         "anti_patterns": [],
+        "visual_experiment": {
+            "design_hypothesis": "Use poster-like asymmetry.",
+            "reason_for_image_first": "Text-only outputs stay too templated.",
+            "desired_break_from_web_templates": ["poster-like asymmetry"],
+            "visual_opportunities_beyond_css": ["ink texture"],
+            "forbidden_generic_patterns": ["centered card grid"],
+        },
     }
 
 
@@ -148,6 +173,13 @@ def test_design_tokens_rejects_unknown_field():
 
 def test_design_tokens_minimum_accepts():
     DesignTokens.model_validate(_minimal_design_tokens())
+
+
+def test_design_tokens_rejects_invalid_visual_experiment_shape():
+    payload = _minimal_design_tokens()
+    payload["visual_experiment"] = {}
+    with pytest.raises(ValidationError):
+        DesignTokens.model_validate(payload)
 
 
 def test_feature_list_rejects_unknown_top_level_field():
@@ -223,6 +255,9 @@ def test_real_artifacts_parse(harness_dir: Path):
         ("feature_list.json", FeatureList),
         ("sprint_plan.json", SprintPlan),
         ("ui_verification_plan.json", UIVerificationPlan),
+        ("design/design_brief.json", DesignBrief),
+        ("design/layout_contract.json", LayoutContract),
+        ("design/asset_manifest.json", AssetManifest),
         ("accepted_sprints.json", AcceptedSprints),
         ("harness_state.json", HarnessState),
     ]

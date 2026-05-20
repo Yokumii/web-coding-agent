@@ -70,6 +70,9 @@ def _build_review_context(
     """将当前 sprint 的视觉审阅上下文整理为 JSON 文本。"""
     spec_text = file_comm.read_spec().strip()
     design_tokens = file_comm.read_design_tokens() or {}
+    design_brief = file_comm.read_design_brief()
+    layout_contract = file_comm.read_layout_contract()
+    asset_manifest = file_comm.read_asset_manifest()
 
     payload = {
         "task": "Evaluate the visual appearance of the current sprint screenshots.",
@@ -99,11 +102,20 @@ def _build_review_context(
         },
         "instructions": [
             "Judge the screenshots against the spec excerpt, design tokens, and sprint goal.",
+            "If a design contract is present, also judge whether the implementation preserves its intended hierarchy and composition.",
             "Use the full 1-5 scale for appearance_review fields.",
             "Use the full 0-10 scale for criteria_scores.",
             "Return only valid JSON.",
         ],
     }
+    if design_brief is not None:
+        payload["design_contract"] = {
+            "visual_strategy": design_brief.get("visual_strategy"),
+            "aesthetic_intent": design_brief.get("aesthetic_intent"),
+            "reference_files": design_brief.get("reference_files"),
+            "layout_contract": layout_contract or {},
+            "asset_manifest": asset_manifest or {},
+        }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 

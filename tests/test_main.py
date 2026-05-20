@@ -135,6 +135,26 @@ def test_build_config_playwright_headless_cli_enables_flag(monkeypatch):
     assert config.playwright_headless is True
 
 
+def test_build_config_design_mode_from_env(monkeypatch):
+    monkeypatch.setenv("DESIGN_MODE", "image-first")
+
+    args = build_parser().parse_args(["build a counter app"])
+    config = build_config(args)
+
+    assert config.design_mode == "image-first"
+
+
+def test_build_config_design_mode_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("DESIGN_MODE", "text-only")
+
+    args = build_parser().parse_args(
+        ["build a counter app", "--design-mode", "image-first"]
+    )
+    config = build_config(args)
+
+    assert config.design_mode == "image-first"
+
+
 # --- --plan-only and --resume must be mutually exclusive ---
 
 

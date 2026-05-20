@@ -167,6 +167,13 @@ def _seed_file_comm(tmp_path: Path):
             "motion": {"fast": 100},
             "style_rules": ["bold"],
             "anti_patterns": [],
+            "visual_experiment": {
+                "design_hypothesis": "Use poster-like asymmetry.",
+                "reason_for_image_first": "Text-only outputs stay too templated.",
+                "desired_break_from_web_templates": ["poster-like asymmetry"],
+                "visual_opportunities_beyond_css": ["ink texture"],
+                "forbidden_generic_patterns": ["centered card grid"],
+            },
         }
     )
     return file_comm
@@ -198,6 +205,54 @@ def test_build_review_context_packs_sprint_and_design_tokens(tmp_path: Path):
     assert parsed["screenshots"] == ["round_2_home.png"]
     assert parsed["design_tokens"]["theme_name"] == "x"
     assert "# Spec" in parsed["spec_excerpt"]
+
+
+def test_build_review_context_includes_design_contract_when_present(tmp_path: Path):
+    file_comm = _seed_file_comm(tmp_path)
+    file_comm.write_design_brief(
+        {
+            "requested_mode": "image-first",
+            "visual_strategy": "image_backed_ui",
+            "reference_files": {"background_ui": ".harness/design/background_ui.png"},
+            "aesthetic_intent": {"design_hypothesis": "Use asymmetry."},
+            "responsive_strategy": {"desktop": "Layered", "mobile": "Stacked"},
+            "overlay_regions": [{"id": "hero"}],
+            "visual_success_criteria": ["Preserve hierarchy."],
+            "implementation_rules": ["Keep text in HTML."],
+        }
+    )
+    file_comm.write_layout_contract(
+        {
+            "viewport_targets": ["1440x900"],
+            "regions": [{"id": "hero"}],
+            "safe_zones": [],
+            "forbidden_overlay_zones": [],
+            "asset_fit": {"background_ui": "cover"},
+            "responsive_rules": ["Keep controls visible."],
+        }
+    )
+    file_comm.write_asset_manifest(
+        {
+            "assets": [{"id": "background_ui"}],
+            "generation_records": [],
+            "implementation_notes": ["Copy production assets."],
+        }
+    )
+
+    payload = _build_review_context(
+        file_comm=file_comm,
+        sprint_num=1,
+        sprint_context={"title": "Landing"},
+        screenshot_names=["round_1_home.png"],
+    )
+
+    import json as _json
+
+    parsed = _json.loads(payload)
+    assert parsed["design_contract"]["visual_strategy"] == "image_backed_ui"
+    assert parsed["design_contract"]["layout_contract"]["asset_fit"] == {
+        "background_ui": "cover"
+    }
 
 
 # --- normalize_visual_review ---
@@ -315,6 +370,13 @@ def _seed_workdir(tmp_path: Path) -> tuple[Path, list[str], Any]:
             "motion": {"fast": 100},
             "style_rules": ["bold"],
             "anti_patterns": [],
+            "visual_experiment": {
+                "design_hypothesis": "Use poster-like asymmetry.",
+                "reason_for_image_first": "Text-only outputs stay too templated.",
+                "desired_break_from_web_templates": ["poster-like asymmetry"],
+                "visual_opportunities_beyond_css": ["ink texture"],
+                "forbidden_generic_patterns": ["centered card grid"],
+            },
         }
     )
     return tmp_path, [".harness/round_1_home.png"], file_comm

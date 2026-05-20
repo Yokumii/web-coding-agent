@@ -7,6 +7,7 @@
 当前实现刻意保持**仅前端**：
 
 - `planner`：将一段简短提示扩展为雄心勃勃的产品规格与 Sprint 计划
+- 可选的 `design`：当 `design_mode=image-first` 时插入在 planning 与 build 之间，产出设计契约，并在配置完整时生成图像参考资产
 - `generator`：在 `workdir/frontend` 下逐 Sprint 构建浏览器端前端应用，模式可为 `generate` 或 `repair`
 - `evaluator`：使用 Playwright MCP 对运行中的前端进行功能性测试
 - 独立的视觉打分器（vision scorer）审阅截图并覆盖外观相关评分
@@ -18,10 +19,12 @@
 已实现的能力：
 
 - 基于 Claude Agent SDK 的执行
-- Planner / Generator / Evaluator 三方智能体流水线
+- Planner / 可选 Design Stage / Generator / Evaluator 流水线
 - 基于 Sprint 的推进，支持 `generate` / `repair` 两种生成模式
 - Sprint 大小硬约束（每个 Sprint ≤5 deliverables 与 ≤5 exit_criteria，由 validator 强制），避免首轮被塞太多任务
 - 仅前端运行时管理
+- 可选的 image-first 设计阶段，可写出 `design_brief.json`、`layout_contract.json` 与 `asset_manifest.json`
+- 可选的设计图生成能力，可产出 `approved_concept.png` 与 `background_ui.png`，图像资产缺失时自动回退为仅文本设计契约
 - 基于 Playwright MCP 的功能性评估
 - 评估器拥有只读 Bash（可 `cat`/`grep`/`python3 -m json.tool` 读取产物，但不能修改源码）
 - evaluator 侧截图采集加独立视觉打分阶段，结果覆盖外观相关评分
@@ -39,6 +42,8 @@
 - `.env` 或环境变量中存在 `ANTHROPIC_API_KEY`
 
 Playwright MCP 在评估阶段通过 `npx` 启动，因此机器上必须可用 Node/npm。
+
+如果使用 `DESIGN_MODE=image-first`，且希望设计阶段自动生成新的栅格图资产，还需要提供 `DESIGN_IMAGE_API_KEY`。若该变量缺失，设计阶段仍会执行并写出文本设计契约，但会回退到 `text_only_fallback`，除非 `.harness/design/` 中已经手工准备好图像资产。
 
 ## 安装
 
@@ -71,6 +76,17 @@ PLANNER_MODEL=claude-sonnet-4-6
 GENERATOR_MODEL=claude-sonnet-4-6
 EVALUATOR_MODEL=claude-sonnet-4-6
 EVALUATOR_VISION_MODEL=claude-sonnet-4-6
+```
+
+可选的设计阶段配置（`.env`）：
+
+```bash
+DESIGN_MODE=text-only                   # 或 "image-first"
+DESIGN_IMAGE_API_KEY=                  # 仅在需要自动生成设计图片时必填
+DESIGN_IMAGE_BASE_URL=https://right.codes/draw
+DESIGN_IMAGE_MODEL=gpt-image-2
+DESIGN_IMAGE_SIZE=1024x1024
+DESIGN_IMAGE_TIMEOUT_SECONDS=180
 ```
 
 可选的独立视觉打分器配置（`.env`，用于外观审阅；未设置时回退到 `EVALUATOR_MODEL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`）：
@@ -123,6 +139,7 @@ CLI 覆盖：
 - `MAX_BUDGET_USD` ↔ `--max-budget`
 - `MAX_ROUNDS` ↔ `--max-rounds`
 - `FRONTEND_PORT` ↔ `--frontend-port`
+- `DESIGN_MODE` ↔ `--design-mode`
 - `PLAYWRIGHT_HEADLESS` ↔ `--playwright-headless` / `--no-playwright-headless`
 
 内置默认值：
@@ -131,7 +148,33 @@ CLI 覆盖：
 - 最大预算：`150`
 - 最大轮次：`3`
 - 前端端口：`5173`
+- 设计模式：`text-only`
 - Playwright headless：`false`
+
+设计图生成仅支持通过环境变量配置：
+
+- `DESIGN_IMAGE_API_KEY`
+- `DESIGN_IMAGE_BASE_URL`
+- `DESIGN_IMAGE_MODEL`
+- `DESIGN_IMAGE_SIZE`
+- `DESIGN_IMAGE_TIMEOUT_SECONDS`
+
+## 设计阶段
+
+当 `design_mode=image-first` 时，harness 会在 planning 与 build 之间插入一个设计检查点：
+
+1. Planner 写出 `design_tokens.json`，其中必须包含 `visual_experiment` 结构。
+2. Design Stage 将结构化实现指导写入 `.harness/design/`。
+3. 如果图像生成配置可用，harness 会尝试创建：
+   - `approved_concept.png`：完整概念图参考
+   - `background_ui.png`：供语义化 HTML 覆盖的无文字背景图资产
+4. Generator 在构建前会读取这些设计契约。
+
+设计阶段支持三种结果：
+
+- `image_backed_ui`：两张图都存在，构建阶段使用完整的 image-backed 契约
+- `concept_reference_only`：仅存在 `approved_concept.png`，构建阶段把它作为视觉参考，但不把它当作正式背景资产
+- `text_only_fallback`：可用图像资产都缺失，构建阶段仅依据文本设计契约继续执行
 
 ## 快速开始
 
@@ -161,6 +204,17 @@ uv run python -m src.main "Build a bold counter app with increment and decrement
 uv run python -m src.main "Build a bold counter app with increment and decrement buttons" \
   --workdir ./e2e-test-1 \
   --resume \
+  --playwright-headless
+```
+
+启用可选的 image-first 设计阶段：
+
+```bash
+uv run python -m src.main "Build a bold counter app with increment and decrement buttons" \
+  --workdir ./e2e-image-first \
+  --design-mode image-first \
+  --max-rounds 3 \
+  --max-budget 20 \
   --playwright-headless
 ```
 
@@ -240,6 +294,7 @@ uv run python -m src.main "<prompt>" [options]
 - `--generator-model`：generator 模型覆盖
 - `--evaluator-model`：evaluator 模型覆盖
 - `--evaluator-vision-model`：独立视觉打分器模型覆盖
+- `--design-mode`：`text-only` 或 `image-first`
 - `--frontend-port`：dev server 端口（默认：`FRONTEND_PORT` 环境变量或 5173）
 - `--keep-frontend`：fresh 运行时不擦除 `workdir/frontend/`
 - `--playwright-headless` / `--no-playwright-headless`：显式开启或关闭 Playwright MCP headless（默认：`PLAYWRIGHT_HEADLESS` 环境变量或 `false`）
@@ -256,6 +311,11 @@ uv run python -m src.main "<prompt>" [options]
 - `./e2e-test-1/.harness/feature_list.json`：planner 特性目录及 Sprint 分配
 - `./e2e-test-1/.harness/sprint_plan.json`：含 deliverables 与 exit criteria 的有序 Sprint 计划
 - `./e2e-test-1/.harness/ui_verification_plan.json`：每个 Sprint 的浏览器验证检查项
+- `./e2e-test-1/.harness/design/design_brief.json`：在启用 `image-first` 时供 generator 消费的设计阶段 brief
+- `./e2e-test-1/.harness/design/layout_contract.json`：overlay 与响应式布局契约
+- `./e2e-test-1/.harness/design/asset_manifest.json`：生成或手工提供的设计资产及实现说明
+- `./e2e-test-1/.harness/design/approved_concept.png`：可选的概念图参考
+- `./e2e-test-1/.harness/design/background_ui.png`：可选的无文字背景资产，供最终前端使用
 - `./e2e-test-1/.harness/accepted_sprints.json`：已接受的 Sprint 与当前目标
 - `./e2e-test-1/.harness/progress.md`：planner 与 generator 共同写入的只追加进度日志
 - `./e2e-test-1/.harness/build_log.md`：generator 自评
@@ -336,6 +396,8 @@ trace 中的有用信号：
 
 - `src/agents/sdk_runner.py`：Claude Agent SDK 集成、工具门控、trace 写入
 - `src/agents/planner.py`：planning bundle 生成与 schema 校验
+- `src/agents/design_stage.py`：image-first 设计契约生成与回退选择
+- `src/agents/image_generation.py`：可选设计图生成所用的 HTTP 客户端
 - `src/agents/generator.py`：以 Sprint 为粒度的前端生成与 repair
 - `src/agents/evaluator.py`：基于 Playwright 的功能性评估
 - `src/agents/visual_capture.py`：基于 Playwright 的截图采集

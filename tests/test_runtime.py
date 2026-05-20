@@ -42,7 +42,7 @@ def test_build_frontend_command_prefers_pnpm_lockfile(tmp_path: Path):
 
 
 def test_playwright_mcp_params_default_to_isolated_mode():
-    params = build_playwright_mcp_args(HarnessConfig())
+    params = build_playwright_mcp_args(HarnessConfig(playwright_headless=False))
     assert params == ["@playwright/mcp@latest", "--isolated"]
 
 

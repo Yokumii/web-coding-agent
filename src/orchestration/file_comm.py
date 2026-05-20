@@ -7,10 +7,13 @@ from typing import Any, TypeVar
 from src.orchestration.schemas import (
     ALL_ARTIFACT_MODELS,
     AcceptedSprints,
+    AssetManifest,
+    DesignBrief,
     DesignTokens,
     FeatureList,
     Grades,
     HarnessState,
+    LayoutContract,
     SprintPlan,
     UIVerificationPlan,
     VisualManifest,
@@ -52,8 +55,13 @@ class FileComm:
 
     def _write(self, payload: _Artifact, **params: Any) -> Path:
         path = self._path(payload.filename(**params))
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
         return path
+
+    @property
+    def design_dir(self) -> Path:
+        return self.dir / "design"
 
     # ---- Markdown 产物 ----
 
@@ -116,6 +124,27 @@ class FileComm:
         model = self._read(UIVerificationPlan)
         return model.model_dump() if model else None
 
+    def write_design_brief(self, payload: dict[str, Any]) -> Path:
+        return self._write(DesignBrief.model_validate(payload))
+
+    def read_design_brief(self) -> dict[str, Any] | None:
+        model = self._read(DesignBrief)
+        return model.model_dump() if model else None
+
+    def write_layout_contract(self, payload: dict[str, Any]) -> Path:
+        return self._write(LayoutContract.model_validate(payload))
+
+    def read_layout_contract(self) -> dict[str, Any] | None:
+        model = self._read(LayoutContract)
+        return model.model_dump() if model else None
+
+    def write_asset_manifest(self, payload: dict[str, Any]) -> Path:
+        return self._write(AssetManifest.model_validate(payload))
+
+    def read_asset_manifest(self) -> dict[str, Any] | None:
+        model = self._read(AssetManifest)
+        return model.model_dump() if model else None
+
     def write_accepted_sprints(self, accepted_sprints: dict[str, Any]) -> Path:
         return self._write(AcceptedSprints.model_validate(accepted_sprints))
 
@@ -169,7 +198,7 @@ class FileComm:
             else:
                 self._path(static_name).unlink(missing_ok=True)
 
-        for subdir in ("logs", "traces"):
+        for subdir in ("logs", "traces", "design"):
             path = self._path(subdir)
             if path.exists():
                 shutil.rmtree(path)

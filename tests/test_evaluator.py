@@ -29,6 +29,13 @@ def _write_evaluator_context(file_comm: FileComm) -> None:
             "motion": {"duration_fast": 160},
             "style_rules": ["bold hierarchy"],
             "anti_patterns": ["generic cards"],
+            "visual_experiment": {
+                "design_hypothesis": "Use poster-like asymmetry.",
+                "reason_for_image_first": "Text-only outputs stay too templated.",
+                "desired_break_from_web_templates": ["poster-like asymmetry"],
+                "visual_opportunities_beyond_css": ["ink texture"],
+                "forbidden_generic_patterns": ["centered card grid"],
+            },
         }
     )
     file_comm.write_feature_list(
@@ -229,6 +236,79 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
     assert "3. .harness/visual_manifest_round_2.json" in captured["prompt"]
     assert ".harness/visual_round_2_home.png" in captured["prompt"]
     assert "downstream VLM review" in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_evaluator_prompt_includes_design_contract_reads_when_present(
+    monkeypatch, tmp_path: Path
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_evaluator_context(file_comm)
+    file_comm.write_design_brief(
+        {
+            "requested_mode": "image-first",
+            "visual_strategy": "image_backed_ui",
+            "reference_files": {"background_ui": ".harness/design/background_ui.png"},
+            "aesthetic_intent": {"design_hypothesis": "Use asymmetry."},
+            "responsive_strategy": {"desktop": "Layered", "mobile": "Stacked"},
+            "overlay_regions": [{"id": "hero"}],
+            "visual_success_criteria": ["Preserve hierarchy."],
+            "implementation_rules": ["Keep text in HTML."],
+        }
+    )
+    file_comm.write_layout_contract(
+        {
+            "viewport_targets": ["1440x900"],
+            "regions": [{"id": "hero"}],
+            "safe_zones": [],
+            "forbidden_overlay_zones": [],
+            "asset_fit": {"background_ui": "cover"},
+            "responsive_rules": ["Keep controls visible."],
+        }
+    )
+    file_comm.write_asset_manifest(
+        {
+            "assets": [{"id": "background_ui"}],
+            "generation_records": [],
+            "implementation_notes": ["Copy production assets."],
+        }
+    )
+    captured: dict[str, str] = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        file_comm.write_grades(1, _passing_grades(1))
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.3,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.3,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.evaluator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_evaluator(
+        HarnessConfig(evaluator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        app_url="http://127.0.0.1:4173",
+    )
+
+    assert "- .harness/design/design_brief.json" in captured["prompt"]
+    assert "- .harness/design/layout_contract.json" in captured["prompt"]
+    assert "- .harness/design/asset_manifest.json" in captured["prompt"]
+    assert "Design Contract Assessment:" in captured["prompt"]
 
 
 @pytest.mark.anyio

@@ -33,6 +33,11 @@ _REPAIR_REQUIRED_READS = (
     ".harness/design_tokens.json",
     ".harness/accepted_sprints.json",
 )
+_DESIGN_REQUIRED_READS = (
+    ".harness/design/design_brief.json",
+    ".harness/design/layout_contract.json",
+    ".harness/design/asset_manifest.json",
+)
 
 # 各评分项的及格线统一来自 prompts.grading，避免多处维护。
 _CRITERIA_THRESHOLDS: dict[str, float] = {c.name: c.threshold for c in CRITERIA}
@@ -144,6 +149,77 @@ def _get_accepted_sprints(file_comm: FileComm) -> dict:
     return accepted_sprints
 
 
+def _design_required_reads(file_comm: FileComm) -> list[str]:
+    if file_comm.read_design_brief() is None:
+        return []
+    return list(_DESIGN_REQUIRED_READS)
+
+
+def _build_design_stage_guidance(file_comm: FileComm) -> str:
+    design_brief = file_comm.read_design_brief()
+    if design_brief is None:
+        return ""
+
+    visual_strategy = str(design_brief.get("visual_strategy", "")).strip()
+    aesthetic_intent = design_brief.get("aesthetic_intent")
+    lines = [
+        "Design Stage Guidance:",
+        "- Read the design-stage artifacts before making layout decisions.",
+        "- Treat `layout_contract.json` as the source of semantic overlay regions, responsive behavior, and safe zones.",
+        "- Treat `asset_manifest.json` as the source of which raster assets are production assets and where they should be copied.",
+    ]
+    if isinstance(aesthetic_intent, dict):
+        hypothesis = str(aesthetic_intent.get("design_hypothesis", "")).strip()
+        preserve = [
+            str(item).strip()
+            for item in aesthetic_intent.get("distinctive_features_to_preserve", []) or []
+            if str(item).strip()
+        ]
+        avoid = [
+            str(item).strip()
+            for item in aesthetic_intent.get("generic_patterns_to_avoid", []) or []
+            if str(item).strip()
+        ]
+        if hypothesis:
+            lines.append(f"- Preserve the design hypothesis: {hypothesis}")
+        if preserve:
+            lines.append(
+                "- Preserve the authored visual traits declared in the design brief: "
+                + "; ".join(preserve)
+                + "."
+            )
+        if avoid:
+            lines.append(
+                "- Do not collapse the implementation back into these generic patterns: "
+                + "; ".join(avoid)
+                + "."
+            )
+    if visual_strategy == "image_backed_ui":
+        lines.extend(
+            [
+                "- Preserve the approved composition using the design contract and asset manifest.",
+                "- Keep user-visible text and interactive controls as semantic HTML overlays.",
+                "- Copy required production assets from `.harness/design/` into the frontend project before referencing them in code.",
+                "- Use the image layer for composition, material, and texture; rebuild all functional labels, controls, and state in HTML.",
+            ]
+        )
+    elif visual_strategy == "concept_reference_only":
+        lines.extend(
+            [
+                "- Use the approved concept as a visual reference only; do not embed it as production UI.",
+                "- Preserve its hierarchy and composition while rebuilding all user-visible text and controls as semantic HTML.",
+                "- Do not assume a text-free background asset exists unless `asset_manifest.json` declares one.",
+            ]
+        )
+    elif visual_strategy == "text_only_fallback":
+        lines.append(
+            "- The design stage fell back to text-only; continue from the planning artifacts without assuming image assets exist."
+        )
+    else:
+        lines.append("- Follow the visual strategy declared in `design_brief.json`.")
+    return "\n".join(lines)
+
+
 def _build_generator_prompt(
     *,
     mode: GeneratorMode,
@@ -167,6 +243,7 @@ def _build_generator_prompt(
 
     if mode == "generate":
         required_reads = list(_GENERATE_REQUIRED_READS)
+        required_reads.extend(_design_required_reads(file_comm))
         previous_round = round_num - 1
         if previous_round >= 1:
             previous_feedback = file_comm.dir / f"feedback_round_{previous_round}.md"
@@ -178,11 +255,14 @@ def _build_generator_prompt(
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
         deliverables = "\n".join(f"- {item}" for item in sprint_context.get("deliverables", []))
         exit_criteria = "\n".join(f"- {item}" for item in sprint_context.get("exit_criteria", []))
+        design_guidance = _build_design_stage_guidance(file_comm)
+        design_guidance_block = f"{design_guidance}\n\n" if design_guidance else ""
         mode_lines = [
             f"Sprint Goal: {sprint_context.get('goal')}\n"
             f"Deliverables:\n{deliverables}\n"
             f"Exit Criteria:\n{exit_criteria}\n"
             f"Required Reads:\n{required_reads_text}\n\n"
+            f"{design_guidance_block}"
             f"Implement only sprint {sprint_num}.\n"
             f"Set up or update the frontend-only project in `frontend/`.\n"
             f"Do not implement future sprint functionality or unrelated refactors.\n"
@@ -208,13 +288,16 @@ def _build_generator_prompt(
                 f"have crashed before writing grades."
             )
         failures_text = _describe_failures(previous_grades, sprint_context)
+        design_guidance = _build_design_stage_guidance(file_comm)
+        design_guidance_block = f"{design_guidance}\n\n" if design_guidance else ""
         required_reads_text = "\n".join(
             f"- {path.format(feedback_round=feedback_round, round_num=round_num)}"
-            for path in _REPAIR_REQUIRED_READS
+            for path in (*_REPAIR_REQUIRED_READS, *_design_required_reads(file_comm))
         )
         mode_lines = [
             "Repair Scope: Fix evaluator-reported issues for the current sprint only\n"
             f"Required Reads:\n{required_reads_text}\n\n"
+            f"{design_guidance_block}"
             "## Previous evaluation findings\n\n"
             f"{failures_text}\n\n"
             "## Your task\n"

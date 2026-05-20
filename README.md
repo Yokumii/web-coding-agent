@@ -7,6 +7,7 @@ This repository is a simple reproduction of the frontend-oriented half of [Anthr
 The current implementation is intentionally **frontend-only**:
 
 - `planner` expands a short prompt into an ambitious product spec and a sprint plan
+- optional `design` runs between planning and build when `design_mode=image-first`, producing design contracts and, when configured, image-backed visual references
 - `generator` builds a browser-based frontend app in `workdir/frontend`, one sprint at a time, in either `generate` or `repair` mode
 - `evaluator` uses Playwright MCP to test the live frontend functionally
 - a separate vision scorer reviews captured screenshots and overrides the appearance criteria
@@ -18,10 +19,12 @@ There is **no backend generation or backend runtime** in the current harness.
 What is implemented:
 
 - Claude Agent SDK based execution
-- Planner / Generator / Evaluator agent pipeline
+- Planner / optional Design Stage / Generator / Evaluator pipeline
 - Sprint-based progression with `generate` / `repair` generator modes
 - Sprint size caps (≤5 deliverables and ≤5 exit_criteria per sprint, validator-enforced) so the generator does not face an over-stuffed first round
 - Frontend-only runtime management
+- Optional image-first design stage that writes `design_brief.json`, `layout_contract.json`, and `asset_manifest.json`
+- Optional image generation for `approved_concept.png` and `background_ui.png`, with automatic fallback to text-only design contracts when image assets are unavailable
 - Playwright MCP based functional evaluation
 - Read-only Bash for the evaluator (so it can `cat`/`grep`/`python3 -m json.tool` artifacts but cannot mutate source)
 - Evaluator-side screenshot capture plus a dedicated vision scoring pass that overrides appearance criteria
@@ -39,6 +42,8 @@ What is implemented:
 - `ANTHROPIC_API_KEY` in `.env` or environment
 
 Playwright MCP is started through `npx` during evaluator runs, so Node/npm must be available on the machine.
+
+If `DESIGN_MODE=image-first` is used and the design stage should generate new raster assets automatically, `DESIGN_IMAGE_API_KEY` is also required. Without it, the design stage still runs and writes textual design contracts, but it falls back to `text_only_fallback` unless manually prepared image assets already exist in `.harness/design/`.
 
 ## Install
 
@@ -71,6 +76,17 @@ PLANNER_MODEL=claude-sonnet-4-6
 GENERATOR_MODEL=claude-sonnet-4-6
 EVALUATOR_MODEL=claude-sonnet-4-6
 EVALUATOR_VISION_MODEL=claude-sonnet-4-6
+```
+
+Optional design-stage configuration in `.env`:
+
+```bash
+DESIGN_MODE=text-only                   # or "image-first"
+DESIGN_IMAGE_API_KEY=                  # required only when auto-generating design images
+DESIGN_IMAGE_BASE_URL=https://right.codes/draw
+DESIGN_IMAGE_MODEL=gpt-image-2
+DESIGN_IMAGE_SIZE=1024x1024
+DESIGN_IMAGE_TIMEOUT_SECONDS=180
 ```
 
 Optional dedicated vision scorer overrides in `.env` (used by the appearance review pass; falls back to `EVALUATOR_MODEL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` if not set):
@@ -123,6 +139,7 @@ Runtime knobs:
 - `MAX_BUDGET_USD` ↔ `--max-budget`
 - `MAX_ROUNDS` ↔ `--max-rounds`
 - `FRONTEND_PORT` ↔ `--frontend-port`
+- `DESIGN_MODE` ↔ `--design-mode`
 - `PLAYWRIGHT_HEADLESS` ↔ `--playwright-headless` / `--no-playwright-headless`
 
 Built-in defaults:
@@ -131,7 +148,33 @@ Built-in defaults:
 - max budget: `150`
 - max rounds: `3`
 - frontend port: `5173`
+- design mode: `text-only`
 - Playwright headless: `false`
+
+Design image generation is configured by environment only:
+
+- `DESIGN_IMAGE_API_KEY`
+- `DESIGN_IMAGE_BASE_URL`
+- `DESIGN_IMAGE_MODEL`
+- `DESIGN_IMAGE_SIZE`
+- `DESIGN_IMAGE_TIMEOUT_SECONDS`
+
+## Design Stage
+
+When `design_mode=image-first`, the harness inserts a design checkpoint between planning and build:
+
+1. Planner writes `design_tokens.json` including a required `visual_experiment` block.
+2. Design stage writes structured implementation guidance into `.harness/design/`.
+3. If image generation is configured, the harness attempts to create:
+   - `approved_concept.png`: full concept reference
+   - `background_ui.png`: text-free background asset for semantic HTML overlays
+4. Generator consumes the resulting design contract before building the frontend.
+
+The design stage supports three outcomes:
+
+- `image_backed_ui`: both images exist, so build uses the full image-backed contract
+- `concept_reference_only`: only `approved_concept.png` exists, so build uses it as visual reference without a production background asset
+- `text_only_fallback`: no usable image assets exist, so build proceeds from the textual design contract only
 
 ## Quick Start
 
@@ -161,6 +204,17 @@ Resume an interrupted run:
 uv run python -m src.main "Build a bold counter app with increment and decrement buttons" \
   --workdir ./e2e-test-1 \
   --resume \
+  --playwright-headless
+```
+
+Run with the optional image-first design stage:
+
+```bash
+uv run python -m src.main "Build a bold counter app with increment and decrement buttons" \
+  --workdir ./e2e-image-first \
+  --design-mode image-first \
+  --max-rounds 3 \
+  --max-budget 20 \
   --playwright-headless
 ```
 
@@ -240,6 +294,7 @@ Main options:
 - `--generator-model`: generator model override
 - `--evaluator-model`: evaluator model override
 - `--evaluator-vision-model`: dedicated vision-scorer model override
+- `--design-mode`: `text-only` or `image-first`
 - `--frontend-port`: dev server port (default: `FRONTEND_PORT` env or 5173)
 - `--keep-frontend`: do not wipe `workdir/frontend/` on a fresh run
 - `--playwright-headless` / `--no-playwright-headless`: force Playwright MCP headless on or off (default: `PLAYWRIGHT_HEADLESS` env or `false`)
@@ -256,6 +311,11 @@ Given `--workdir ./e2e-test-1`, the harness writes:
 - `./e2e-test-1/.harness/feature_list.json`: planner feature catalog with sprint assignments
 - `./e2e-test-1/.harness/sprint_plan.json`: ordered sprint plan with deliverables and exit criteria
 - `./e2e-test-1/.harness/ui_verification_plan.json`: per-sprint browser verification checks
+- `./e2e-test-1/.harness/design/design_brief.json`: design-stage brief consumed by the generator when `image-first` is enabled
+- `./e2e-test-1/.harness/design/layout_contract.json`: overlay and responsive composition contract
+- `./e2e-test-1/.harness/design/asset_manifest.json`: generated or manually supplied design assets and implementation notes
+- `./e2e-test-1/.harness/design/approved_concept.png`: optional concept reference image
+- `./e2e-test-1/.harness/design/background_ui.png`: optional text-free background asset for the built frontend
 - `./e2e-test-1/.harness/accepted_sprints.json`: which sprints have been accepted and the current target
 - `./e2e-test-1/.harness/progress.md`: append-only progress log written by planner and generator
 - `./e2e-test-1/.harness/build_log.md`: generator self-evaluation
@@ -336,6 +396,8 @@ The harness currently uses:
 
 - `src/agents/sdk_runner.py`: Claude Agent SDK integration, tool gating, trace writing
 - `src/agents/planner.py`: planning bundle generation and schema validation
+- `src/agents/design_stage.py`: image-first design contract generation and fallback selection
+- `src/agents/image_generation.py`: HTTP client for optional design image generation
 - `src/agents/generator.py`: frontend generation and repair rounds (sprint scoped)
 - `src/agents/evaluator.py`: Playwright-based functional evaluation
 - `src/agents/visual_capture.py`: Playwright-based screenshot capture

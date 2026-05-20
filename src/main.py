@@ -94,6 +94,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--design-mode",
+        choices=("text-only", "image-first"),
+        default=None,
+        help=(
+            "Optional design-stage mode (default: DESIGN_MODE env or "
+            "text-only). Use image-first to run the design checkpoint "
+            "between plan and build."
+        ),
+    )
+    parser.add_argument(
         "--keep-frontend",
         action="store_true",
         help=(
@@ -130,6 +140,7 @@ def build_config(args: argparse.Namespace) -> HarnessConfig:
         "evaluator_vision_model": "evaluator_vision_model",
         "playwright_headless": "playwright_headless",
         "frontend_port": "frontend_port",
+        "design_mode": "design_mode",
     }
     for arg_name, config_key in arg_to_config.items():
         value = getattr(args, arg_name)
