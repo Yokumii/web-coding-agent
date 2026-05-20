@@ -13,14 +13,18 @@ class FileComm:
         self.dir = harness_dir
         self.dir.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def design_dir(self) -> Path:
+        return self.dir / "design"
+
     def write_spec(self, content: str) -> Path:
         path = self.dir / "spec.md"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def read_spec(self) -> str:
         path = self.dir / "spec.md"
-        return path.read_text() if path.exists() else ""
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def write_design_tokens(self, tokens: dict[str, Any]) -> Path:
         return self._write_json("design_tokens.json", tokens)
@@ -52,30 +56,48 @@ class FileComm:
     def read_accepted_sprints(self) -> dict[str, Any] | None:
         return self._read_json("accepted_sprints.json")
 
+    def write_design_brief(self, payload: dict[str, Any]) -> Path:
+        return self._write_json("design/design_brief.json", payload)
+
+    def read_design_brief(self) -> dict[str, Any] | None:
+        return self._read_json("design/design_brief.json")
+
+    def write_layout_contract(self, payload: dict[str, Any]) -> Path:
+        return self._write_json("design/layout_contract.json", payload)
+
+    def read_layout_contract(self) -> dict[str, Any] | None:
+        return self._read_json("design/layout_contract.json")
+
+    def write_asset_manifest(self, payload: dict[str, Any]) -> Path:
+        return self._write_json("design/asset_manifest.json", payload)
+
+    def read_asset_manifest(self) -> dict[str, Any] | None:
+        return self._read_json("design/asset_manifest.json")
+
     def write_progress(self, content: str) -> Path:
         path = self.dir / "progress.md"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def read_progress(self) -> str:
         path = self.dir / "progress.md"
-        return path.read_text() if path.exists() else ""
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def append_progress_entry(self, entry: str) -> Path:
         path = self.dir / "progress.md"
         existing = self.read_progress()
         content = entry if not existing else f"{existing.rstrip()}\n\n{entry}"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def write_feedback(self, round_num: int, content: str) -> Path:
         path = self.dir / f"feedback_round_{round_num}.md"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def read_feedback(self, round_num: int) -> str:
         path = self.dir / f"feedback_round_{round_num}.md"
-        return path.read_text() if path.exists() else ""
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def write_grades(self, round_num: int, grades: dict) -> Path:
         return self._write_json(f"grade_round_{round_num}.json", grades)
@@ -106,12 +128,12 @@ class FileComm:
 
     def write_build_log(self, content: str) -> Path:
         path = self.dir / "build_log.md"
-        path.write_text(content)
+        path.write_text(content, encoding="utf-8")
         return path
 
     def read_build_log(self) -> str:
         path = self.dir / "build_log.md"
-        return path.read_text() if path.exists() else ""
+        return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def write_state(self, state: dict) -> Path:
         return self._write_json("harness_state.json", state)
@@ -142,18 +164,19 @@ class FileComm:
             for path in self.dir.glob(pattern):
                 path.unlink(missing_ok=True)
 
-        for subdir in ("logs", "traces"):
+        for subdir in ("logs", "traces", "design"):
             path = self.dir / subdir
             if path.exists():
                 shutil.rmtree(path)
 
     def _write_json(self, filename: str, payload: dict[str, Any]) -> Path:
         path = self.dir / filename
-        path.write_text(json.dumps(payload, indent=2))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return path
 
     def _read_json(self, filename: str) -> dict[str, Any] | None:
         path = self.dir / filename
         if not path.exists():
             return None
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))

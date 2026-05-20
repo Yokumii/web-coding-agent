@@ -8,11 +8,13 @@ import pytest
 
 from src.agents.sdk_runner import build_playwright_mcp_args
 from src.config import HarnessConfig
+from src.orchestration import runtime
 from src.orchestration.runtime import (
     ManagedProcess,
     RunningAppStack,
     build_frontend_command,
     ensure_port_available,
+    resolve_command_executable,
     start_app_stack,
     start_process,
     stop_process,
@@ -38,6 +40,25 @@ def test_build_frontend_command_prefers_pnpm_lockfile(tmp_path: Path):
         "5173",
         "--strictPort",
     ]
+
+
+def test_resolve_command_executable_uses_path_lookup(monkeypatch):
+    monkeypatch.setattr(
+        "src.orchestration.runtime.shutil.which",
+        lambda name: f"C:/bin/{name}.cmd",
+    )
+
+    assert resolve_command_executable(["npm", "run", "dev"]) == [
+        "C:/bin/npm.cmd",
+        "run",
+        "dev",
+    ]
+
+
+def test_resolve_command_executable_keeps_unknown_command(monkeypatch):
+    monkeypatch.setattr("src.orchestration.runtime.shutil.which", lambda name: None)
+
+    assert resolve_command_executable(["custom-tool", "arg"]) == ["custom-tool", "arg"]
 
 
 def test_playwright_mcp_params_default_to_isolated_mode():
@@ -79,7 +100,7 @@ def test_ensure_port_available_escalates_to_sigkill(monkeypatch):
 
     assert sent_signals == [
         (4321, signal.SIGTERM),
-        (4321, signal.SIGKILL),
+        (4321, runtime.FORCE_KILL_SIGNAL),
     ]
 
 
@@ -179,6 +200,7 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
         def poll(self):
             return None
 
+    monkeypatch.setattr("src.orchestration.runtime.shutil.which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr("src.orchestration.runtime.subprocess.Popen", FakePopen)
 
     log_path = tmp_path / "frontend.log"
@@ -190,14 +212,14 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
     )
 
     assert process.process.pid == 4242
-    assert captured["kwargs"].get("start_new_session") is True, (
-        "start_process must launch in a new POSIX session so stop_process can "
-        "kill the whole process group, otherwise vite/esbuild children orphan."
-    )
+    assert captured["command"] == ["/usr/bin/echo", "hi"]
+    assert captured["kwargs"].get("start_new_session") is (not runtime.IS_WINDOWS)
 
 
 @pytest.mark.anyio
 async def test_stop_process_sigterms_the_process_group(monkeypatch, tmp_path: Path):
+    if runtime.IS_WINDOWS:
+        pytest.skip("POSIX process-group signaling is unavailable on Windows")
     sent: list[tuple] = []
 
     class FakeProc:
@@ -239,6 +261,8 @@ async def test_stop_process_sigterms_the_process_group(monkeypatch, tmp_path: Pa
 
 @pytest.mark.anyio
 async def test_stop_process_escalates_to_sigkill_after_timeout(monkeypatch, tmp_path: Path):
+    if runtime.IS_WINDOWS:
+        pytest.skip("POSIX process-group signaling is unavailable on Windows")
     sent: list[tuple] = []
     wait_calls = {"count": 0}
 
@@ -278,7 +302,43 @@ async def test_stop_process_escalates_to_sigkill_after_timeout(monkeypatch, tmp_
     await stop_process(managed)
 
     assert ("killpg", 7777, signal.SIGTERM) in sent
-    assert ("killpg", 7777, signal.SIGKILL) in sent
+    assert ("killpg", 7777, runtime.FORCE_KILL_SIGNAL) in sent
+
+
+@pytest.mark.anyio
+async def test_stop_process_falls_back_to_direct_child_on_windows(monkeypatch, tmp_path: Path):
+    if not runtime.IS_WINDOWS:
+        pytest.skip("Windows-only fallback")
+
+    sent: list[tuple] = []
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 9001
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else 0
+
+        def wait(self, timeout=None):
+            self._alive = False
+            return 0
+
+        def terminate(self):
+            sent.append(("terminate",))
+            self._alive = False
+
+        def kill(self):
+            sent.append(("kill",))
+            self._alive = False
+
+    log_path = tmp_path / "log.txt"
+    log_file = log_path.open("w")
+    managed = ManagedProcess("frontend", FakeProc(), log_path, log_file)
+
+    await stop_process(managed)
+
+    assert sent == [("terminate",)]
 
 
 # --- dev server env must not leak API keys / tokens ---

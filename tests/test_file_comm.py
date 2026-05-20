@@ -1,4 +1,3 @@
-import json
 import tempfile
 from pathlib import Path
 
@@ -39,6 +38,9 @@ def test_missing_files():
         assert comm.read_sprint_plan() is None
         assert comm.read_ui_verification_plan() is None
         assert comm.read_accepted_sprints() is None
+        assert comm.read_design_brief() is None
+        assert comm.read_layout_contract() is None
+        assert comm.read_asset_manifest() is None
         assert comm.read_progress() == ""
         assert comm.read_grades(99) is None
         assert comm.read_state() is None
@@ -75,6 +77,39 @@ def test_planning_artifact_round_trip():
         assert comm.read_accepted_sprints() == accepted_sprints
 
 
+def test_design_artifact_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        comm = FileComm(Path(tmp) / ".harness")
+        design_brief = {"visual_strategy": "image_backed_ui"}
+        layout_contract = {"viewport_targets": ["1440x900"]}
+        asset_manifest = {"assets": [{"id": "background_ui"}]}
+
+        comm.write_design_brief(design_brief)
+        comm.write_layout_contract(layout_contract)
+        comm.write_asset_manifest(asset_manifest)
+
+        assert comm.read_design_brief() == design_brief
+        assert comm.read_layout_contract() == layout_contract
+        assert comm.read_asset_manifest() == asset_manifest
+        assert comm.design_dir.exists()
+
+
+def test_utf8_artifact_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        comm = FileComm(Path(tmp) / ".harness")
+        spec = "# 规格\n设计一个带有“增量”按钮的计数器。"
+        feedback = "修复按钮文案：增加"
+        feature_list = {"features": [{"id": "F001", "name": "计数器", "description": "支持“+1”"}]}
+
+        comm.write_spec(spec)
+        comm.write_feedback(1, feedback)
+        comm.write_feature_list(feature_list)
+
+        assert comm.read_spec() == spec
+        assert comm.read_feedback(1) == feedback
+        assert comm.read_feature_list() == feature_list
+
+
 def test_progress_round_trip_and_append():
     with tempfile.TemporaryDirectory() as tmp:
         comm = FileComm(Path(tmp) / ".harness")
@@ -99,6 +134,9 @@ def test_reset_run_artifacts_clears_new_planning_files():
         comm.write_sprint_plan({"total_sprints": 1, "sprints": []})
         comm.write_ui_verification_plan({"sprints": []})
         comm.write_accepted_sprints({"accepted": [], "current_target": 1})
+        comm.write_design_brief({"visual_strategy": "text_only_fallback"})
+        comm.write_layout_contract({"viewport_targets": []})
+        comm.write_asset_manifest({"assets": []})
         comm.write_progress("# Progress")
         comm.write_build_log("build")
         comm.write_state({"round": 1})
@@ -108,8 +146,8 @@ def test_reset_run_artifacts_clears_new_planning_files():
         traces_dir = harness_dir / "traces"
         logs_dir.mkdir()
         traces_dir.mkdir()
-        (logs_dir / "frontend.log").write_text("log")
-        (traces_dir / "planner.jsonl").write_text("trace")
+        (logs_dir / "frontend.log").write_text("log", encoding="utf-8")
+        (traces_dir / "planner.jsonl").write_text("trace", encoding="utf-8")
 
         comm.reset_run_artifacts()
 
@@ -119,10 +157,14 @@ def test_reset_run_artifacts_clears_new_planning_files():
         assert comm.read_sprint_plan() is None
         assert comm.read_ui_verification_plan() is None
         assert comm.read_accepted_sprints() is None
+        assert comm.read_design_brief() is None
+        assert comm.read_layout_contract() is None
+        assert comm.read_asset_manifest() is None
         assert comm.read_progress() == ""
         assert comm.read_build_log() == ""
         assert comm.read_state() is None
         assert comm.read_feedback(1) == ""
         assert comm.read_grades(1) is None
+        assert not comm.design_dir.exists()
         assert not logs_dir.exists()
         assert not traces_dir.exists()

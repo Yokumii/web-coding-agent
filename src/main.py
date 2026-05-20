@@ -69,6 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Port for the frontend dev server (default: FRONTEND_PORT env or 5173)",
     )
     parser.add_argument(
+        "--design-mode",
+        choices=("text-only", "image-first"),
+        default=None,
+        help=(
+            "Optional design-stage mode (default: DESIGN_MODE env or text-only). "
+            "Use image-first to run the optional design checkpoint before build."
+        ),
+    )
+    parser.add_argument(
         "--keep-frontend",
         action="store_true",
         help=(
@@ -112,6 +121,8 @@ def build_config(args: argparse.Namespace) -> HarnessConfig:
         kwargs["evaluator_vision_model"] = args.evaluator_vision_model
     if args.frontend_port is not None:
         kwargs["frontend_port"] = args.frontend_port
+    if args.design_mode is not None:
+        kwargs["design_mode"] = args.design_mode
     return HarnessConfig(**kwargs)
 
 

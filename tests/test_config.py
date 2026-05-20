@@ -31,3 +31,27 @@ def test_harness_config_uses_sdk_buffer_environment_variable(monkeypatch):
     config = HarnessConfig()
 
     assert config.sdk_max_buffer_size == 12 * 1024 * 1024
+
+
+def test_harness_config_uses_design_mode_environment_variable(monkeypatch):
+    monkeypatch.setenv("DESIGN_MODE", "image-first")
+
+    config = HarnessConfig()
+
+    assert config.design_mode == "image-first"
+
+
+def test_harness_config_uses_design_image_environment_variables(monkeypatch):
+    monkeypatch.setenv("DESIGN_IMAGE_API_KEY", "image-key")
+    monkeypatch.setenv("DESIGN_IMAGE_BASE_URL", "https://draw.example.com")
+    monkeypatch.setenv("DESIGN_IMAGE_MODEL", "gpt-image-2-vip")
+    monkeypatch.setenv("DESIGN_IMAGE_SIZE", "2048x2048")
+    monkeypatch.setenv("DESIGN_IMAGE_TIMEOUT_SECONDS", "240")
+
+    config = HarnessConfig()
+
+    assert config.design_image_api_key == "image-key"
+    assert config.design_image_base_url == "https://draw.example.com"
+    assert config.design_image_model == "gpt-image-2-vip"
+    assert config.design_image_size == "2048x2048"
+    assert config.design_image_timeout_seconds == 240

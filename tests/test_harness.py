@@ -1680,3 +1680,103 @@ async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: P
     build_log = file_comm.read_build_log() or ""
     assert "git commit 0000000" in build_log
     assert "round 01/sprint_1 (generate)" in build_log
+
+
+@pytest.mark.anyio
+async def test_image_first_mode_writes_design_checkpoint_before_rounds(monkeypatch, tmp_path: Path):
+    async def fake_planner(config, user_prompt, file_comm, workdir):
+        file_comm.write_sprint_plan(
+            {
+                "total_sprints": 1,
+                "sprints": [
+                    {
+                        "number": 1,
+                        "title": "Core flow",
+                        "goal": "Ship sprint 1.",
+                        "feature_ids": ["F001"],
+                        "deliverables": ["Primary UI."],
+                        "exit_criteria": ["Primary flow works."],
+                    }
+                ],
+            }
+        )
+        file_comm.write_accepted_sprints(
+            {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+        )
+        _write_feature_list(file_comm)
+        return 0.1
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+
+    await run_harness(
+        "build something",
+        tmp_path,
+        HarnessConfig(max_rounds=0, design_mode="image-first", design_image_api_key=""),
+    )
+
+    file_comm = FileComm(tmp_path / ".harness")
+    state = file_comm.read_state()
+    assert state is not None
+    assert state["last_completed_phase"] == "design"
+    assert state["requested_design_mode"] == "image-first"
+    assert state["design_mode"] == "text_only_fallback"
+    assert state["design_status"] == "fallback_text_only"
+    assert file_comm.read_design_brief()["visual_strategy"] == "text_only_fallback"
+
+
+@pytest.mark.anyio
+async def test_resume_from_design_checkpoint_skips_planner_and_design(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_sprint_plan(
+        {
+            "total_sprints": 1,
+            "sprints": [
+                {
+                    "number": 1,
+                    "title": "Core flow",
+                    "goal": "Ship sprint 1.",
+                    "feature_ids": ["F001"],
+                    "deliverables": ["Primary UI."],
+                    "exit_criteria": ["Primary flow works."],
+                }
+            ],
+        }
+    )
+    file_comm.write_accepted_sprints(
+        {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+    )
+    _write_feature_list(file_comm)
+    file_comm.write_state(
+        {
+            "last_completed_phase": "design",
+            "round_num": 0,
+            "prompt": "saved prompt",
+            "costs": {"planner": 0.1},
+            "requested_design_mode": "image-first",
+            "design_mode": "text_only_fallback",
+            "design_status": "fallback_text_only",
+            "approved_concept_path": None,
+            "background_ui_path": None,
+        }
+    )
+    calls: list[str] = []
+
+    async def fake_planner(*args, **kwargs):
+        calls.append("planner")
+        return 0.1
+
+    async def fake_design_stage(*args, **kwargs):
+        calls.append("design")
+        raise AssertionError("design stage should not rerun from design checkpoint")
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner", fake_planner)
+    monkeypatch.setattr("src.orchestration.harness.run_design_stage", fake_design_stage)
+
+    await run_harness(
+        "ignored",
+        tmp_path,
+        HarnessConfig(max_rounds=0, design_mode="text-only"),
+        resume=True,
+    )
+
+    assert calls == []

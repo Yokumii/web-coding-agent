@@ -113,6 +113,183 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
 
 
 @pytest.mark.anyio
+async def test_generator_generate_mode_reads_design_contract_when_present(
+    monkeypatch,
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_design_brief(
+        {
+            "visual_strategy": "image_backed_ui",
+            "aesthetic_intent": {
+                "design_hypothesis": "Escape card-grid sameness.",
+                "distinctive_features_to_preserve": ["poster-like asymmetry"],
+                "generic_patterns_to_avoid": ["centered card grid"],
+            },
+        }
+    )
+    file_comm.write_layout_contract({"viewport_targets": ["1440x900"]})
+    file_comm.write_asset_manifest({"assets": []})
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+    )
+
+    assert "- .harness/design/design_brief.json" in captured["prompt"]
+    assert "- .harness/design/layout_contract.json" in captured["prompt"]
+    assert "- .harness/design/asset_manifest.json" in captured["prompt"]
+    assert "Design Stage Guidance:" in captured["prompt"]
+    assert "Preserve the design hypothesis: Escape card-grid sameness." in captured["prompt"]
+    assert "poster-like asymmetry" in captured["prompt"]
+    assert "centered card grid" in captured["prompt"]
+    assert "Preserve the approved composition" in captured["prompt"]
+    assert "semantic HTML overlays" in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_repair_mode_reads_design_contract_when_present(
+    monkeypatch,
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_feedback(1, "Keep layout stable.")
+    file_comm.write_grades(
+        1,
+        {
+            "round": 1,
+            "overall_passed": False,
+            "ui_checks": [],
+            "target_exit_criteria_results": [],
+        },
+    )
+    file_comm.write_design_brief({"visual_strategy": "text_only_fallback"})
+    file_comm.write_layout_contract({"viewport_targets": ["1440x900"]})
+    file_comm.write_asset_manifest({"assets": []})
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+    )
+
+    assert ".harness/design/design_brief.json" in captured["prompt"]
+    assert ".harness/design/layout_contract.json" in captured["prompt"]
+    assert ".harness/design/asset_manifest.json" in captured["prompt"]
+    assert "fell back to text-only" in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_generator_generate_mode_uses_concept_as_reference_without_background(
+    monkeypatch,
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_design_brief(
+        {
+            "visual_strategy": "concept_reference_only",
+        }
+    )
+    file_comm.write_layout_contract({"viewport_targets": ["1440x900"]})
+    file_comm.write_asset_manifest({"assets": []})
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return (
+            ResultMessage(
+                subtype="result",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session",
+                total_cost_usd=0.2,
+                usage={"input_tokens": 100_000},
+                result="done",
+            ),
+            0.2,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.generator.run_sdk_agent", fake_run_sdk_agent)
+
+    await run_generator(
+        HarnessConfig(generator_model="claude-sonnet-4-6"),
+        file_comm,
+        tmp_path,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+    )
+
+    assert "Use the approved concept as a visual reference only" in captured["prompt"]
+    assert "do not embed it as production UI" in captured["prompt"]
+    assert "Do not assume a text-free background asset exists" in captured["prompt"]
+
+
+@pytest.mark.anyio
 async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, tmp_path: Path):
     file_comm = FileComm(tmp_path / ".harness")
     _write_generator_context(file_comm)
