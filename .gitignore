@@ -1,7 +1,8 @@
 .env*
 !.env.example
 workdir/
-examples/
+examples/*
+!examples/*.tgz
 runs/
 .claude/settings.local.json
 .playwright-mcp/
