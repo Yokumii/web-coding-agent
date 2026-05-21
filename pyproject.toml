@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Multi-agent harness for long-running autonomous coding (Planner → Generator → Evaluator)"
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=0.30.0",
     "claude-agent-sdk>=0.1.65",
-    "litellm>=1.50,<2.0",
     "pydantic>=2.0,<3.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",

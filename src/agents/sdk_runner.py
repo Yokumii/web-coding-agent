@@ -490,6 +490,7 @@ def build_agent_options(
         mcp_servers["playwright"] = {
             "command": "npx",
             "args": build_playwright_mcp_args(config),
+            "env": {"TMPDIR": "/tmp"},
         }
 
     allowed_tools = sorted(LOCAL_AGENT_TOOLS_WITH_BASH if allow_bash else LOCAL_AGENT_TOOLS)

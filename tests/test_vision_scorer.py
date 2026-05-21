@@ -22,37 +22,20 @@ from src.utils.llm_json import LLMJSONError
 # --- _provider_model_string ---
 
 
-def test_provider_model_string_routes_anthropic_by_default():
+def test_provider_model_string_returns_model_directly():
     config = HarnessConfig(
         evaluator_vision_model="claude-sonnet-4-6",
         evaluator_vision_endpoint_type="anthropic",
     )
-    assert _provider_model_string(config) == "anthropic/claude-sonnet-4-6"
+    assert _provider_model_string(config) == "claude-sonnet-4-6"
 
 
-def test_provider_model_string_routes_openai_when_endpoint_is_openai():
+def test_provider_model_string_returns_custom_model_directly():
     config = HarnessConfig(
-        evaluator_vision_model="gpt-4o-mini",
-        evaluator_vision_endpoint_type="OpenAI",
+        evaluator_vision_model="ep-5o96ln-1770432475019207263",
+        evaluator_vision_endpoint_type="anthropic",
     )
-    assert _provider_model_string(config) == "openai/gpt-4o-mini"
-
-
-def test_provider_model_string_blank_endpoint_falls_back_to_anthropic():
-    config = HarnessConfig(
-        evaluator_vision_model="claude-sonnet-4-6",
-        evaluator_vision_endpoint_type="",
-    )
-    assert _provider_model_string(config) == "anthropic/claude-sonnet-4-6"
-
-
-def test_provider_model_string_unknown_endpoint_raises():
-    config = HarnessConfig(
-        evaluator_vision_model="claude-sonnet-4-6",
-        evaluator_vision_endpoint_type="azure",
-    )
-    with pytest.raises(ValueError, match="unsupported evaluator vision endpoint type"):
-        _provider_model_string(config)
+    assert _provider_model_string(config) == "ep-5o96ln-1770432475019207263"
 
 
 # --- _build_vision_messages ---
@@ -311,7 +294,7 @@ def test_normalize_visual_review_clamps_values_and_preserves_screenshots():
     assert normalized["criteria_scores"]["craft"]["score"] == 6.3
 
 
-# --- _perform_visual_review_request (with LiteLLM mock) ---
+# --- _perform_visual_review_request (with Anthropic SDK mock) ---
 
 
 def _vision_config(**overrides) -> HarnessConfig:
@@ -411,7 +394,7 @@ def test_perform_visual_review_request_calls_completion_with_anthropic_model_str
     )
 
     assert review["phase_result"] == "pass"
-    assert captured["model"] == "anthropic/claude-sonnet-4-6"
+    assert captured["model"] == "claude-sonnet-4-6"
     assert captured["kwargs"]["api_key"] == "test-key"
     assert captured["kwargs"]["api_base"] == "https://api.anthropic.com"
     assert captured["kwargs"]["max_tokens"] == 600
@@ -420,7 +403,7 @@ def test_perform_visual_review_request_calls_completion_with_anthropic_model_str
     assert captured["messages"][0]["role"] == "system"
     assert captured["messages"][1]["role"] == "user"
     assert captured["messages"][1]["content"][1]["type"] == "image_url"
-    # Stats reflect the LiteLLM usage dict
+    # Stats reflect the usage dict
     assert stats.token_usage == {
         "prompt_tokens": 120,
         "completion_tokens": 60,
@@ -435,7 +418,7 @@ def test_perform_visual_review_request_calls_completion_with_anthropic_model_str
     assert stats.cost_usd >= 0
 
 
-def test_perform_visual_review_request_routes_to_openai_when_configured(
+def test_perform_visual_review_request_passes_custom_model_directly(
     monkeypatch, tmp_path
 ):
     workdir, paths, file_comm = _seed_workdir(tmp_path)
@@ -454,9 +437,9 @@ def test_perform_visual_review_request_routes_to_openai_when_configured(
 
     review, _ = vision_scorer._perform_visual_review_request(
         config=_vision_config(
-            evaluator_vision_model="gpt-4o-mini",
-            evaluator_vision_endpoint_type="openai",
-            evaluator_vision_base_url="https://api.openai.com",
+            evaluator_vision_model="ep-custom-model-123",
+            evaluator_vision_endpoint_type="anthropic",
+            evaluator_vision_base_url="https://custom-gateway.example.com",
         ),
         file_comm=file_comm,
         workdir=workdir,
@@ -466,7 +449,7 @@ def test_perform_visual_review_request_routes_to_openai_when_configured(
     )
 
     assert review["phase_result"] == "pass"
-    assert captured["model"] == "openai/gpt-4o-mini"
+    assert captured["model"] == "ep-custom-model-123"
 
 
 def test_perform_visual_review_request_raises_on_missing_model(tmp_path):

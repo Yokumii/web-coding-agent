@@ -139,17 +139,8 @@ def _coerce_score(value: Any, fallback: float) -> float:
 
 
 def _provider_model_string(config: HarnessConfig) -> str:
-    """按端点类型生成 LiteLLM 所需的 model 标识。"""
-    endpoint_type = (config.evaluator_vision_endpoint_type or "anthropic").strip().lower()
-    base = config.evaluator_vision_model
-    if endpoint_type in ("", "anthropic"):
-        return f"anthropic/{base}"
-    if endpoint_type == "openai":
-        return f"openai/{base}"
-    raise ValueError(
-        f"unsupported evaluator vision endpoint type: {config.evaluator_vision_endpoint_type!r}; "
-        "expected 'anthropic' or 'openai'"
-    )
+    """返回模型标识，直接使用 Anthropic SDK，无需 LiteLLM 路由前缀。"""
+    return config.evaluator_vision_model
 
 
 def _build_vision_messages(
@@ -158,7 +149,7 @@ def _build_vision_messages(
     screenshot_paths: list[str],
     review_context: str,
 ) -> list[dict[str, Any]]:
-    """构造 LiteLLM 共用的文本加图片消息体。"""
+    """构造文本加图片消息体。"""
     content: list[dict[str, Any]] = [{"type": "text", "text": review_context}]
     for relative_path in screenshot_paths:
         absolute_path = _validate_screenshot_path(relative_path, workdir)
