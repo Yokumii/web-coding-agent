@@ -26,6 +26,26 @@ class PlannerValidationError(ValueError):
     """planner 产物缺失、结构异常或交叉引用失配时抛出。"""
 
 
+def _make_planner_stop_hook(file_comm: FileComm, config: HarnessConfig):
+    """在 planner 结束前执行最终校验，失败时阻断 stop 并要求原会话修正。"""
+
+    async def _hook(_input: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        try:
+            _validate_planning_bundle(file_comm, config)
+        except PlannerValidationError as exc:
+            return {
+                "decision": "block",
+                "reason": (
+                    "Planning artifact validation failed. Update the existing files under "
+                    f".harness, then try to stop again.\n\n{exc}"
+                ),
+                "stopReason": "Planner artifacts failed validation; continue editing .harness.",
+            }
+        return {"continue_": True}
+
+    return _hook
+
+
 def _validate_planning_bundle(
     file_comm: FileComm, config: HarnessConfig | None = None
 ) -> None:
@@ -43,6 +63,10 @@ def _validate_planning_bundle(
     if config is None:
         config = HarnessConfig()
 
+    if file_comm.is_planning_scaffold("spec.md"):
+        raise PlannerValidationError(
+            "Planner completed without writing .harness/spec.md."
+        )
     spec = file_comm.read_spec()
     if not spec:
         raise PlannerValidationError(
@@ -53,36 +77,39 @@ def _validate_planning_bundle(
             "Planner wrote invalid spec.md: required sections are missing."
         )
 
-    try:
-        design_tokens = file_comm.read_design_tokens()
-        feature_list = file_comm.read_feature_list()
-        sprint_plan = file_comm.read_sprint_plan()
-        verification_plan = file_comm.read_ui_verification_plan()
-    except ValidationError as exc:
-        raise PlannerValidationError(
-            f"Planner artifact failed schema validation:\n{exc}"
-        ) from exc
-
-    for artifact, filename in (
-        (design_tokens, "design_tokens.json"),
-        (feature_list, "feature_list.json"),
-        (sprint_plan, "sprint_plan.json"),
-        (verification_plan, "ui_verification_plan.json"),
-    ):
+    artifact_readers = (
+        ("design_tokens.json", file_comm.read_design_tokens),
+        ("feature_list.json", file_comm.read_feature_list),
+        ("sprint_plan.json", file_comm.read_sprint_plan),
+        ("ui_verification_plan.json", file_comm.read_ui_verification_plan),
+    )
+    artifacts: dict[str, Any] = {}
+    for filename, reader in artifact_readers:
+        if file_comm.is_planning_scaffold(filename):
+            raise PlannerValidationError(
+                f"Planner completed without writing .harness/{filename}."
+            )
+        try:
+            artifact = reader()
+        except ValidationError as exc:
+            raise PlannerValidationError(
+                f"Planner artifact failed schema validation in {filename}:\n{exc}"
+            ) from exc
         if artifact is None:
             raise PlannerValidationError(
                 f"Planner completed without writing .harness/{filename}."
             )
+        artifacts[filename] = artifact
 
     progress = file_comm.read_progress()
-    if not progress.strip():
+    if file_comm.is_planning_scaffold("progress.md") or not progress.strip():
         raise PlannerValidationError(
             "Planner completed without writing .harness/progress.md."
         )
 
-    assert feature_list is not None  # 缩窄类型，便于静态检查。
-    assert sprint_plan is not None
-    assert verification_plan is not None
+    feature_list = artifacts["feature_list.json"]
+    sprint_plan = artifacts["sprint_plan.json"]
+    verification_plan = artifacts["ui_verification_plan.json"]
 
     _check_cross_references(
         feature_list=feature_list,
@@ -196,14 +223,15 @@ async def run_planner(
     logger.info(f"[bold blue]Planner[/] starting for prompt: {user_prompt[:80]}...")
     workdir.mkdir(parents=True, exist_ok=True)
     file_comm.dir.mkdir(parents=True, exist_ok=True)
+    file_comm.initialize_planning_artifacts()
 
     prompt = (
         f"Create a complete planning bundle for this product idea:\n\n"
         f"{user_prompt}\n\n"
-        f"Write all required planning artifacts into .harness using only file editing tools such as "
+        f"Update the existing planning artifact files under .harness using only file editing tools such as "
         f"Write, Edit, and MultiEdit. Bash is unavailable for this task. "
-        f"The Harness has already prepared the workdir and .harness directory for this task, "
-        f"so begin by writing the files themselves instead of creating directories. "
+        f"The Harness has already prepared the workdir, the .harness directory, and the required artifact files. "
+        f"Replace the scaffold content in those files; do not create directories, rename files, or add alternate filenames. "
         f"Use paths relative to the workdir only; do not use absolute paths. "
         f"The workdir is: {workdir}"
     )
@@ -216,6 +244,7 @@ async def run_planner(
         system_prompt=PLANNER_SYSTEM_PROMPT,
         max_turns=30,
         allow_bash=False,
+        stop_hooks=[_make_planner_stop_hook(file_comm, config)],
         trace_path=file_comm.dir / "traces" / "planner.jsonl",
     )
 

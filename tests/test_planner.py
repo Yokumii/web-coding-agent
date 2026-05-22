@@ -8,6 +8,7 @@ from claude_agent_sdk.types import ResultMessage
 
 from src.agents.planner import (
     PlannerValidationError,
+    _make_planner_stop_hook,
     _validate_planning_bundle,
     run_planner,
 )
@@ -366,7 +367,7 @@ async def test_planner_rejects_missing_visual_experiment(monkeypatch, tmp_path: 
 
 
 @pytest.mark.anyio
-async def test_planner_prompt_explicitly_forbids_bash_and_directory_creation(
+async def test_planner_prompt_explicitly_forbids_bash_and_uses_precreated_artifacts(
     monkeypatch, tmp_path: Path
 ):
     file_comm = FileComm(tmp_path / ".harness")
@@ -375,6 +376,13 @@ async def test_planner_prompt_explicitly_forbids_bash_and_directory_creation(
     async def fake_run_sdk_agent(**kwargs):
         captured["prompt"] = kwargs["prompt"]
         captured["system_prompt"] = kwargs["system_prompt"]
+        captured["stop_hooks"] = kwargs["stop_hooks"]
+        assert file_comm.read_spec().startswith("# Draft Product - Working Title")
+        assert file_comm.read_progress() == "# Progress Log\n"
+        assert (file_comm.dir / "design_tokens.json").exists() is True
+        assert (file_comm.dir / "feature_list.json").exists() is True
+        assert (file_comm.dir / "sprint_plan.json").exists() is True
+        assert (file_comm.dir / "ui_verification_plan.json").exists() is True
         _write_valid_planning_bundle(file_comm)
         return (
             ResultMessage(
@@ -397,9 +405,14 @@ async def test_planner_prompt_explicitly_forbids_bash_and_directory_creation(
     await run_planner(HarnessConfig(), "build a counter app", file_comm, tmp_path)
 
     assert "Bash is unavailable for this task." in captured["prompt"]
-    assert "The Harness has already prepared the workdir and .harness directory for this task" in captured["prompt"]
+    assert "The Harness has already prepared the workdir, the .harness directory, and the required artifact files." in captured["prompt"]
+    assert "Replace the scaffold content in those files" in captured["prompt"]
     assert "`Bash` is unavailable for this task." in captured["system_prompt"]
-    assert "The Harness prepares the workdir and `.harness/` directory before this task starts." in captured["system_prompt"]
+    assert "The Harness prepares the workdir, the `.harness/` directory, and the required artifact" in captured["system_prompt"]
+    assert "Use `total_sprints` exactly as written, never `total_sprint`." in captured["system_prompt"]
+    assert "Every sprint entry must include at least one item in `feature_ids`" in captured["system_prompt"]
+    assert "Before finishing, reread every required file under `.harness`" in captured["system_prompt"]
+    assert len(captured["stop_hooks"]) == 1
 
 
 @pytest.mark.anyio
@@ -415,6 +428,12 @@ async def test_planner_prepares_missing_workdir_and_harness_dir(monkeypatch, tmp
     async def fake_run_sdk_agent(**kwargs):
         assert workdir.exists() is True
         assert harness_dir.exists() is True
+        assert (harness_dir / "spec.md").exists() is True
+        assert (harness_dir / "design_tokens.json").exists() is True
+        assert (harness_dir / "feature_list.json").exists() is True
+        assert (harness_dir / "sprint_plan.json").exists() is True
+        assert (harness_dir / "ui_verification_plan.json").exists() is True
+        assert (harness_dir / "progress.md").exists() is True
         _write_valid_planning_bundle(file_comm)
         return (
             ResultMessage(
@@ -438,6 +457,30 @@ async def test_planner_prepares_missing_workdir_and_harness_dir(monkeypatch, tmp
 
     assert workdir.exists() is True
     assert harness_dir.exists() is True
+
+
+@pytest.mark.anyio
+async def test_planner_stop_hook_blocks_invalid_bundle(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.initialize_planning_artifacts()
+    hook = _make_planner_stop_hook(file_comm, HarnessConfig())
+
+    result = await hook({}, None, None)
+
+    assert result["decision"] == "block"
+    assert "Planning artifact validation failed" in result["reason"]
+    assert ".harness/spec.md" in result["reason"]
+
+
+@pytest.mark.anyio
+async def test_planner_stop_hook_allows_valid_bundle(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    hook = _make_planner_stop_hook(file_comm, HarnessConfig())
+
+    result = await hook({}, None, None)
+
+    assert result == {"continue_": True}
 
 
 # --- cross-ref consistency between the three plan files ---

@@ -243,6 +243,25 @@ def test_progress_round_trip_and_append():
         assert progress.count("## 2026-04-27T") == 2
 
 
+def test_initialize_planning_artifacts_creates_scaffolds():
+    with tempfile.TemporaryDirectory() as tmp:
+        harness_dir = Path(tmp) / ".harness"
+        comm = FileComm(harness_dir)
+
+        comm.initialize_planning_artifacts()
+
+        assert comm.read_spec().startswith("# Draft Product - Working Title")
+        assert comm.read_progress() == "# Progress Log\n"
+        assert (harness_dir / "design_tokens.json").read_text(encoding="utf-8") == "{}\n"
+        assert (harness_dir / "feature_list.json").read_text(encoding="utf-8") == '{\n  "features": []\n}\n'
+        assert (harness_dir / "sprint_plan.json").read_text(encoding="utf-8") == (
+            '{\n  "total_sprints": 0,\n  "sprints": []\n}\n'
+        )
+        assert (harness_dir / "ui_verification_plan.json").read_text(encoding="utf-8") == (
+            '{\n  "sprints": []\n}\n'
+        )
+
+
 def test_reset_run_artifacts_clears_new_planning_files():
     with tempfile.TemporaryDirectory() as tmp:
         harness_dir = Path(tmp) / ".harness"

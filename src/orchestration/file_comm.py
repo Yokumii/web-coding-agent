@@ -24,6 +24,23 @@ T = TypeVar("T", bound=_Artifact)
 _TEXT_ARTIFACTS = ("spec.md", "progress.md", "build_log.md")
 _ROUND_TEXT_PATTERNS = ("feedback_round_*.md",)
 _ROUND_IMAGE_PATTERNS = ("visual_round_*.png",)
+_PLANNING_TEXT_SCAFFOLDS = {
+    "spec.md": (
+        "# Draft Product - Working Title\n\n"
+        "## Product Overview\n\n"
+        "## Target Users\n\n"
+        "## Feature Descriptions\n\n"
+        "## Technical Architecture\n\n"
+        "## Visual Design Direction\n"
+    ),
+    "progress.md": "# Progress Log\n",
+}
+_PLANNING_JSON_SCAFFOLDS = {
+    "design_tokens.json": "{}\n",
+    "feature_list.json": '{\n  "features": []\n}\n',
+    "sprint_plan.json": '{\n  "total_sprints": 0,\n  "sprints": []\n}\n',
+    "ui_verification_plan.json": '{\n  "sprints": []\n}\n',
+}
 
 
 class FileComm:
@@ -81,6 +98,30 @@ class FileComm:
         existing = self.read_progress()
         content = entry if not existing else f"{existing.rstrip()}\n\n{entry}"
         return self.write_progress(content)
+
+    def initialize_planning_artifacts(self) -> None:
+        """预创建 planner 必需文件，供 agent 直接更新内容。"""
+        for name, content in _PLANNING_TEXT_SCAFFOLDS.items():
+            path = self._path(name)
+            if not path.exists():
+                self._write_text(name, content)
+
+        for name, content in _PLANNING_JSON_SCAFFOLDS.items():
+            path = self._path(name)
+            if not path.exists():
+                self._write_text(name, content)
+
+    def is_planning_scaffold(self, name: str) -> bool:
+        """判断文件是否仍是 harness 预创建的 planner 占位内容。"""
+        path = self._path(name)
+        if not path.exists():
+            return False
+        scaffold = _PLANNING_TEXT_SCAFFOLDS.get(name)
+        if scaffold is None:
+            scaffold = _PLANNING_JSON_SCAFFOLDS.get(name)
+        if scaffold is None:
+            return False
+        return path.read_text(encoding="utf-8") == scaffold
 
     def write_feedback(self, round_num: int, content: str) -> Path:
         return self._write_text(f"feedback_round_{round_num}.md", content)
