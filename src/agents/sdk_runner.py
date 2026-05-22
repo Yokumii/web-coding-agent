@@ -13,6 +13,7 @@ from claude_agent_sdk import query
 from claude_agent_sdk.types import (
     AssistantMessage,
     ClaudeAgentOptions,
+    HookCallback,
     HookMatcher,
     McpStdioServerConfig,
     PermissionResultAllow,
@@ -27,12 +28,23 @@ from src.utils.bash_policy import (
     validate_bash_command,
     validate_bash_command_readonly,
 )
+from src.utils.claude_http_trace import (
+    capture_claude_http_traffic,
+    resolve_claude_upstream_base_url,
+)
 from src.utils.sdk_session import _clear_current_task_cancellation
 
 LOCAL_AGENT_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"}
 LOCAL_AGENT_TOOLS_WITH_BASH = LOCAL_AGENT_TOOLS | {"Bash"}
 PLAYWRIGHT_TOOL_PREFIX = "mcp__playwright__"
 _CLAUDE_SDK_SKIP_VERSION_CHECK = "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"
+_DEFAULT_CLAUDE_CODE_ENV = {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "DISABLE_INSTALLATION_CHECKS": "1",
+    "DISABLE_TELEMETRY": "1",
+}
 
 # Playwright MCP 浏览器只允许访问本机回环地址，避免被提示词注入后
 # 探测 file://、云元数据地址或其他本地端口。
@@ -468,7 +480,9 @@ def build_agent_options(
     allow_bash: bool,
     allow_playwright: bool = False,
     bash_profile: str = "full",
+    stop_hooks: list[HookCallback] | None = None,
     trace_writer: SdkTraceWriter | None = None,
+    anthropic_base_url_override: str | None = None,
 ) -> ClaudeAgentOptions:
     """按 harness 约束组装单个 agent 的 ClaudeAgentOptions。"""
     mcp_servers: dict[str, McpStdioServerConfig] = {}
@@ -479,8 +493,9 @@ def build_agent_options(
         }
 
     allowed_tools = sorted(LOCAL_AGENT_TOOLS_WITH_BASH if allow_bash else LOCAL_AGENT_TOOLS)
+    resolved_stop_hooks = [_keepalive_hook, *(stop_hooks or [])]
     hooks: dict[str, list[HookMatcher]] = {
-        "Stop": [HookMatcher(hooks=[_keepalive_hook])],
+        "Stop": [HookMatcher(hooks=resolved_stop_hooks)],
     }
     if allow_bash:
         # PreToolUse 对所有工具调用都会触发，适合拦截 Bash 白名单内的实际执行。
@@ -491,11 +506,14 @@ def build_agent_options(
             )
         ]
 
-    env = {}
+    env = dict(_DEFAULT_CLAUDE_CODE_ENV)
     if config.api_key:
         env["ANTHROPIC_API_KEY"] = config.api_key
-    if config.base_url:
-        env["ANTHROPIC_BASE_URL"] = config.base_url
+    target_base_url = anthropic_base_url_override
+    if target_base_url is None:
+        target_base_url = config.base_url
+    if target_base_url:
+        env["ANTHROPIC_BASE_URL"] = target_base_url
 
     return ClaudeAgentOptions(
         model=model,
@@ -536,36 +554,48 @@ async def run_sdk_agent(
     allow_bash: bool,
     allow_playwright: bool = False,
     bash_profile: str = "full",
+    stop_hooks: list[HookCallback] | None = None,
     trace_path: Path | None = None,
 ) -> tuple[ResultMessage, float, str, list[Any]]:
     """运行单个 SDK agent，并统一收集文本、权限拒绝与成本信息。"""
     trace_writer = SdkTraceWriter(trace_path) if trace_path else None
-    options = build_agent_options(
-        config=config,
-        workdir=workdir,
-        model=model,
-        system_prompt=system_prompt,
-        max_turns=max_turns,
-        allow_bash=allow_bash,
-        allow_playwright=allow_playwright,
-        bash_profile=bash_profile,
-        trace_writer=trace_writer,
-    )
-    if trace_writer:
-        trace_writer.write(
-            "run_start",
-            {
-                "model": model,
-                "cwd": str(workdir),
-                "max_turns": max_turns,
-                "allow_bash": allow_bash,
-                "allow_playwright": allow_playwright,
-                "allowed_tools": options.allowed_tools,
-                "prompt": prompt,
-            },
-    )
+    http_trace_path = trace_path.with_suffix(".http.jsonl") if trace_path else None
+    upstream_base_url = resolve_claude_upstream_base_url(config.base_url)
 
-    async def _run_once() -> tuple[ResultMessage, float, str, list[Any]]:
+    async def _run_once(
+        *,
+        anthropic_base_url_override: str | None,
+    ) -> tuple[ResultMessage, float, str, list[Any]]:
+        options = build_agent_options(
+            config=config,
+            workdir=workdir,
+            model=model,
+            system_prompt=system_prompt,
+            max_turns=max_turns,
+            allow_bash=allow_bash,
+            allow_playwright=allow_playwright,
+            bash_profile=bash_profile,
+            stop_hooks=stop_hooks,
+            trace_writer=trace_writer,
+            anthropic_base_url_override=anthropic_base_url_override,
+        )
+        if trace_writer:
+            trace_writer.write(
+                "run_start",
+                {
+                    "model": model,
+                    "cwd": str(workdir),
+                    "max_turns": max_turns,
+                    "allow_bash": allow_bash,
+                    "allow_playwright": allow_playwright,
+                    "allowed_tools": options.allowed_tools,
+                    "prompt": prompt,
+                    "upstream_base_url": upstream_base_url,
+                    "http_trace_path": str(http_trace_path) if http_trace_path else None,
+                    "proxy_base_url": anthropic_base_url_override,
+                },
+            )
+
         result_message: ResultMessage | None = None
         last_assistant_text = ""
         permission_denials: list[Any] = []
@@ -663,33 +693,43 @@ async def run_sdk_agent(
             permission_denials,
         )
 
-    agent_task = asyncio.create_task(_run_once(), name="run_sdk_agent")
-    try:
-        while True:
-            try:
-                return await asyncio.shield(agent_task)
-            except asyncio.CancelledError:
-                cleared = _clear_current_task_cancellation()
-                if cleared == 0:
-                    raise
-                if trace_writer:
-                    trace_writer.write(
-                        "run_cancelled_parent",
-                        {
-                            "cleared": cleared,
-                            "task_done": agent_task.done(),
-                        },
-                    )
-                if agent_task.done():
-                    break
+    async with capture_claude_http_traffic(
+        trace_path=http_trace_path,
+        target_url=upstream_base_url,
+    ) as http_trace_proxy:
+        proxy_base_url = (
+            http_trace_proxy.base_url if http_trace_proxy is not None else None
+        )
+        agent_task = asyncio.create_task(
+            _run_once(anthropic_base_url_override=proxy_base_url),
+            name="run_sdk_agent",
+        )
+        try:
+            while True:
+                try:
+                    return await asyncio.shield(agent_task)
+                except asyncio.CancelledError:
+                    cleared = _clear_current_task_cancellation()
+                    if cleared == 0:
+                        raise
+                    if trace_writer:
+                        trace_writer.write(
+                            "run_cancelled_parent",
+                            {
+                                "cleared": cleared,
+                                "task_done": agent_task.done(),
+                            },
+                        )
+                    if agent_task.done():
+                        break
 
-        if agent_task.cancelled():
-            raise RuntimeError("Agent SDK task was cancelled before completion")
+            if agent_task.cancelled():
+                raise RuntimeError("Agent SDK task was cancelled before completion")
 
-        task_exc = agent_task.exception()
-        if task_exc is not None:
-            raise task_exc
-        return agent_task.result()
-    finally:
-        if not agent_task.done():
-            agent_task.cancel()
+            task_exc = agent_task.exception()
+            if task_exc is not None:
+                raise task_exc
+            return agent_task.result()
+        finally:
+            if not agent_task.done():
+                agent_task.cancel()

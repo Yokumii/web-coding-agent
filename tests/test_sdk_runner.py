@@ -4,12 +4,16 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
+import aiohttp
 import pytest
+from aiohttp import web
 from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
 from src.agents.sdk_runner import (
     AgentRunStats,
+    _DEFAULT_CLAUDE_CODE_ENV,
     SdkTraceWriter,
     build_agent_run_stats,
     build_agent_options,
@@ -19,6 +23,10 @@ from src.agents.sdk_runner import (
 )
 from src.config import HarnessConfig
 from src.orchestration.pricing import estimate_cost_usd
+from src.utils.claude_http_trace import (
+    DEFAULT_ANTHROPIC_BASE_URL,
+    capture_claude_http_traffic,
+)
 
 
 @pytest.fixture
@@ -324,6 +332,19 @@ def test_build_agent_options_sets_sdk_buffer_size(tmp_path: Path):
     assert options.max_buffer_size == 6 * 1024 * 1024
 
 
+def test_build_agent_options_sets_default_claude_code_env(tmp_path: Path):
+    options = build_agent_options(
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=10,
+        allow_bash=False,
+    )
+    for key, value in _DEFAULT_CLAUDE_CODE_ENV.items():
+        assert options.env[key] == value
+
+
 def test_build_agent_options_adds_keepalive_hook_for_permission_callback(tmp_path: Path):
     options = build_agent_options(
         config=HarnessConfig(),
@@ -336,6 +357,26 @@ def test_build_agent_options_adds_keepalive_hook_for_permission_callback(tmp_pat
     assert options.hooks is not None
     assert "Stop" in options.hooks
     assert len(options.hooks["Stop"]) == 1
+
+
+def test_build_agent_options_appends_custom_stop_hook(tmp_path: Path):
+    async def custom_stop_hook(_input, _tool_use_id, _context):
+        return {"continue_": True}
+
+    options = build_agent_options(
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=10,
+        allow_bash=False,
+        stop_hooks=[custom_stop_hook],
+    )
+    assert options.hooks is not None
+    stop_matchers = options.hooks["Stop"]
+    assert len(stop_matchers) == 1
+    assert stop_matchers[0].hooks[0].__name__ == "_keepalive_hook"
+    assert stop_matchers[0].hooks[1] is custom_stop_hook
 
 
 def test_build_agent_options_wires_stderr_callback_into_trace(tmp_path: Path):
@@ -355,6 +396,83 @@ def test_build_agent_options_wires_stderr_callback_into_trace(tmp_path: Path):
     records = [json.loads(line) for line in trace_path.read_text().splitlines()]
     assert records[-1]["event"] == "sdk_stderr"
     assert records[-1]["line"] == "cli stderr line"
+
+
+@pytest.mark.anyio
+async def test_capture_claude_http_traffic_records_streaming_response(tmp_path: Path):
+    async def handle_messages(request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        assert body["stream"] is True
+        response = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/event-stream"},
+        )
+        await response.prepare(request)
+        chunks = [
+            (
+                'event: message_start\n'
+                'data: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[]}}\n\n'
+            ),
+            (
+                'event: content_block_delta\n'
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n'
+            ),
+            (
+                'event: message_delta\n'
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n'
+            ),
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        for chunk in chunks:
+            await response.write(chunk.encode("utf-8"))
+        await response.write_eof()
+        return response
+
+    upstream_app = web.Application()
+    upstream_app.router.add_post("/v1/messages", handle_messages)
+    upstream_runner = web.AppRunner(upstream_app)
+    await upstream_runner.setup()
+    upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+    await upstream_site.start()
+    upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+    upstream_url = f"http://127.0.0.1:{upstream_port}"
+
+    trace_path = tmp_path / "http_trace.jsonl"
+    try:
+        async with capture_claude_http_traffic(
+            trace_path=trace_path,
+            target_url=upstream_url,
+        ) as proxy:
+            assert proxy is not None
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy.base_url}/v1/messages",
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "ping"}],
+                    },
+                ) as response:
+                    text = await response.text()
+
+            assert "message_start" in text
+            assert "content_block_delta" in text
+    finally:
+        await upstream_runner.cleanup()
+
+    records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record["request"]["path"] == "/v1/messages"
+    assert record["request"]["body"]["messages"][0]["content"] == "ping"
+    assert record["response"]["status"] == 200
+    assert [event["event"] for event in record["response"]["sse_events"]] == [
+        "message_start",
+        "content_block_delta",
+        "message_delta",
+        "message_stop",
+    ]
+    assert record["upstream_base_url"] == upstream_url
 
 
 def test_build_agent_run_stats_extracts_usage_and_serializes_wall_time():
@@ -457,7 +575,7 @@ async def test_run_sdk_agent_returns_cost(monkeypatch, tmp_path: Path):
     trace_path = tmp_path / "trace.jsonl"
     result, cost, assistant_text, permission_denials = await run_sdk_agent(
         prompt="hello",
-        config=HarnessConfig(),
+        config=HarnessConfig(base_url=""),
         workdir=tmp_path,
         model="glm-5.1",
         system_prompt="system",
@@ -479,6 +597,68 @@ async def test_run_sdk_agent_returns_cost(monkeypatch, tmp_path: Path):
     assert any(json.loads(line)["event"] == "sdk_message" for line in lines)
     assert any(json.loads(line)["event"] == "run_complete" for line in lines)
     assert os.environ.get(_CLAUDE_SDK_SKIP_VERSION_CHECK) is None
+
+
+@pytest.mark.anyio
+async def test_run_sdk_agent_routes_base_url_through_http_trace_proxy(
+    monkeypatch,
+    tmp_path: Path,
+):
+    captured: dict[str, object] = {}
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_capture_claude_http_traffic(*, trace_path, target_url):
+        captured["trace_path"] = trace_path
+        captured["target_url"] = target_url
+        yield SimpleNamespace(base_url="http://127.0.0.1:43123")
+
+    async def fake_query(*, prompt, options):
+        messages = [message async for message in prompt]
+        assert messages[0]["message"]["content"] == "hello"
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:43123"
+        yield ResultMessage(
+            subtype="result",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="session",
+            total_cost_usd=0.0,
+            result="done",
+        )
+
+    monkeypatch.setattr(
+        "src.agents.sdk_runner.capture_claude_http_traffic",
+        fake_capture_claude_http_traffic,
+    )
+    monkeypatch.setattr("src.agents.sdk_runner.query", fake_query)
+
+    trace_path = tmp_path / "trace.jsonl"
+    result, cost, assistant_text, permission_denials = await run_sdk_agent(
+        prompt="hello",
+        config=HarnessConfig(base_url=""),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=5,
+        allow_bash=False,
+        trace_path=trace_path,
+    )
+
+    assert result.result == "done"
+    assert cost == 0.0
+    assert assistant_text == ""
+    assert permission_denials == []
+    assert captured["trace_path"] == tmp_path / "trace.http.jsonl"
+    assert captured["target_url"] == DEFAULT_ANTHROPIC_BASE_URL
+
+    records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    run_start = next(record for record in records if record["event"] == "run_start")
+    assert run_start["http_trace_path"] == str(tmp_path / "trace.http.jsonl")
+    assert run_start["upstream_base_url"] == DEFAULT_ANTHROPIC_BASE_URL
+    assert run_start["proxy_base_url"] == "http://127.0.0.1:43123"
 
 
 @pytest.mark.anyio
