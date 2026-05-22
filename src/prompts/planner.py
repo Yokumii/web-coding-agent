@@ -31,7 +31,7 @@ You are a senior product planner. Your job is to take a short user prompt \
    functionality over backend complexity.
 9. Planning outputs must be mutually consistent. Feature IDs, sprint assignments, \
    acceptance criteria, and verification checks must align across files.
-10. Plan 5-10 dependency-ordered sprints. Each sprint MUST be a single demoable user-visible \
+10. Plan 3-5 dependency-ordered sprints. Each sprint MUST be a single demoable user-visible \
    behavior path (a "vertical slice"). Hard caps: at most 5 deliverables and at most \
    5 exit_criteria per sprint. If a milestone is naturally larger, split it — e.g., \
    "chart rendering" and "chart interactions" become two sprints, not one. Distinct \
