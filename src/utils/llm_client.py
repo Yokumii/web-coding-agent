@@ -1,15 +1,17 @@
-"""对 Anthropic SDK 的轻量封装，替代原 LiteLLM 路由层。"""
+"""对 LiteLLM `completion()` 的轻量封装。"""
 from __future__ import annotations
 
+import importlib
+import importlib.util
+import logging
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-import anthropic
-
 
 class LLMClientError(RuntimeError):
-    """调用失败时抛出，错误信息会先做脱敏。"""
+    """LiteLLM 调用失败时抛出，错误信息会先做脱敏。"""
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,11 @@ _SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]{8,}"),
     re.compile(r"Bearer\s+[A-Za-z0-9_.\-]{8,}"),
 ]
+_LITELLM_IMPORT_WARNING_SNIPPETS = (
+    "could not pre-load bedrock-runtime response stream shape",
+    "could not pre-load sagemaker-runtime response stream shape",
+)
+_litellm_module: Any | None = None
 
 
 def _scrub(text: str, *, limit: int = 512) -> str:
@@ -36,22 +43,70 @@ def _scrub(text: str, *, limit: int = 512) -> str:
     return scrubbed
 
 
+def _extract_text(response: Any) -> str:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        raise LLMClientError("provider returned no choices")
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        raise LLMClientError("provider returned a choice with no message")
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    raise LLMClientError(f"unsupported message content shape: {type(content).__name__}")
+
+
 def _normalize_usage(usage_obj: Any) -> dict[str, int]:
     if usage_obj is None:
         return {}
     if hasattr(usage_obj, "model_dump"):
-        return {
-            k: int(v)
-            for k, v in usage_obj.model_dump().items()
-            if isinstance(v, (int, float))
-        }
-    if isinstance(usage_obj, dict):
-        return {
-            k: int(v)
-            for k, v in usage_obj.items()
-            if isinstance(v, (int, float))
-        }
-    return {}
+        usage_obj = usage_obj.model_dump()
+    if not isinstance(usage_obj, dict):
+        return {}
+    return {
+        key: int(value)
+        for key, value in usage_obj.items()
+        if isinstance(value, (int, float))
+    }
+
+
+class _LiteLLMImportWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not any(snippet in message for snippet in _LITELLM_IMPORT_WARNING_SNIPPETS)
+
+
+@contextmanager
+def _suppress_litellm_import_warnings():
+    logger = logging.getLogger("LiteLLM")
+    warning_filter = _LiteLLMImportWarningFilter()
+    logger.addFilter(warning_filter)
+    try:
+        yield
+    finally:
+        logger.removeFilter(warning_filter)
+
+
+def _load_litellm() -> Any:
+    global _litellm_module
+    if _litellm_module is not None:
+        return _litellm_module
+
+    if importlib.util.find_spec("botocore") is None:
+        with _suppress_litellm_import_warnings():
+            _litellm_module = importlib.import_module("litellm")
+    else:
+        _litellm_module = importlib.import_module("litellm")
+    return _litellm_module
 
 
 def completion(
@@ -66,74 +121,31 @@ def completion(
     timeout: float | None = 90.0,
     **extra: Any,
 ) -> CompletionResult:
-    """执行一次 completion 调用，直接使用 Anthropic SDK。"""
-    client_kwargs: dict[str, Any] = {}
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    if api_base:
-        client_kwargs["base_url"] = api_base
-    if timeout is not None:
-        client_kwargs["timeout"] = timeout
-    client_kwargs["max_retries"] = num_retries
-
-    client = anthropic.Anthropic(**client_kwargs)
-
-    system_text = None
-    api_messages = []
-    for msg in messages:
-        if msg["role"] == "system":
-            system_text = msg["content"] if isinstance(msg["content"], str) else str(msg["content"])
-        else:
-            content = msg["content"]
-            if isinstance(content, list):
-                converted = []
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "image_url":
-                        url = block["image_url"]["url"]
-                        if url.startswith("data:"):
-                            media_type, _, b64_data = url.partition(";base64,")
-                            media_type = media_type.replace("data:", "")
-                            converted.append({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": b64_data,
-                                },
-                            })
-                        else:
-                            converted.append({
-                                "type": "image",
-                                "source": {"type": "url", "url": url},
-                            })
-                    else:
-                        converted.append(block)
-                content = converted
-            api_messages.append({"role": msg["role"], "content": content})
-
-    create_kwargs: dict[str, Any] = {
+    """执行一次 completion 调用，并返回统一结果结构。"""
+    litellm = _load_litellm()
+    kwargs: dict[str, Any] = {
         "model": model,
-        "messages": api_messages,
-        "max_tokens": max_tokens or 4096,
+        "messages": messages,
+        "temperature": temperature,
+        "num_retries": num_retries,
     }
-    if temperature > 0:
-        create_kwargs["temperature"] = temperature
-    if system_text:
-        create_kwargs["system"] = system_text
-    create_kwargs.update(extra)
+    if api_key:
+        kwargs["api_key"] = api_key
+    if api_base:
+        kwargs["api_base"] = api_base
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    kwargs.update(extra)
 
     try:
-        response = client.messages.create(**create_kwargs)
+        response = litellm.completion(**kwargs)
     except Exception as exc:
-        raise LLMClientError(f"completion failed: {_scrub(str(exc))}") from exc
-
-    text_parts = []
-    for block in response.content:
-        if hasattr(block, "text"):
-            text_parts.append(block.text)
+        raise LLMClientError(f"llm completion failed: {_scrub(str(exc))}") from exc
 
     return CompletionResult(
-        text="\n".join(text_parts),
-        usage=_normalize_usage(response.usage),
+        text=_extract_text(response),
+        usage=_normalize_usage(getattr(response, "usage", None)),
         raw=response,
     )

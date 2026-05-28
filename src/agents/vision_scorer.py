@@ -139,8 +139,17 @@ def _coerce_score(value: Any, fallback: float) -> float:
 
 
 def _provider_model_string(config: HarnessConfig) -> str:
-    """返回模型标识，直接使用 Anthropic SDK，无需 LiteLLM 路由前缀。"""
-    return config.evaluator_vision_model
+    """按端点类型生成 LiteLLM 所需的 model 标识。"""
+    endpoint_type = (config.evaluator_vision_endpoint_type or "anthropic").strip().lower()
+    base = config.evaluator_vision_model
+    if endpoint_type in ("", "anthropic"):
+        return f"anthropic/{base}"
+    if endpoint_type == "openai":
+        return f"openai/{base}"
+    raise ValueError(
+        f"unsupported evaluator vision endpoint type: {config.evaluator_vision_endpoint_type!r}; "
+        "expected 'anthropic' or 'openai'"
+    )
 
 
 def _build_vision_messages(

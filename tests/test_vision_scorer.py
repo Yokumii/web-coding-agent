@@ -27,7 +27,7 @@ def test_provider_model_string_returns_model_directly():
         evaluator_vision_model="claude-sonnet-4-6",
         evaluator_vision_endpoint_type="anthropic",
     )
-    assert _provider_model_string(config) == "claude-sonnet-4-6"
+    assert _provider_model_string(config) == "anthropic/claude-sonnet-4-6"
 
 
 def test_provider_model_string_returns_custom_model_directly():
@@ -35,7 +35,7 @@ def test_provider_model_string_returns_custom_model_directly():
         evaluator_vision_model="ep-5o96ln-1770432475019207263",
         evaluator_vision_endpoint_type="anthropic",
     )
-    assert _provider_model_string(config) == "ep-5o96ln-1770432475019207263"
+    assert _provider_model_string(config) == "anthropic/ep-5o96ln-1770432475019207263"
 
 
 # --- _build_vision_messages ---
@@ -294,7 +294,7 @@ def test_normalize_visual_review_clamps_values_and_preserves_screenshots():
     assert normalized["criteria_scores"]["craft"]["score"] == 6.3
 
 
-# --- _perform_visual_review_request (with Anthropic SDK mock) ---
+# --- _perform_visual_review_request (with LiteLLM mock) ---
 
 
 def _vision_config(**overrides) -> HarnessConfig:
@@ -394,7 +394,7 @@ def test_perform_visual_review_request_calls_completion_with_anthropic_model_str
     )
 
     assert review["phase_result"] == "pass"
-    assert captured["model"] == "claude-sonnet-4-6"
+    assert captured["model"] == "anthropic/claude-sonnet-4-6"
     assert captured["kwargs"]["api_key"] == "test-key"
     assert captured["kwargs"]["api_base"] == "https://api.anthropic.com"
     assert captured["kwargs"]["max_tokens"] == 600
@@ -449,7 +449,7 @@ def test_perform_visual_review_request_passes_custom_model_directly(
     )
 
     assert review["phase_result"] == "pass"
-    assert captured["model"] == "ep-custom-model-123"
+    assert captured["model"] == "anthropic/ep-custom-model-123"
 
 
 def test_perform_visual_review_request_raises_on_missing_model(tmp_path):
