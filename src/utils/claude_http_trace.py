@@ -54,7 +54,11 @@ async def capture_claude_http_traffic(
         yield None
         return
 
-    proxy_handler, trace_writer_type = _load_claude_tap_symbols()
+    try:
+        proxy_handler, trace_writer_type = _load_claude_tap_symbols()
+    except RuntimeError:
+        yield None
+        return
     upstream_base_url = resolve_claude_upstream_base_url(target_url)
     trace_writer = trace_writer_type(trace_path)
     session = aiohttp.ClientSession(auto_decompress=False, trust_env=True)
