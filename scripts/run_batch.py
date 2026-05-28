@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 """并发批量执行 harness，每个 prompt 独立 workdir + 端口。
 
+支持 --proxy 模式：自动启动本地 Anthropic→OpenAI 翻译代理，
+使 Claude Code SDK 能通过 qwen 等 OpenAI 兼容模型运行。
+
 输入格式:
   JSONL — 每行 {"prompt": "...", "workdir": "name"}  (workdir 可选)
   纯文本 — 每行一个 prompt
 
 用法:
+  # 用默认 Anthropic API
   python scripts/run_batch.py prompts.jsonl --workers 4
-  python scripts/run_batch.py prompts.jsonl --workers 2 --output-dir ./batch --base-port 5200
-  python scripts/run_batch.py prompts.jsonl --workers 3 -- --max-rounds 5 --max-budget 50
+
+  # 用 qwen 模型（通过本地代理）
+  python scripts/run_batch.py prompts.jsonl --workers 2 \
+    --proxy --proxy-model openai/qwen3.7-max \
+    --proxy-key sk-xxx --proxy-base https://app-hk.ppapi.ai/v1 \
+    -- --max-rounds 5 --max-budget 30
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 import re
+import signal
 import sys
 import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,6 +41,87 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Anthropic → OpenAI 翻译代理
+# ---------------------------------------------------------------------------
+
+def _make_proxy_handler(model: str, api_key: str, api_base: str):
+    from src.utils.llm_client import completion, LLMClientError
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if "/v1/messages" not in self.path:
+                self._reply(404, {"error": {"message": f"not found: {self.path}"}})
+                return
+
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+
+            messages: list[dict[str, Any]] = []
+            if body.get("system"):
+                sys_content = body["system"]
+                if isinstance(sys_content, list):
+                    sys_content = "\n".join(
+                        b.get("text", "") for b in sys_content if isinstance(b, dict)
+                    )
+                messages.append({"role": "system", "content": sys_content})
+            for msg in body.get("messages", []):
+                messages.append({"role": msg["role"], "content": msg["content"]})
+
+            try:
+                result = completion(
+                    messages=messages,
+                    model=model,
+                    api_key=api_key,
+                    api_base=api_base,
+                    max_tokens=body.get("max_tokens", 4096),
+                    temperature=body.get("temperature", 0.0),
+                    timeout=300.0,
+                )
+            except LLMClientError as e:
+                self._reply(502, {"error": {"message": str(e)}})
+                return
+
+            self._reply(200, {
+                "id": "msg_proxy",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": result.text}],
+                "model": model,
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": result.usage.get("prompt_tokens", result.usage.get("input_tokens", 0)),
+                    "output_tokens": result.usage.get("completion_tokens", result.usage.get("output_tokens", 0)),
+                },
+            })
+
+        def _reply(self, code: int, data: dict):
+            payload = json.dumps(data).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, fmt, *args):
+            pass  # suppress per-request logging
+
+    return Handler
+
+
+def start_proxy(port: int, model: str, api_key: str, api_base: str) -> HTTPServer:
+    handler = _make_proxy_handler(model, api_key, api_base)
+    server = HTTPServer(("127.0.0.1", port), handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"[bold]Proxy started[/] http://127.0.0.1:{port} → {model} @ {api_base}")
+    return server
+
+
+# ---------------------------------------------------------------------------
+# 输入解析
+# ---------------------------------------------------------------------------
 
 def _slugify(text: str, max_len: int = 40) -> str:
     slug = re.sub(r"[^\w一-鿿]+", "-", text.strip().lower())
@@ -57,6 +150,10 @@ def parse_input_file(path: Path) -> list[dict[str, str]]:
     return tasks
 
 
+# ---------------------------------------------------------------------------
+# 单任务 / 批量执行
+# ---------------------------------------------------------------------------
+
 def build_config_for_task(
     base_config: dict[str, Any],
     frontend_port: int,
@@ -84,7 +181,7 @@ async def run_single(
             logger.info(f"[{index}] 完成: {workdir.name} ({elapsed:.0f}s)")
             return {
                 "index": index,
-                "prompt": prompt,
+                "prompt": prompt[:200],
                 "workdir": str(workdir),
                 "status": "ok",
                 "duration_s": round(elapsed, 1),
@@ -96,7 +193,7 @@ async def run_single(
             logger.error(f"[{index}] 失败: {workdir.name} — {e}")
             return {
                 "index": index,
-                "prompt": prompt,
+                "prompt": prompt[:200],
                 "workdir": str(workdir),
                 "status": "error",
                 "error": str(e),
@@ -137,6 +234,10 @@ async def run_batch(
     results = await asyncio.gather(*coros)
     return list(results)
 
+
+# ---------------------------------------------------------------------------
+# CLI 参数解析
+# ---------------------------------------------------------------------------
 
 def parse_harness_args(extra_args: list[str]) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
@@ -186,6 +287,13 @@ def main() -> None:
     parser.add_argument("-o", "--output-dir", type=Path, default=Path("batch_output"), help="输出根目录")
     parser.add_argument("--base-port", type=int, default=5200, help="起始端口号 (默认 5200)")
 
+    proxy_group = parser.add_argument_group("proxy", "Anthropic→OpenAI 翻译代理 (用第三方模型)")
+    proxy_group.add_argument("--proxy", action="store_true", help="启动本地翻译代理")
+    proxy_group.add_argument("--proxy-port", type=int, default=4000, help="代理端口 (默认 4000)")
+    proxy_group.add_argument("--proxy-model", default="openai/qwen3.7-max", help="LiteLLM 模型标识")
+    proxy_group.add_argument("--proxy-key", default="", help="第三方 API key")
+    proxy_group.add_argument("--proxy-base", default="https://app-hk.ppapi.ai/v1", help="第三方 API base URL")
+
     args, extra = parser.parse_known_args()
     if extra and extra[0] == "--":
         extra = extra[1:]
@@ -202,22 +310,35 @@ def main() -> None:
     if plan_only:
         harness_kwargs["plan_only"] = True
 
+    proxy_server = None
+    if args.proxy:
+        proxy_server = start_proxy(args.proxy_port, args.proxy_model, args.proxy_key, args.proxy_base)
+        harness_overrides["api_key"] = "proxy-key"
+        harness_overrides["base_url"] = f"http://127.0.0.1:{args.proxy_port}"
+
     print(f"共 {len(tasks)} 个任务，最大并发 {args.workers}，端口 {args.base_port}-{args.base_port + len(tasks) - 1}", file=sys.stderr)
     print(f"输出目录: {args.output_dir.resolve()}", file=sys.stderr)
+    if args.proxy:
+        print(f"代理: http://127.0.0.1:{args.proxy_port} → {args.proxy_model}", file=sys.stderr)
     if harness_overrides:
-        print(f"Harness 参数: {harness_overrides}", file=sys.stderr)
+        safe = {k: v for k, v in harness_overrides.items() if "key" not in k.lower()}
+        print(f"Harness 参数: {safe}", file=sys.stderr)
 
     start = time.time()
-    results = asyncio.run(run_batch(
-        tasks=tasks,
-        output_dir=args.output_dir.resolve(),
-        workers=args.workers,
-        base_port=args.base_port,
-        config_overrides=harness_overrides,
-        harness_kwargs=harness_kwargs,
-    ))
-    elapsed = time.time() - start
+    try:
+        results = asyncio.run(run_batch(
+            tasks=tasks,
+            output_dir=args.output_dir.resolve(),
+            workers=args.workers,
+            base_port=args.base_port,
+            config_overrides=harness_overrides,
+            harness_kwargs=harness_kwargs,
+        ))
+    finally:
+        if proxy_server:
+            proxy_server.shutdown()
 
+    elapsed = time.time() - start
     success = sum(1 for r in results if r["status"] == "ok")
     failed = sum(1 for r in results if r["status"] == "error")
     total_cost = sum(r.get("cost_usd", 0) for r in results)
