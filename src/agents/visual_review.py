@@ -8,10 +8,7 @@ from src.agents.vision_scorer import normalize_visual_review, run_visual_appeara
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.orchestration.round_artifacts import RoundArtifacts
-from src.prompts.grading import apply_visual_review_scores, visual_review_failure
-from src.utils.logger import get_logger
-
-logger = get_logger(__name__)
+from src.orchestration.visual_review_round import VisualReviewRound
 
 
 def discover_visual_screenshots(
@@ -39,32 +36,19 @@ async def apply_dedicated_visual_review(
     manifest: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], AgentRunStats | None]:
     """执行独立视觉复核，并把结果合并回 evaluator 评分。"""
-    screenshot_paths = discover_visual_screenshots(file_comm, round_num, manifest, grades)
-    if not screenshot_paths:
-        logger.warning(
-            f"[bold yellow]Visual review[/] round {round_num} found no screenshots; "
-            f"failing the appearance phase closed"
-        )
-        return visual_review_failure(grades, "no screenshots available"), None
-
-    try:
-        review, vision_stats = await run_visual_appearance_review(
-            config=config,
-            file_comm=file_comm,
-            workdir=workdir,
-            sprint_num=sprint_num,
-            sprint_context=sprint_context,
-            screenshot_paths=screenshot_paths,
-        )
-    except Exception as exc:
-        logger.warning(
-            f"[bold yellow]Visual review[/] round {round_num} failed; "
-            f"failing the appearance phase closed: {exc}"
-        )
-        return visual_review_failure(grades, str(exc)), None
-
-    normalized = normalize_visual_review(review, screenshot_paths)
-    return apply_visual_review_scores(grades, normalized), vision_stats
+    return await VisualReviewRound(
+        config=config,
+        file_comm=file_comm,
+        workdir=workdir,
+        round_num=round_num,
+        sprint_num=sprint_num,
+        sprint_context=sprint_context,
+    ).apply(
+        grades=grades,
+        manifest=manifest,
+        reviewer=run_visual_appearance_review,
+        normalizer=normalize_visual_review,
+    )
 
 
 def render_feedback_from_grades(grades: dict[str, Any]) -> str:
