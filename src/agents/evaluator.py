@@ -8,6 +8,7 @@ from src.agents._shared import expose_local_claude_skills
 from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.sprint_state import SprintRunContext, SprintState
 from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
 from src.prompts.grading import determine_passed as _determine_passed
 from src.utils.llm_json import extract_json_object
@@ -75,8 +76,8 @@ async def run_evaluator(
 ) -> tuple[bool, dict[str, Any], AgentRunStats]:
     """运行 evaluator，并返回通过状态、评分结果与执行统计。"""
     _ensure_local_claude_skills(workdir)
-    sprint_num, sprint_context = _get_current_sprint_context(file_comm)
-    accepted_sprints = _get_accepted_sprints(file_comm)
+    sprint_run_context = SprintState.load(file_comm).current_run_context()
+    sprint_num = sprint_run_context.sprint_num
 
     logger.info(
         f"[bold yellow]Evaluator[/] round {round_num} starting at {app_url} "
@@ -88,8 +89,7 @@ async def run_evaluator(
         workdir=workdir,
         round_num=round_num,
         sprint_num=sprint_num,
-        sprint_context=sprint_context,
-        accepted_sprints=accepted_sprints,
+        sprint_run_context=sprint_run_context,
         app_url=app_url,
     )
     response, total_cost, _assistant_text, permission_denials = await run_sdk_agent(
@@ -123,85 +123,10 @@ async def run_evaluator(
     )
 
 
-def _get_current_sprint_context(file_comm: FileComm) -> tuple[int, dict[str, Any]]:
-    accepted_sprints = _get_accepted_sprints(file_comm)
-    sprint_num = int(accepted_sprints.get("current_target", 1))
-    sprint_plan = file_comm.read_sprint_plan() or {}
-    for sprint in sprint_plan.get("sprints", []):
-        if sprint.get("number") == sprint_num:
-            return sprint_num, sprint
-    return sprint_num, {}
-
-
-def _get_accepted_sprints(file_comm: FileComm) -> dict[str, Any]:
-    return file_comm.read_accepted_sprints() or {
-        "accepted": [],
-        "current_target": 1,
-        "last_evaluated_round": 0,
-    }
-
-
 def _design_required_reads(file_comm: FileComm) -> list[str]:
     if file_comm.read_design_brief() is None:
         return []
     return list(_DESIGN_REQUIRED_READS)
-
-
-def _get_current_sprint_ui_checks(file_comm: FileComm, sprint_num: int) -> list[dict[str, Any]]:
-    verification_plan = file_comm.read_ui_verification_plan() or {}
-    for sprint in verification_plan.get("sprints", []):
-        if sprint.get("sprint") == sprint_num:
-            checks = sprint.get("checks", [])
-            return [check for check in checks if isinstance(check, dict)]
-    return []
-
-
-def _get_current_sprint_features(file_comm: FileComm, sprint_num: int) -> list[dict[str, Any]]:
-    feature_list = file_comm.read_feature_list() or {}
-    features = feature_list.get("features", [])
-    return [
-        feature
-        for feature in features
-        if isinstance(feature, dict) and feature.get("sprint") == sprint_num
-    ]
-
-
-def _build_exit_criterion_feature_map(
-    file_comm: FileComm,
-    sprint_num: int,
-    sprint_context: dict[str, Any],
-) -> list[dict[str, Any]]:
-    exit_criteria = sprint_context.get("exit_criteria", [])
-    sprint_features = _get_current_sprint_features(file_comm, sprint_num)
-    feature_ids = [str(feature.get("id")) for feature in sprint_features if feature.get("id")]
-    single_feature_id = feature_ids[0] if len(feature_ids) == 1 else ""
-
-    mappings: list[dict[str, Any]] = []
-    for index, criterion in enumerate(exit_criteria, start=1):
-        criterion_text = str(criterion).strip()
-        if not criterion_text:
-            continue
-
-        matched_feature_id = ""
-        for feature in sprint_features:
-            acceptance = feature.get("acceptance_criteria", [])
-            if criterion_text in [str(item).strip() for item in acceptance]:
-                matched_feature_id = str(feature.get("id", "")).strip()
-                break
-
-        if not matched_feature_id and single_feature_id:
-            matched_feature_id = single_feature_id
-
-        mappings.append(
-            {
-                "criterion_id": f"EXIT-{sprint_num:02d}-{index:02d}",
-                "feature_id": matched_feature_id or "unknown",
-                "criterion": criterion_text,
-                "critical": True,
-            }
-        )
-
-    return mappings
 
 
 def _build_evaluator_prompt(
@@ -210,8 +135,7 @@ def _build_evaluator_prompt(
     workdir: Path,
     round_num: int,
     sprint_num: int,
-    sprint_context: dict[str, Any],
-    accepted_sprints: dict[str, Any],
+    sprint_run_context: SprintRunContext,
     app_url: str,
 ) -> str:
     previous_round = round_num - 1
@@ -225,11 +149,13 @@ def _build_evaluator_prompt(
         if previous_grades.exists():
             required_reads.append(f".harness/{previous_grades.name}")
 
+    sprint_context = sprint_run_context.sprint_context
+    accepted_sprints = sprint_run_context.accepted_sprints
     feature_ids = sprint_context.get("feature_ids", [])
     deliverables = sprint_context.get("deliverables", [])
     exit_criteria = sprint_context.get("exit_criteria", [])
-    ui_checks = _get_current_sprint_ui_checks(file_comm, sprint_num)
-    exit_criterion_map = _build_exit_criterion_feature_map(file_comm, sprint_num, sprint_context)
+    ui_checks = sprint_run_context.ui_checks
+    exit_criterion_map = sprint_run_context.exit_criterion_map
     has_design_contract = file_comm.read_design_brief() is not None
 
     lines = [

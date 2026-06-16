@@ -23,11 +23,28 @@ def file_comm(tmp_path):
     fc.write_feature_list({
         "features": [
             {"id": "F-001", "name": "F1", "description": "", "priority": "P0",
-             "depends_on": [], "acceptance_criteria": [], "status": "planned", "sprint": 1},
+             "depends_on": [], "acceptance_criteria": ["e1"], "status": "planned", "sprint": 1},
             {"id": "F-002", "name": "F2", "description": "", "priority": "P0",
-             "depends_on": [], "acceptance_criteria": [], "status": "planned", "sprint": 2},
+             "depends_on": [], "acceptance_criteria": ["e2"], "status": "planned", "sprint": 2},
             {"id": "F-003", "name": "F3", "description": "", "priority": "P0",
-             "depends_on": [], "acceptance_criteria": [], "status": "planned", "sprint": 3},
+             "depends_on": [], "acceptance_criteria": ["e3"], "status": "planned", "sprint": 3},
+        ]
+    })
+    fc.write_ui_verification_plan({
+        "sprints": [
+            {
+                "sprint": 2,
+                "checks": [
+                    {
+                        "id": "UI-002",
+                        "feature_id": "F-002",
+                        "task": "Check sprint 2.",
+                        "expected_result": "Sprint 2 works.",
+                        "critical": True,
+                        "category": "core_interaction",
+                    }
+                ],
+            }
         ]
     })
     fc.write_accepted_sprints({"accepted": [], "current_target": 1, "last_evaluated_round": 0})
@@ -114,6 +131,63 @@ def test_feature_ids_for_sprint(file_comm):
     state = SprintState.load(file_comm)
     assert state.feature_ids_for_sprint(2) == {"F-002"}
     assert state.feature_ids_for_sprint(99) == set()
+
+
+def test_sprint_run_context_gathers_sprint_artifacts(file_comm):
+    state = SprintState.load(file_comm)
+    ctx = state.sprint_run_context(2)
+
+    assert ctx.sprint_num == 2
+    assert ctx.sprint_context["title"] == "S2"
+    assert ctx.accepted_sprints == {
+        "accepted": [],
+        "current_target": 1,
+        "last_evaluated_round": 0,
+    }
+    assert [feature["id"] for feature in ctx.features] == ["F-002"]
+    assert [check["id"] for check in ctx.ui_checks] == ["UI-002"]
+    assert ctx.exit_criterion_map == [
+        {
+            "criterion_id": "EXIT-02-01",
+            "feature_id": "F-002",
+            "criterion": "e2",
+            "critical": True,
+        }
+    ]
+
+
+def test_current_sprint_run_context_uses_current_target(file_comm):
+    file_comm.write_accepted_sprints(
+        {"accepted": [1], "current_target": 2, "last_evaluated_round": 1}
+    )
+    state = SprintState.load(file_comm)
+
+    ctx = state.current_run_context()
+
+    assert ctx.sprint_num == 2
+    assert ctx.sprint_context["title"] == "S2"
+
+
+def test_required_sprint_run_context_rejects_missing_sprint(file_comm):
+    state = SprintState.load(file_comm)
+
+    with pytest.raises(RuntimeError, match="Generator could not find sprint 99"):
+        state.required_run_context(99, owner="Generator")
+
+
+def test_required_sprint_run_context_rejects_missing_accepted_sprints(tmp_path):
+    fc = FileComm(tmp_path / ".harness")
+    fc.write_sprint_plan({
+        "total_sprints": 1,
+        "sprints": [
+            {"number": 1, "title": "S1", "goal": "g1", "deliverables": ["d1"],
+             "feature_ids": ["F-001"], "exit_criteria": ["e1"]},
+        ],
+    })
+    state = SprintState.load(fc)
+
+    with pytest.raises(RuntimeError, match="Generator requires .harness/accepted_sprints.json"):
+        state.required_run_context(1, owner="Generator")
 
 
 def test_mark_sprint_in_progress(file_comm):

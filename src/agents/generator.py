@@ -11,6 +11,7 @@ from src.agents.sdk_runner import (
 )
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.sprint_state import SprintState
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
 from src.prompts.grading import criterion_threshold
 from src.utils.logger import get_logger
@@ -119,31 +120,6 @@ def _describe_failures(grades: dict[str, Any], sprint_context: dict[str, Any]) -
             lines.append(f"- {fid}: {notes}")
 
     return "\n".join(lines) if lines else "(no specific failures found in previous grades)"
-
-
-def _get_sprint_context(file_comm: FileComm, sprint_num: int) -> dict:
-    sprint_plan = file_comm.read_sprint_plan()
-    if sprint_plan is None:
-        raise RuntimeError("Generator requires .harness/sprint_plan.json, but it was not found.")
-
-    sprints = sprint_plan.get("sprints")
-    if not isinstance(sprints, list):
-        raise RuntimeError("Generator found invalid .harness/sprint_plan.json: sprints must be an array.")
-
-    for sprint in sprints:
-        if isinstance(sprint, dict) and sprint.get("number") == sprint_num:
-            return sprint
-
-    raise RuntimeError(f"Generator could not find sprint {sprint_num} in .harness/sprint_plan.json.")
-
-
-def _get_accepted_sprints(file_comm: FileComm) -> dict:
-    accepted_sprints = file_comm.read_accepted_sprints()
-    if accepted_sprints is None:
-        raise RuntimeError(
-            "Generator requires .harness/accepted_sprints.json, but it was not found."
-        )
-    return accepted_sprints
 
 
 def _design_required_reads(file_comm: FileComm) -> list[str]:
@@ -375,15 +351,17 @@ async def run_generator(
     )
     _ensure_local_claude_skills(workdir)
 
-    sprint_context = _get_sprint_context(file_comm, sprint_num)
-    accepted_sprints = _get_accepted_sprints(file_comm)
+    sprint_run_context = SprintState.load(file_comm).required_run_context(
+        sprint_num,
+        owner="Generator",
+    )
     user_msg = _build_generator_prompt(
         mode=mode,
         file_comm=file_comm,
         round_num=round_num,
         sprint_num=sprint_num,
-        sprint_context=sprint_context,
-        accepted_sprints=accepted_sprints,
+        sprint_context=sprint_run_context.sprint_context,
+        accepted_sprints=sprint_run_context.accepted_sprints,
     )
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
