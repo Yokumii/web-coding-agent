@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,7 @@ from src.agents.visual_review import (
     render_feedback_from_grades,
 )
 from src.config import HarnessConfig
+from src.orchestration.checkpoints import CheckpointTransaction
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
 from src.orchestration.git_journal import commit_round
@@ -80,37 +80,13 @@ def _record_phase_stats(
     return completed
 
 
-def _save_checkpoint(
-    ctx: HarnessContext,
-    phase: str,
-    round_num: int,
-    *,
-    current_sprint: int | None = None,
-    generator_mode: str | None = None,
-    last_verdict: str | None = None,
-    accepted_sprints_payload: dict[str, Any] | None = None,
-    design_metadata: dict[str, Any] | None = None,
-) -> None:
-    """写入 harness 检查点。"""
-    if accepted_sprints_payload is None:
-        accepted_sprints_payload = ctx.file_comm.read_accepted_sprints() or {}
-    state = {
-        "last_completed_phase": phase,
-        "round_num": round_num,
-        "prompt": ctx.user_prompt,
-        "costs": ctx.cost_tracker.breakdown.copy(),
-        "phase_metrics": ctx.phase_metrics,
-        "current_sprint": current_sprint,
-        "generator_mode": generator_mode,
-        "accepted_sprints": accepted_sprints_payload.get("accepted", []),
-        "accepted_sprints_payload": accepted_sprints_payload,
-        "last_verdict": last_verdict,
-        "timestamp": datetime.now().isoformat(),
-    }
-    if design_metadata:
-        state.update(design_metadata)
-    ctx.file_comm.write_state(state)
-    logger.debug(f"Checkpoint saved: {phase} (round {round_num})")
+def _checkpoint_transaction(ctx: HarnessContext) -> CheckpointTransaction:
+    return CheckpointTransaction(
+        file_comm=ctx.file_comm,
+        prompt=ctx.user_prompt,
+        costs=ctx.cost_tracker.breakdown,
+        phase_metrics=ctx.phase_metrics,
+    )
 
 
 # ---- Planner 阶段 ----
@@ -124,20 +100,14 @@ async def run_planner_phase(ctx: HarnessContext) -> None:
     async with safe_sdk_session(phase_name="planner"):
         raw_stats = await run_planner(ctx.config, ctx.user_prompt, ctx.file_comm, ctx.workdir)
         _record_phase_stats(ctx, "planner", _coerce_stats(raw_stats), started_at=started)
-        _save_checkpoint(ctx, "plan", 0, last_verdict="planned")
+        _checkpoint_transaction(ctx).record_plan_completed()
 
 
 async def run_design_phase(ctx: HarnessContext) -> dict[str, Any]:
     """执行 design 阶段，并在完成后写入检查点。"""
     logger.info("[bold magenta]PHASE 2: DESIGN")
     result = await run_design_stage(ctx.config, ctx.file_comm, ctx.workdir)
-    _save_checkpoint(
-        ctx,
-        "design",
-        0,
-        last_verdict=result.metadata.get("design_status"),
-        design_metadata=result.metadata,
-    )
+    _checkpoint_transaction(ctx).record_design_completed(result.metadata)
     return result.metadata
 
 
@@ -255,11 +225,10 @@ async def run_build_phase(
         )
         _record_build_log(ctx, commit_result, round_num, sprint_num, mode)
 
-        _save_checkpoint(
-            ctx, f"build_r{round_num}", round_num,
+        _checkpoint_transaction(ctx).record_build_completed(
+            round_num=round_num,
             current_sprint=sprint_num,
             generator_mode=mode,
-            last_verdict="awaiting_review",
         )
 
 
@@ -396,28 +365,11 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
 
     ctx.sprint_state.mark_sprint_outcome(sprint_num, recommendation=recommendation, grades=grades)
 
-    # 先在内存中计算 accepted_sprints 的下一版内容，确保检查点先落盘。
-    # 如果两次写入之间进程中断，恢复执行时可用检查点中的 payload 重建。
-    next_payload = ctx.sprint_state.compute_advance(
-        sprint_num=sprint_num, round_num=round_num, recommendation=recommendation,
-    )
-
-    last_verdict = (
-        "completed" if recommendation == "complete"
-        else "accepted_review" if recommendation == "generate_next_sprint"
-        else "failed_review"
-    )
-    _save_checkpoint(
-        ctx, f"evaluate_r{round_num}", round_num,
-        current_sprint=sprint_num,
-        generator_mode="repair" if recommendation == "repair" else "generate",
-        last_verdict=last_verdict,
-        accepted_sprints_payload=next_payload,
-    )
-
-    # 再更新 accepted_sprints.json，本地文件与检查点由此保持同一推进顺序。
-    ctx.sprint_state.advance(
-        sprint_num=sprint_num, round_num=round_num, recommendation=recommendation,
+    _checkpoint_transaction(ctx).record_evaluate_completed(
+        sprint_state=ctx.sprint_state,
+        round_num=round_num,
+        sprint_num=sprint_num,
+        recommendation=recommendation,
     )
 
     return _build_verdict(recommendation)

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import HarnessConfig
+from src.orchestration.checkpoints import ResumeError, restore_resume_state
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
 from src.orchestration.phases import (
@@ -21,10 +22,6 @@ from src.orchestration.sprint_state import SprintState
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-class ResumeError(RuntimeError):
-    """恢复执行时，检查点状态无法与当前目录协调时抛出。"""
 
 
 def _is_planner_checkpoint(phase: str | None) -> bool:
@@ -49,7 +46,7 @@ async def run_harness(
     if resume and existing_state:
         user_prompt = existing_state.get("prompt", user_prompt)
         _restore_costs(cost_tracker, existing_state.get("costs", {}))
-        _restore_resume_state(file_comm, existing_state)
+        restore_resume_state(file_comm, existing_state)
         phase_metrics = _copy_metrics(existing_state.get("phase_metrics"))
         skip_until_phase = existing_state.get("last_completed_phase")
         logger.info(f"[bold]Harness resuming[/] from '{skip_until_phase}'")
@@ -214,18 +211,6 @@ def _verdict_from_state(state: dict[str, Any] | None) -> Verdict:
     if last == "accepted_review":
         return Verdict.accepted_review
     return Verdict.failed_review
-
-
-def _restore_resume_state(file_comm: FileComm, state: dict[str, Any]) -> None:
-    """用检查点中的 accepted_sprints 内容恢复当前目录状态。"""
-    payload = state.get("accepted_sprints_payload")
-    if not isinstance(payload, dict) or "accepted" not in payload:
-        raise ResumeError(
-            "harness_state.json was written by an older version of this tool; "
-            "delete the workdir's .harness/ directory and start a fresh run."
-        )
-    if file_comm.read_accepted_sprints() != payload:
-        file_comm.write_accepted_sprints(payload)
 
 
 def _print_summary(cost: CostTracker, elapsed: float, rounds: int, success: bool) -> None:
