@@ -11,6 +11,7 @@ from src.agents.sdk_runner import (
 )
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.round_artifacts import RoundArtifacts
 from src.orchestration.sprint_state import SprintState
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
 from src.prompts.grading import criterion_threshold
@@ -24,13 +25,6 @@ _LOCAL_CLAUDE_SKILLS_DIR = _REPO_ROOT / ".claude" / "skills"
 _GENERATE_REQUIRED_READS = (
     ".harness/sprint_plan.json",
     ".harness/feature_list.json",
-    ".harness/design_tokens.json",
-    ".harness/accepted_sprints.json",
-)
-_REPAIR_REQUIRED_READS = (
-    ".harness/feedback_round_{feedback_round}.md",
-    ".harness/grade_round_{feedback_round}.json",
-    ".harness/sprint_plan.json",
     ".harness/design_tokens.json",
     ".harness/accepted_sprints.json",
 )
@@ -203,6 +197,7 @@ def _build_generator_prompt(
     accepted_sprints: dict,
 ) -> str:
     """构造 generator 单轮提示词，按 generate/repair 两种模式切换细节。"""
+    round_artifacts = RoundArtifacts(file_comm, round_num)
     accepted = accepted_sprints.get("accepted", [])
     feature_ids = ", ".join(sprint_context.get("feature_ids", []))
     common_lines = [
@@ -217,14 +212,7 @@ def _build_generator_prompt(
     if mode == "generate":
         required_reads = list(_GENERATE_REQUIRED_READS)
         required_reads.extend(_design_required_reads(file_comm))
-        previous_round = round_num - 1
-        if previous_round >= 1:
-            previous_feedback = file_comm.dir / f"feedback_round_{previous_round}.md"
-            previous_grades = file_comm.dir / f"grade_round_{previous_round}.json"
-            if previous_feedback.exists():
-                required_reads.append(f".harness/{previous_feedback.name}")
-            if previous_grades.exists():
-                required_reads.append(f".harness/{previous_grades.name}")
+        required_reads.extend(round_artifacts.previous_existing_refs())
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
         deliverables = "\n".join(f"- {item}" for item in sprint_context.get("deliverables", []))
         exit_criteria = "\n".join(f"- {item}" for item in sprint_context.get("exit_criteria", []))
@@ -253,20 +241,26 @@ def _build_generator_prompt(
         )
     else:
         feedback_round = round_num - 1
+        previous_artifacts = RoundArtifacts(file_comm, feedback_round)
         previous_grades = file_comm.read_grades(feedback_round)
         if previous_grades is None:
             raise RuntimeError(
-                f"Generator repair mode requires .harness/grade_round_{feedback_round}.json "
+                f"Generator repair mode requires {previous_artifacts.grade_ref} "
                 f"from the previous round, but it was not found. The previous round may "
                 f"have crashed before writing grades."
             )
         failures_text = _describe_failures(previous_grades, sprint_context)
         design_guidance = _build_design_stage_guidance(file_comm)
         design_guidance_block = f"{design_guidance}\n\n" if design_guidance else ""
-        required_reads_text = "\n".join(
-            f"- {path.format(feedback_round=feedback_round, round_num=round_num)}"
-            for path in (*_REPAIR_REQUIRED_READS, *_design_required_reads(file_comm))
-        )
+        required_reads = [
+            previous_artifacts.feedback_ref,
+            previous_artifacts.grade_ref,
+            ".harness/sprint_plan.json",
+            ".harness/design_tokens.json",
+            ".harness/accepted_sprints.json",
+            *_design_required_reads(file_comm),
+        ]
+        required_reads_text = "\n".join(f"- {path}" for path in required_reads)
         mode_lines = [
             "Repair Scope: Fix evaluator-reported issues for the current sprint only\n"
             f"Required Reads:\n{required_reads_text}\n\n"
@@ -284,7 +278,7 @@ def _build_generator_prompt(
             f"Allowed examples: `ls frontend/src`, `grep -n \"pattern\" frontend/src/App.jsx`, "
             f"`npm install --prefix frontend`, `npm --prefix frontend run build`, "
             f"`cd frontend && npm run build`, `find frontend/src -type f | head -40`, "
-            f"`head -20 .harness/grade_round_{feedback_round}.json`.\n"
+            f"`head -20 {previous_artifacts.grade_ref}`.\n"
         )
         build_log_instruction = (
             "When done, update `.harness/build_log.md` with round, sprint, mode, addressed issues, "
@@ -372,7 +366,7 @@ async def run_generator(
         system_prompt=GENERATOR_SYSTEM_PROMPT,
         max_turns=config.generator_max_turns,
         allow_bash=True,
-        trace_path=file_comm.dir / "traces" / f"generator_round_{round_num}.jsonl",
+        trace_path=RoundArtifacts(file_comm, round_num).trace_path("generator"),
     )
 
     _validate_generator_outputs(file_comm, workdir, (result.result or "").strip())

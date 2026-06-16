@@ -24,6 +24,7 @@ from src.orchestration.checkpoints import CheckpointTransaction
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
 from src.orchestration.git_journal import commit_round
+from src.orchestration.round_artifacts import RoundArtifacts
 from src.orchestration.runtime import start_app_stack
 from src.orchestration.sprint_state import SprintState
 from src.utils.logger import get_logger
@@ -308,14 +309,15 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
         finally:
             await app_stack.close()
 
+    round_artifacts = RoundArtifacts(ctx.file_comm, round_num)
     visual_manifest = ctx.file_comm.read_visual_manifest(round_num)
     if not visual_manifest:
-        matches = sorted(ctx.file_comm.dir.glob(f"visual_round_{round_num}_*.png"))
-        if matches:
+        screenshot_refs = round_artifacts.visual_screenshot_refs(manifest=None)
+        if screenshot_refs:
             visual_manifest = {
                 "round": round_num,
                 "app_url": "",
-                "screenshots": [f".harness/{p.name}" for p in matches],
+                "screenshots": screenshot_refs,
                 "notes": "",
             }
 

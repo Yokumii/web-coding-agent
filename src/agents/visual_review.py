@@ -7,6 +7,7 @@ from src.agents.sdk_runner import AgentRunStats
 from src.agents.vision_scorer import normalize_visual_review, run_visual_appearance_review
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.round_artifacts import RoundArtifacts
 from src.prompts.grading import apply_visual_review_scores, visual_review_failure
 from src.utils.logger import get_logger
 
@@ -20,24 +21,10 @@ def discover_visual_screenshots(
     grades: dict[str, Any] | None = None,
 ) -> list[str]:
     """按 manifest、既有 grades、文件兜底三层顺序收集截图列表。"""
-    if isinstance(manifest, dict):
-        screenshots = manifest.get("screenshots")
-        if isinstance(screenshots, list):
-            normalized = [str(item).strip() for item in screenshots if str(item).strip()]
-            if normalized:
-                return normalized
-
-    if isinstance(grades, dict):
-        appearance_review = grades.get("appearance_review")
-        if isinstance(appearance_review, dict):
-            screenshots = appearance_review.get("screenshots")
-            if isinstance(screenshots, list):
-                normalized = [str(item).strip() for item in screenshots if str(item).strip()]
-                if normalized:
-                    return normalized
-
-    matches = sorted(file_comm.dir.glob(f"visual_round_{round_num}_*.png"))
-    return [f".harness/{path.name}" for path in matches]
+    return RoundArtifacts(file_comm, round_num).visual_screenshot_refs(
+        manifest=manifest,
+        grades=grades,
+    )
 
 
 async def apply_dedicated_visual_review(

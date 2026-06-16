@@ -8,6 +8,7 @@ from src.agents._shared import expose_local_claude_skills
 from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.round_artifacts import RoundArtifacts
 from src.orchestration.sprint_state import SprintRunContext, SprintState
 from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
 from src.prompts.grading import determine_passed as _determine_passed
@@ -38,23 +39,20 @@ def _ensure_local_claude_skills(workdir: Path) -> None:
     expose_local_claude_skills(workdir, _LOCAL_CLAUDE_SKILLS_DIR)
 
 
-def _build_visual_capture_requirements(*, round_num: int, app_url: str) -> list[str]:
+def _build_visual_capture_requirements(*, artifacts: RoundArtifacts, app_url: str) -> list[str]:
     """构造 Phase C 所需的截图与 manifest 写入要求。"""
+    home_ref, mid_ref, bottom_ref = artifacts.visual_capture_refs
     return [
         "Phase C: Deferred Visual Review Capture",
-        f"- During this evaluator run, capture `.harness/visual_round_{round_num}_home.png` at the top of the page.",
-        f"- If the page meaningfully scrolls, also capture `.harness/visual_round_{round_num}_mid.png` from a middle section.",
-        f"- If the page meaningfully scrolls, also capture `.harness/visual_round_{round_num}_bottom.png` near the bottom section.",
-        f"- Write `.harness/visual_manifest_round_{round_num}.json` with this schema:",
+        f"- During this evaluator run, capture `{home_ref}` at the top of the page.",
+        f"- If the page meaningfully scrolls, also capture `{mid_ref}` from a middle section.",
+        f"- If the page meaningfully scrolls, also capture `{bottom_ref}` near the bottom section.",
+        f"- Write `{artifacts.visual_manifest_ref}` with this schema:",
         json.dumps(
             {
-                "round": round_num,
+                "round": artifacts.round_num,
                 "app_url": app_url,
-                "screenshots": [
-                    f".harness/visual_round_{round_num}_home.png",
-                    f".harness/visual_round_{round_num}_mid.png",
-                    f".harness/visual_round_{round_num}_bottom.png",
-                ],
+                "screenshots": artifacts.visual_capture_refs,
                 "notes": "short paragraph describing what was captured",
             },
             indent=2,
@@ -102,7 +100,7 @@ async def run_evaluator(
         allow_bash=True,
         bash_profile="read_only",
         allow_playwright=True,
-        trace_path=file_comm.dir / "traces" / f"evaluator_round_{round_num}.jsonl",
+        trace_path=RoundArtifacts(file_comm, round_num).trace_path("evaluator"),
     )
 
     grades = file_comm.read_grades(round_num)
@@ -138,16 +136,10 @@ def _build_evaluator_prompt(
     sprint_run_context: SprintRunContext,
     app_url: str,
 ) -> str:
-    previous_round = round_num - 1
+    round_artifacts = RoundArtifacts(file_comm, round_num)
     required_reads = list(_EVALUATOR_REQUIRED_READS)
     required_reads.extend(_design_required_reads(file_comm))
-    if previous_round >= 1:
-        previous_feedback = file_comm.dir / f"feedback_round_{previous_round}.md"
-        previous_grades = file_comm.dir / f"grade_round_{previous_round}.json"
-        if previous_feedback.exists():
-            required_reads.append(f".harness/{previous_feedback.name}")
-        if previous_grades.exists():
-            required_reads.append(f".harness/{previous_grades.name}")
+    required_reads.extend(round_artifacts.previous_existing_refs())
 
     sprint_context = sprint_run_context.sprint_context
     accepted_sprints = sprint_run_context.accepted_sprints
@@ -221,11 +213,11 @@ def _build_evaluator_prompt(
         "5. Phase E: Score Aggregation And Verdict",
         "",
         "Output Files:",
-        f"1. .harness/feedback_round_{round_num}.md",
-        f"2. .harness/grade_round_{round_num}.json",
-        f"3. .harness/visual_manifest_round_{round_num}.json",
+        f"1. {round_artifacts.feedback_ref}",
+        f"2. {round_artifacts.grade_ref}",
+        f"3. {round_artifacts.visual_manifest_ref}",
         "",
-        *_build_visual_capture_requirements(round_num=round_num, app_url=app_url),
+        *_build_visual_capture_requirements(artifacts=round_artifacts, app_url=app_url),
         "",
         *(
             [
