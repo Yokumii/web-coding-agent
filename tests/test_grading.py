@@ -2,7 +2,15 @@ import math
 
 import pytest
 
-from src.prompts.grading import CRITERIA, check_grades
+from src.prompts.grading import (
+    CRITERIA,
+    VISION_OWNED_CRITERIA,
+    apply_visual_review_scores,
+    check_grades,
+    criterion_threshold,
+    determine_passed,
+    visual_review_failure,
+)
 
 
 def test_all_pass():
@@ -103,3 +111,73 @@ def test_check_grades_handles_non_dict_score_data():
         },
     }
     assert check_grades(grades) is False
+
+
+def test_criterion_threshold_returns_configured_value_or_default():
+    assert criterion_threshold("design_quality") == 6.0
+    assert criterion_threshold("unknown", default=6.0) == 6.0
+
+
+def test_determine_passed_rejects_failed_critical_ui_check_without_overall_flag():
+    grades = _grades_with(7.0)
+    grades["ui_checks"] = [
+        {
+            "critical": True,
+            "status": "partial",
+        }
+    ]
+
+    assert determine_passed(grades) is False
+
+
+def test_determine_passed_rejects_failed_critical_exit_criterion_without_overall_flag():
+    grades = _grades_with(7.0)
+    grades["target_exit_criteria_results"] = [
+        {
+            "critical": "yes",
+            "passed": "failed",
+        }
+    ]
+
+    assert determine_passed(grades) is False
+
+
+def test_visual_review_failure_marks_visual_criteria_and_repair():
+    grades = _grades_with(7.0)
+    grades["sprint_passed"] = True
+    grades["mode_recommendation"] = "complete"
+
+    failed = visual_review_failure(grades, "no screenshots available")
+
+    assert failed["overall_passed"] is False
+    assert failed["mode_recommendation"] == "repair"
+    assert failed["sprint_passed"] is False
+    assert failed["phase_results"]["appearance"] == "fail"
+    for name in VISION_OWNED_CRITERIA:
+        assert failed["criteria"][name]["score"] == 0.0
+        assert failed["criteria"][name]["passed"] is False
+    assert grades["mode_recommendation"] == "complete"
+
+
+def test_apply_visual_review_scores_recomputes_overall_passed():
+    grades = _grades_with(7.0)
+    grades["overall_passed"] = True
+    grades["mode_recommendation"] = "complete"
+    normalized = {
+        "phase_result": "pass",
+        "appearance_review": {"screenshots": ["home.png"], "notes": "ok"},
+        "criteria_scores": {
+            "design_quality": {"score": 7.0, "notes": "ok"},
+            "originality": {"score": 6.0, "notes": "ok"},
+            "craft": {"score": 5.0, "notes": "below threshold"},
+        },
+    }
+
+    merged = apply_visual_review_scores(grades, normalized)
+
+    assert merged["phase_results"]["appearance"] == "pass"
+    assert merged["appearance_review"]["screenshots"] == ["home.png"]
+    assert merged["criteria"]["craft"]["passed"] is False
+    assert merged["overall_passed"] is False
+    assert merged["mode_recommendation"] == "repair"
+    assert grades["overall_passed"] is True

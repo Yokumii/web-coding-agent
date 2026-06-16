@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -8,16 +7,10 @@ from src.agents.sdk_runner import AgentRunStats
 from src.agents.vision_scorer import normalize_visual_review, run_visual_appearance_review
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
-from src.prompts.grading import CRITERIA, check_grades
+from src.prompts.grading import apply_visual_review_scores, visual_review_failure
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
-_CRITERION_THRESHOLDS = {criterion.name: criterion.threshold for criterion in CRITERIA}
-
-
-def _criterion_threshold(name: str) -> float:
-    """读取评分项阈值；未知名称按 0 处理。"""
-    return _CRITERION_THRESHOLDS.get(name, 0.0)
 
 
 def discover_visual_screenshots(
@@ -47,40 +40,6 @@ def discover_visual_screenshots(
     return [f".harness/{path.name}" for path in matches]
 
 
-_VISION_OWNED_CRITERIA = ("design_quality", "originality", "craft")
-
-
-def _force_visual_review_failure(
-    grades: dict[str, Any], reason: str
-) -> dict[str, Any]:
-    """复制 grades，并把视觉评分负责的字段统一标记为失败。"""
-    merged = json.loads(json.dumps(grades))
-
-    phase_results = merged.setdefault("phase_results", {})
-    if isinstance(phase_results, dict):
-        phase_results["appearance"] = "fail"
-
-    criteria = merged.setdefault("criteria", {})
-    if isinstance(criteria, dict):
-        for name in _VISION_OWNED_CRITERIA:
-            criteria[name] = {
-                "score": 0.0,
-                "passed": False,
-                "notes": f"vision scorer unavailable: {reason}",
-            }
-
-    appearance = merged.setdefault("appearance_review", {})
-    if isinstance(appearance, dict):
-        appearance.setdefault("screenshots", [])
-        appearance["notes"] = f"Visual review failed: {reason}"
-
-    merged["overall_passed"] = False
-    merged["mode_recommendation"] = "repair"
-    if merged.get("sprint_passed") is True:
-        merged["sprint_passed"] = False
-    return merged
-
-
 async def apply_dedicated_visual_review(
     *,
     config: HarnessConfig,
@@ -99,7 +58,7 @@ async def apply_dedicated_visual_review(
             f"[bold yellow]Visual review[/] round {round_num} found no screenshots; "
             f"failing the appearance phase closed"
         )
-        return _force_visual_review_failure(grades, "no screenshots available"), None
+        return visual_review_failure(grades, "no screenshots available"), None
 
     try:
         review, vision_stats = await run_visual_appearance_review(
@@ -115,31 +74,10 @@ async def apply_dedicated_visual_review(
             f"[bold yellow]Visual review[/] round {round_num} failed; "
             f"failing the appearance phase closed: {exc}"
         )
-        return _force_visual_review_failure(grades, str(exc)), None
+        return visual_review_failure(grades, str(exc)), None
 
     normalized = normalize_visual_review(review, screenshot_paths)
-    merged = json.loads(json.dumps(grades))
-    phase_results = merged.setdefault("phase_results", {})
-    if isinstance(phase_results, dict):
-        phase_results["appearance"] = normalized["phase_result"]
-
-    merged["appearance_review"] = normalized["appearance_review"]
-    criteria = merged.setdefault("criteria", {})
-    if isinstance(criteria, dict):
-        for name, value in normalized["criteria_scores"].items():
-            threshold = _criterion_threshold(name)
-            criteria[name] = {
-                "score": value["score"],
-                "passed": value["score"] >= threshold,
-                "notes": value["notes"],
-            }
-
-    merged["overall_passed"] = check_grades(merged)
-    if merged["overall_passed"] is False:
-        merged["mode_recommendation"] = "repair"
-        if merged.get("sprint_passed") is True:
-            merged["sprint_passed"] = False
-    return merged, vision_stats
+    return apply_visual_review_scores(grades, normalized), vision_stats
 
 
 def render_feedback_from_grades(grades: dict[str, Any]) -> str:

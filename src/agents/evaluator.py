@@ -9,7 +9,7 @@ from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
-from src.prompts.grading import check_grades
+from src.prompts.grading import determine_passed as _determine_passed
 from src.utils.llm_json import extract_json_object
 from src.utils.logger import get_logger
 
@@ -317,75 +317,6 @@ def _build_evaluator_prompt(
         "Treat `.` as the workdir root.",
     ]
     return "\n".join(lines)
-
-
-def _determine_passed(grades: dict[str, Any] | None) -> bool:
-    """按关键字段与评分阈值综合判断当前轮是否通过。"""
-    if not grades:
-        return False
-
-    if _parse_tristate(grades.get("sprint_passed")) is False:
-        return False
-
-    if _has_failed_critical_ui_checks(grades):
-        return False
-
-    if _has_failed_critical_exit_criteria(grades):
-        return False
-
-    overall_passed = _parse_tristate(grades.get("overall_passed"))
-    if overall_passed is not None:
-        return overall_passed and check_grades(grades)
-
-    return check_grades(grades)
-
-
-_TRUTHY_STRINGS = frozenset({"true", "yes", "1", "y", "t", "pass", "passed", "ok"})
-_FALSEY_STRINGS = frozenset({"false", "no", "0", "n", "f", "fail", "failed"})
-_FAIL_STATUSES = frozenset({"fail", "failed", "partial"})
-
-
-def _parse_tristate(value: Any) -> bool | None:
-    """将 agent 输出解析为 True / False / 未知 三态值。
-
-    兼容布尔字符串与 0/1 数值；含义仍不明确时返回 ``None``。
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and not isinstance(value, bool):
-        if value in (0, 1):
-            return bool(value)
-        return None
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in _TRUTHY_STRINGS:
-            return True
-        if normalized in _FALSEY_STRINGS:
-            return False
-    return None
-
-
-def _has_failed_critical_ui_checks(grades: dict[str, Any]) -> bool:
-    for check in grades.get("ui_checks", []):
-        if not isinstance(check, dict):
-            continue
-        if _parse_tristate(check.get("critical")) is not True:
-            continue
-        status = str(check.get("status", "")).strip().lower()
-        if status in _FAIL_STATUSES:
-            return True
-    return False
-
-
-def _has_failed_critical_exit_criteria(grades: dict[str, Any]) -> bool:
-    for result in grades.get("target_exit_criteria_results", []):
-        if not isinstance(result, dict):
-            continue
-        if _parse_tristate(result.get("critical")) is not True:
-            continue
-        if _parse_tristate(result.get("passed")) is False:
-            return True
-    return False
 
 
 _GRADE_LIKE_KEYS = ("criteria", "phase_results", "round")

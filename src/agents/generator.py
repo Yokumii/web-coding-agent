@@ -12,7 +12,7 @@ from src.agents.sdk_runner import (
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
-from src.prompts.grading import CRITERIA
+from src.prompts.grading import criterion_threshold
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -39,9 +39,6 @@ _DESIGN_REQUIRED_READS = (
     ".harness/design/asset_manifest.json",
 )
 
-# 各评分项的及格线统一来自 prompts.grading，避免多处维护。
-_CRITERIA_THRESHOLDS: dict[str, float] = {c.name: c.threshold for c in CRITERIA}
-
 
 def _ensure_local_claude_skills(workdir: Path) -> None:
     """将仓库内置 skills 暴露到 generator 的工作目录。"""
@@ -67,7 +64,7 @@ def _describe_failures(grades: dict[str, Any], sprint_context: dict[str, Any]) -
         for name, payload in criteria.items():
             if not isinstance(payload, dict):
                 continue
-            threshold = _CRITERIA_THRESHOLDS.get(name, 6)
+            threshold = criterion_threshold(name, default=6.0)
             score = payload.get("score")
             if isinstance(score, bool):
                 continue
