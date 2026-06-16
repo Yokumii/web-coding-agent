@@ -10,6 +10,7 @@ from src.agents.sdk_runner import (
     run_sdk_agent,
 )
 from src.config import HarnessConfig
+from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.file_comm import FileComm
 from src.orchestration.round_artifacts import RoundArtifacts
 from src.orchestration.sprint_state import SprintState
@@ -27,11 +28,6 @@ _GENERATE_REQUIRED_READS = (
     ".harness/feature_list.json",
     ".harness/design_tokens.json",
     ".harness/accepted_sprints.json",
-)
-_DESIGN_REQUIRED_READS = (
-    ".harness/design/design_brief.json",
-    ".harness/design/layout_contract.json",
-    ".harness/design/asset_manifest.json",
 )
 
 
@@ -116,77 +112,6 @@ def _describe_failures(grades: dict[str, Any], sprint_context: dict[str, Any]) -
     return "\n".join(lines) if lines else "(no specific failures found in previous grades)"
 
 
-def _design_required_reads(file_comm: FileComm) -> list[str]:
-    if file_comm.read_design_brief() is None:
-        return []
-    return list(_DESIGN_REQUIRED_READS)
-
-
-def _build_design_stage_guidance(file_comm: FileComm) -> str:
-    design_brief = file_comm.read_design_brief()
-    if design_brief is None:
-        return ""
-
-    visual_strategy = str(design_brief.get("visual_strategy", "")).strip()
-    aesthetic_intent = design_brief.get("aesthetic_intent")
-    lines = [
-        "Design Stage Guidance:",
-        "- Read the design-stage artifacts before making layout decisions.",
-        "- Treat `layout_contract.json` as the source of semantic overlay regions, responsive behavior, and safe zones.",
-        "- Treat `asset_manifest.json` as the source of which raster assets are production assets and where they should be copied.",
-    ]
-    if isinstance(aesthetic_intent, dict):
-        hypothesis = str(aesthetic_intent.get("design_hypothesis", "")).strip()
-        preserve = [
-            str(item).strip()
-            for item in aesthetic_intent.get("distinctive_features_to_preserve", []) or []
-            if str(item).strip()
-        ]
-        avoid = [
-            str(item).strip()
-            for item in aesthetic_intent.get("generic_patterns_to_avoid", []) or []
-            if str(item).strip()
-        ]
-        if hypothesis:
-            lines.append(f"- Preserve the design hypothesis: {hypothesis}")
-        if preserve:
-            lines.append(
-                "- Preserve the authored visual traits declared in the design brief: "
-                + "; ".join(preserve)
-                + "."
-            )
-        if avoid:
-            lines.append(
-                "- Do not collapse the implementation back into these generic patterns: "
-                + "; ".join(avoid)
-                + "."
-            )
-    if visual_strategy == "image_backed_ui":
-        lines.extend(
-            [
-                "- Preserve the approved composition using the design contract and asset manifest.",
-                "- Keep user-visible text and interactive controls as semantic HTML overlays.",
-                "- Copy required production assets from `.harness/design/` into the frontend project before referencing them in code.",
-                "- Use the image layer for composition, material, and texture; rebuild all functional labels, controls, and state in HTML.",
-            ]
-        )
-    elif visual_strategy == "concept_reference_only":
-        lines.extend(
-            [
-                "- Use the approved concept as a visual reference only; do not embed it as production UI.",
-                "- Preserve its hierarchy and composition while rebuilding all user-visible text and controls as semantic HTML.",
-                "- Do not assume a text-free background asset exists unless `asset_manifest.json` declares one.",
-            ]
-        )
-    elif visual_strategy == "text_only_fallback":
-        lines.append(
-            "- The design stage fell back to text-only; continue from the planning artifacts without assuming image assets exist."
-        )
-    else:
-        lines.append("- Follow the visual strategy declared in `design_brief.json`.")
-    return "\n".join(lines)
-
-
 def _build_generator_prompt(
     *,
     mode: GeneratorMode,
@@ -198,6 +123,7 @@ def _build_generator_prompt(
 ) -> str:
     """构造 generator 单轮提示词，按 generate/repair 两种模式切换细节。"""
     round_artifacts = RoundArtifacts(file_comm, round_num)
+    design_contract = DesignContractContext.load(file_comm)
     accepted = accepted_sprints.get("accepted", [])
     feature_ids = ", ".join(sprint_context.get("feature_ids", []))
     common_lines = [
@@ -211,12 +137,12 @@ def _build_generator_prompt(
 
     if mode == "generate":
         required_reads = list(_GENERATE_REQUIRED_READS)
-        required_reads.extend(_design_required_reads(file_comm))
+        required_reads.extend(design_contract.required_refs())
         required_reads.extend(round_artifacts.previous_existing_refs())
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
         deliverables = "\n".join(f"- {item}" for item in sprint_context.get("deliverables", []))
         exit_criteria = "\n".join(f"- {item}" for item in sprint_context.get("exit_criteria", []))
-        design_guidance = _build_design_stage_guidance(file_comm)
+        design_guidance = design_contract.generator_guidance()
         design_guidance_block = f"{design_guidance}\n\n" if design_guidance else ""
         mode_lines = [
             f"Sprint Goal: {sprint_context.get('goal')}\n"
@@ -250,7 +176,7 @@ def _build_generator_prompt(
                 f"have crashed before writing grades."
             )
         failures_text = _describe_failures(previous_grades, sprint_context)
-        design_guidance = _build_design_stage_guidance(file_comm)
+        design_guidance = design_contract.generator_guidance()
         design_guidance_block = f"{design_guidance}\n\n" if design_guidance else ""
         required_reads = [
             previous_artifacts.feedback_ref,
@@ -258,7 +184,7 @@ def _build_generator_prompt(
             ".harness/sprint_plan.json",
             ".harness/design_tokens.json",
             ".harness/accepted_sprints.json",
-            *_design_required_reads(file_comm),
+            *design_contract.required_refs(),
         ]
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
         mode_lines = [

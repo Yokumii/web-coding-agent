@@ -9,6 +9,7 @@ from typing import Any
 
 from src.agents.sdk_runner import AgentRunStats
 from src.config import HarnessConfig
+from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.file_comm import FileComm
 from src.orchestration.pricing import estimate_cost_usd
 from src.prompts.evaluator_vision import EVALUATOR_VISION_SYSTEM_PROMPT
@@ -70,9 +71,7 @@ def _build_review_context(
     """将当前 sprint 的视觉审阅上下文整理为 JSON 文本。"""
     spec_text = file_comm.read_spec().strip()
     design_tokens = file_comm.read_design_tokens() or {}
-    design_brief = file_comm.read_design_brief()
-    layout_contract = file_comm.read_layout_contract()
-    asset_manifest = file_comm.read_asset_manifest()
+    design_contract = DesignContractContext.load(file_comm)
 
     payload = {
         "task": "Evaluate the visual appearance of the current sprint screenshots.",
@@ -108,14 +107,9 @@ def _build_review_context(
             "Return only valid JSON.",
         ],
     }
-    if design_brief is not None:
-        payload["design_contract"] = {
-            "visual_strategy": design_brief.get("visual_strategy"),
-            "aesthetic_intent": design_brief.get("aesthetic_intent"),
-            "reference_files": design_brief.get("reference_files"),
-            "layout_contract": layout_contract or {},
-            "asset_manifest": asset_manifest or {},
-        }
+    design_contract_payload = design_contract.vision_payload()
+    if design_contract_payload is not None:
+        payload["design_contract"] = design_contract_payload
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
