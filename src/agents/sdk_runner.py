@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -30,6 +31,7 @@ from src.utils.bash_policy import (
 )
 from src.utils.claude_http_trace import (
     capture_claude_http_traffic,
+    generate_claude_http_trace_html,
     resolve_claude_upstream_base_url,
 )
 from src.utils.sdk_session import _clear_current_task_cancellation
@@ -38,6 +40,7 @@ LOCAL_AGENT_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"}
 LOCAL_AGENT_TOOLS_WITH_BASH = LOCAL_AGENT_TOOLS | {"Bash"}
 PLAYWRIGHT_TOOL_PREFIX = "mcp__playwright__"
 _CLAUDE_SDK_SKIP_VERSION_CHECK = "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"
+log = logging.getLogger(__name__)
 _DEFAULT_CLAUDE_CODE_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
@@ -704,10 +707,12 @@ async def run_sdk_agent(
             _run_once(anthropic_base_url_override=proxy_base_url),
             name="run_sdk_agent",
         )
+        run_result: tuple[ResultMessage, float, str, list[Any]] | None = None
         try:
             while True:
                 try:
-                    return await asyncio.shield(agent_task)
+                    run_result = await asyncio.shield(agent_task)
+                    break
                 except asyncio.CancelledError:
                     cleared = _clear_current_task_cancellation()
                     if cleared == 0:
@@ -723,13 +728,33 @@ async def run_sdk_agent(
                     if agent_task.done():
                         break
 
-            if agent_task.cancelled():
-                raise RuntimeError("Agent SDK task was cancelled before completion")
+            if run_result is None:
+                if agent_task.cancelled():
+                    raise RuntimeError("Agent SDK task was cancelled before completion")
 
-            task_exc = agent_task.exception()
-            if task_exc is not None:
-                raise task_exc
-            return agent_task.result()
+                task_exc = agent_task.exception()
+                if task_exc is not None:
+                    raise task_exc
+                run_result = agent_task.result()
         finally:
             if not agent_task.done():
                 agent_task.cancel()
+
+    if http_trace_path is not None:
+        try:
+            http_trace_html_path = generate_claude_http_trace_html(http_trace_path)
+        except Exception as exc:
+            log.warning("failed to generate Claude HTTP trace HTML: %s", exc)
+        else:
+            if trace_writer:
+                trace_writer.write(
+                    "http_trace_html_generated",
+                    {
+                        "http_trace_path": str(http_trace_path),
+                        "http_trace_html_path": str(http_trace_html_path),
+                    },
+                )
+
+    if run_result is None:
+        raise RuntimeError("Agent SDK returned no result")
+    return run_result

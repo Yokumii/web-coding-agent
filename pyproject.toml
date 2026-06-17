@@ -22,6 +22,12 @@ where = ["."]
 include = ["src*"]
 namespaces = false
 
+[tool.setuptools.package-data]
+"src.utils" = ["claude_http_viewer.html", "claude_http_viewer_i18n.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",

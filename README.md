@@ -31,6 +31,7 @@ What is implemented:
 - Vision scorer transient-error retry (5xx and connection failures, exponential backoff with jitter)
 - Resume/checkpoint support across plan, build, and evaluate phases
 - JSONL traces for SDK-backed agent runs
+- Claude HTTP trace pairs for SDK-backed agent runs: `*.http.jsonl` remains the source trace, and `*.http.html` is generated beside it for browser inspection
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
 
@@ -175,6 +176,12 @@ The design stage supports three outcomes:
 - `image_backed_ui`: both images exist, so build uses the full image-backed contract
 - `concept_reference_only`: only `approved_concept.png` exists, so build uses it as visual reference without a production background asset
 - `text_only_fallback`: no usable image assets exist, so build proceeds from the textual design contract only
+
+## Trace Files
+
+Each SDK-backed agent run writes trace artifacts under the run workdir's `.harness/traces/` directory. The SDK trace is a JSONL file for harness events. Its paired Claude HTTP trace is named with the same prefix plus `.http.jsonl`, for example `planner.http.jsonl`, `generator_round_1.http.jsonl`, or `evaluator_round_1.http.jsonl`.
+
+After the HTTP JSONL file is closed, the harness also writes a same-prefix self-contained HTML file beside it, such as `planner.http.html`. The HTML file can be opened in a browser and provides a rich trace viewer with a turn sidebar, path filtering, theme and language controls, token and duration summaries, user messages, assistant text, tool use, thinking blocks, request JSON, response JSON, and SSE events. The JSONL file remains the source artifact.
 
 ## Quick Start
 

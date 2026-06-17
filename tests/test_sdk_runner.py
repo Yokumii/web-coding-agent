@@ -26,6 +26,7 @@ from src.orchestration.pricing import estimate_cost_usd
 from src.utils.claude_http_trace import (
     DEFAULT_ANTHROPIC_BASE_URL,
     capture_claude_http_traffic,
+    generate_claude_http_trace_html,
 )
 
 
@@ -447,6 +448,10 @@ async def test_capture_claude_http_traffic_records_streaming_response(tmp_path: 
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{proxy.base_url}/v1/messages",
+                    headers={
+                        "Authorization": "Bearer secret-token",
+                        "x-api-key": "secret-api-key",
+                    },
                     json={
                         "model": "claude-sonnet-4-6",
                         "stream": True,
@@ -465,6 +470,8 @@ async def test_capture_claude_http_traffic_records_streaming_response(tmp_path: 
     record = records[0]
     assert record["request"]["path"] == "/v1/messages"
     assert record["request"]["body"]["messages"][0]["content"] == "ping"
+    assert record["request"]["headers"]["Authorization"] == "Bearer secre..."
+    assert record["request"]["headers"]["x-api-key"] == "secret-api-k..."
     assert record["response"]["status"] == 200
     assert [event["event"] for event in record["response"]["sse_events"]] == [
         "message_start",
@@ -473,6 +480,140 @@ async def test_capture_claude_http_traffic_records_streaming_response(tmp_path: 
         "message_stop",
     ]
     assert record["upstream_base_url"] == upstream_url
+
+
+@pytest.mark.anyio
+async def test_capture_claude_http_traffic_rejects_unknown_paths(tmp_path: Path):
+    trace_path = tmp_path / "http_trace.jsonl"
+    async with capture_claude_http_traffic(
+        trace_path=trace_path,
+        target_url="http://127.0.0.1:9",
+    ) as proxy:
+        assert proxy is not None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{proxy.base_url}/metrics") as response:
+                assert response.status == 404
+                assert await response.text() == "Not Found"
+
+    assert trace_path.read_text(encoding="utf-8") == ""
+
+
+def test_generate_claude_http_trace_html_renders_core_debug_fields(tmp_path: Path):
+    trace_path = tmp_path / "planner.http.jsonl"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "turn": 2,
+                "duration_ms": 123,
+                "request": {
+                    "method": "POST",
+                    "path": "/v1/messages",
+                    "headers": {"authorization": "***"},
+                    "body": {
+                        "model": "claude-sonnet-4-6",
+                        "messages": [
+                            {"role": "user", "content": "Build the dashboard"}
+                        ],
+                    },
+                },
+                "response": {
+                    "status": 200,
+                    "body": {
+                        "content": [
+                            {"type": "text", "text": "Here is the plan"},
+                            {
+                                "type": "tool_use",
+                                "name": "Write",
+                                "input": {"file_path": "frontend/src/App.tsx"},
+                            },
+                            {"type": "thinking", "thinking": "Check layout first"},
+                        ],
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 20,
+                            "cache_read_input_tokens": 3,
+                            "cache_creation_input_tokens": 4,
+                        },
+                    },
+                    "sse_events": [
+                        {"event": "message_start", "data": {"type": "message_start"}}
+                    ],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    html_path = generate_claude_http_trace_html(trace_path)
+
+    assert html_path == tmp_path / "planner.http.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert "Claude HTTP Trace Viewer" in html
+    assert "sidebar" in html
+    assert "path-filter" in html
+    assert "theme-toggle" in html
+    assert "EMBEDDED_TRACE_DATA" in html
+    assert '"turn": 2' in html
+    assert "claude-sonnet-4-6" in html
+    assert '"status": 200' in html
+    assert '"duration_ms": 123' in html
+    assert '"input_tokens": 10' in html
+    assert '"output_tokens": 20' in html
+    assert "Build the dashboard" in html
+    assert "Here is the plan" in html
+    assert "Write" in html
+    assert "frontend/src/App.tsx" in html
+    assert "Check layout first" in html
+    assert "message_start" in html
+    assert "renderJSONTree" in html
+    assert "renderMessages" in html
+
+
+def test_generate_claude_http_trace_html_escapes_trace_content(tmp_path: Path):
+    trace_path = tmp_path / "generator.http.jsonl"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "turn": 1,
+                "duration_ms": 1,
+                "request": {
+                    "body": {
+                        "model": "claude-sonnet-4-6",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": '<script>alert("x")</script><b>bold</b>',
+                            }
+                        ],
+                    }
+                },
+                "response": {
+                    "status": 200,
+                    "body": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": '<img src=x onerror="alert(1)">',
+                            }
+                        ],
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    html_path = generate_claude_http_trace_html(trace_path)
+    html = html_path.read_text(encoding="utf-8")
+
+    assert '<script>alert("x")</script>' not in html
+    assert '<\\/script>' in html
+    assert '<img src=x onerror=\\"alert(1)\\">' in html
+    assert "EMBEDDED_TRACE_DATA" in html
 
 
 def test_build_agent_run_stats_extracts_usage_and_serializes_wall_time():
@@ -659,6 +800,73 @@ async def test_run_sdk_agent_routes_base_url_through_http_trace_proxy(
     assert run_start["http_trace_path"] == str(tmp_path / "trace.http.jsonl")
     assert run_start["upstream_base_url"] == DEFAULT_ANTHROPIC_BASE_URL
     assert run_start["proxy_base_url"] == "http://127.0.0.1:43123"
+    assert (tmp_path / "trace.http.html").exists()
+    html_event = next(
+        record for record in records if record["event"] == "http_trace_html_generated"
+    )
+    assert html_event["http_trace_path"] == str(tmp_path / "trace.http.jsonl")
+    assert html_event["http_trace_html_path"] == str(tmp_path / "trace.http.html")
+
+
+@pytest.mark.anyio
+async def test_run_sdk_agent_warns_when_http_trace_html_generation_fails(
+    monkeypatch,
+    caplog,
+    tmp_path: Path,
+):
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_capture_claude_http_traffic(*, trace_path, target_url):
+        del target_url
+        assert trace_path == tmp_path / "trace.http.jsonl"
+        yield SimpleNamespace(base_url="http://127.0.0.1:43123")
+
+    async def fake_query(*, prompt, options):
+        _ = [message async for message in prompt]
+        assert options.env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:43123"
+        yield ResultMessage(
+            subtype="result",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="session",
+            total_cost_usd=0.0,
+            result="done",
+        )
+
+    def fail_generate(_trace_path):
+        raise RuntimeError("html boom")
+
+    monkeypatch.setattr(
+        "src.agents.sdk_runner.capture_claude_http_traffic",
+        fake_capture_claude_http_traffic,
+    )
+    monkeypatch.setattr("src.agents.sdk_runner.query", fake_query)
+    monkeypatch.setattr(
+        "src.agents.sdk_runner.generate_claude_http_trace_html",
+        fail_generate,
+    )
+
+    trace_path = tmp_path / "trace.jsonl"
+    with caplog.at_level("WARNING"):
+        result, cost, assistant_text, permission_denials = await run_sdk_agent(
+            prompt="hello",
+            config=HarnessConfig(base_url=""),
+            workdir=tmp_path,
+            model="glm-5.1",
+            system_prompt="system",
+            max_turns=5,
+            allow_bash=False,
+            trace_path=trace_path,
+        )
+
+    assert result.result == "done"
+    assert cost == 0.0
+    assert assistant_text == ""
+    assert permission_denials == []
+    assert "failed to generate Claude HTTP trace HTML: html boom" in caplog.text
 
 
 @pytest.mark.anyio

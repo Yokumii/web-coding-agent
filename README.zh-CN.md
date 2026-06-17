@@ -31,6 +31,7 @@
 - 视觉打分器对瞬时错误（5xx 与连接失败）做指数退避带抖动的重试
 - 跨 plan / build / evaluate 各阶段的恢复 / 检查点支持
 - 为基于 SDK 的 agent 调用记录 JSONL trace
+- 为基于 SDK 的 agent 调用生成 Claude HTTP trace 配套文件：`*.http.jsonl` 保持为源 trace，旁边生成 `*.http.html` 供浏览器查看
 - 前端运行时失败的本地日志
 - 按阶段记录成本，并设有总预算硬上限
 
@@ -175,6 +176,12 @@ CLI 覆盖：
 - `image_backed_ui`：两张图都存在，构建阶段使用完整的 image-backed 契约
 - `concept_reference_only`：仅存在 `approved_concept.png`，构建阶段把它作为视觉参考，但不把它当作正式背景资产
 - `text_only_fallback`：可用图像资产都缺失，构建阶段仅依据文本设计契约继续执行
+
+## Trace 文件
+
+每次基于 SDK 的 agent 运行都会在本次运行目录的 `.harness/traces/` 下写入 trace 产物。SDK trace 是记录 harness 事件的 JSONL 文件。配套的 Claude HTTP trace 使用同名前缀并追加 `.http.jsonl`，例如 `planner.http.jsonl`、`generator_round_1.http.jsonl` 或 `evaluator_round_1.http.jsonl`。
+
+HTTP JSONL 文件关闭后，harness 会在同目录生成同名前缀的自包含 HTML 文件，例如 `planner.http.html`。该 HTML 文件可在浏览器中打开，提供完整 trace 浏览器，包括 turn 侧栏、path 筛选、主题与语言控制、token 与 duration 摘要、用户消息、assistant text、tool use、thinking block、request JSON、response JSON 与 SSE events。JSONL 文件仍然是源产物。
 
 ## 快速开始
 
