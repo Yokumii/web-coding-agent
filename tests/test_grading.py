@@ -9,6 +9,7 @@ from src.prompts.grading import (
     check_grades,
     criterion_threshold,
     determine_passed,
+    evaluation_is_inconclusive,
     visual_review_failure,
 )
 
@@ -140,6 +141,55 @@ def test_determine_passed_rejects_failed_critical_exit_criterion_without_overall
     ]
 
     assert determine_passed(grades) is False
+
+
+def test_determine_passed_ignores_unverified_partial_when_all_evidence_passes():
+    grades = _grades_with(7.0)
+    grades.update({
+        "overall_passed": False,
+        "sprint_passed": False,
+        "phase_results": {
+            "render_gate": "pass", "ui_functionality": "pass", "appearance": "pass"
+        },
+        "target_exit_criteria_results": [
+            {"critical": True, "passed": True, "notes": "Filter works."}
+        ],
+        "ui_checks": [{
+            "critical": True,
+            "status": "partial",
+            "notes": "Filtering was not conclusively demonstrated by automation.",
+        }],
+    })
+    assert determine_passed(grades) is True
+
+
+def test_evaluation_is_inconclusive_when_all_failures_are_unverified():
+    grades = {
+        "phase_results": {"render_gate": "pass", "ui_functionality": "fail"},
+        "target_exit_criteria_results": [{
+            "critical": True,
+            "passed": False,
+            "notes": "Calendar behavior was not verified with browser evidence.",
+        }],
+        "ui_checks": [{
+            "critical": True,
+            "status": "fail",
+            "notes": "Conflict badge was not observed.",
+        }],
+    }
+    assert evaluation_is_inconclusive(grades) is True
+
+
+def test_evaluation_is_not_inconclusive_with_reproduced_failure():
+    grades = {
+        "phase_results": {"render_gate": "pass", "ui_functionality": "fail"},
+        "ui_checks": [{
+            "critical": True,
+            "status": "fail",
+            "notes": "Clicked Save; the item count remained 0 and console logged TypeError.",
+        }],
+    }
+    assert evaluation_is_inconclusive(grades) is False
 
 
 def test_visual_review_failure_marks_visual_criteria_and_repair():

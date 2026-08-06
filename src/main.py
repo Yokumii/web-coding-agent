@@ -104,6 +104,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--planner-scope-mode",
+        choices=("query-aligned", "expansive-data"),
+        default=None,
+        help=(
+            "Planner scope strategy: query-aligned preserves benchmark intent; "
+            "expansive-data restores the legacy 5-10 Sprint expansion used for "
+            "training-data construction (default: PLANNER_SCOPE_MODE env or query-aligned)"
+        ),
+    )
+    parser.add_argument(
         "--keep-frontend",
         action="store_true",
         help=(
@@ -111,6 +121,16 @@ def build_parser() -> argparse.ArgumentParser:
             "run (without --resume) wipes the previous prompt's frontend so "
             "the new generator does not 'repair' unrelated code. Use this to "
             "iterate on a hand-edited frontend."
+        ),
+    )
+    parser.add_argument(
+        "--final-project-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Build toward one complete final website using a natural Sprint roadmap; "
+            "intermediate states are for execution/recovery, not dataset extraction "
+            "(default: FINAL_PROJECT_MODE env or false)"
         ),
     )
     # `--plan-only` 与 `--resume` 互斥；恢复执行时如果再带上前者，
@@ -141,6 +161,8 @@ def build_config(args: argparse.Namespace) -> HarnessConfig:
         "playwright_headless": "playwright_headless",
         "frontend_port": "frontend_port",
         "design_mode": "design_mode",
+        "planner_scope_mode": "planner_scope_mode",
+        "final_project_mode": "final_project_mode",
     }
     for arg_name, config_key in arg_to_config.items():
         value = getattr(args, arg_name)

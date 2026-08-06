@@ -11,6 +11,7 @@ from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.file_comm import FileComm
 from src.orchestration.round_artifacts import RoundArtifacts
 from src.orchestration.sprint_state import SprintRunContext, SprintState
+from src.orchestration.target_profile import target_profile_guidance
 from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
 from src.prompts.grading import determine_passed as _determine_passed
 from src.utils.llm_json import extract_json_object
@@ -30,6 +31,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LOCAL_CLAUDE_SKILLS_DIR = _REPO_ROOT / ".claude" / "skills"
 
 
+def _make_evaluator_stop_hook(file_comm: FileComm, round_num: int):
+    async def _hook(_input: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        missing = []
+        if not file_comm.read_grades(round_num):
+            missing.append("the round grades JSON")
+        if not file_comm.read_visual_manifest(round_num):
+            missing.append("the visual screenshot manifest")
+        if missing:
+            reason = "Evaluator must write " + " and ".join(missing) + " before finishing."
+            return {"decision": "block", "reason": reason, "stopReason": reason}
+        return {"continue_": True}
+    return _hook
+
+
 def _ensure_local_claude_skills(workdir: Path) -> None:
     """将仓库内置 skills 暴露到 evaluator 的工作目录。"""
     expose_local_claude_skills(workdir, _LOCAL_CLAUDE_SKILLS_DIR)
@@ -40,9 +55,9 @@ def _build_visual_capture_requirements(*, artifacts: RoundArtifacts, app_url: st
     home_ref, mid_ref, bottom_ref = artifacts.visual_capture_refs
     return [
         "Phase C: Deferred Visual Review Capture",
-        f"- During this evaluator run, capture `{home_ref}` at the top of the page.",
-        f"- If the page meaningfully scrolls, also capture `{mid_ref}` from a middle section.",
-        f"- If the page meaningfully scrolls, also capture `{bottom_ref}` near the bottom section.",
+        f"- Capture `{home_ref}` with browser_screenshot position=`top`.",
+        f"- If the page meaningfully scrolls, capture `{mid_ref}` with position=`middle`.",
+        f"- If the page meaningfully scrolls, capture `{bottom_ref}` with position=`bottom`.",
         f"- Write `{artifacts.visual_manifest_ref}` with this schema:",
         json.dumps(
             {
@@ -67,8 +82,18 @@ async def run_evaluator(
     workdir: Path,
     round_num: int,
     app_url: str,
+    edit_guard: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any], AgentRunStats]:
     """运行 evaluator，并返回通过状态、评分结果与执行统计。"""
+    if config.evaluator_mode == "simple":
+        from src.agents.simple_evaluator import run_simple_evaluator
+        sprint_num = SprintState.load(file_comm).current_run_context().sprint_num
+        return await run_simple_evaluator(
+            file_comm=file_comm, workdir=workdir, round_num=round_num,
+            sprint_num=sprint_num, app_url=app_url,
+        )
+    if config.evaluator_mode != "full":
+        raise ValueError(f"unsupported EVALUATOR_MODE: {config.evaluator_mode!r}")
     _ensure_local_claude_skills(workdir)
     sprint_run_context = SprintState.load(file_comm).current_run_context()
     sprint_num = sprint_run_context.sprint_num
@@ -85,6 +110,7 @@ async def run_evaluator(
         sprint_num=sprint_num,
         sprint_run_context=sprint_run_context,
         app_url=app_url,
+        edit_guard=edit_guard,
     )
     response, total_cost, _assistant_text, permission_denials = await run_sdk_agent(
         prompt=user_msg,
@@ -93,9 +119,10 @@ async def run_evaluator(
         model=config.evaluator_model,
         system_prompt=EVALUATOR_SYSTEM_PROMPT,
         max_turns=config.evaluator_max_turns,
-        allow_bash=True,
+        allow_bash=False,
         bash_profile="read_only",
         allow_playwright=True,
+        stop_hooks=[_make_evaluator_stop_hook(file_comm, round_num)],
         trace_path=RoundArtifacts(file_comm, round_num).trace_path("evaluator"),
     )
 
@@ -125,12 +152,21 @@ def _build_evaluator_prompt(
     sprint_num: int,
     sprint_run_context: SprintRunContext,
     app_url: str,
+    edit_guard: dict[str, Any] | None = None,
 ) -> str:
     round_artifacts = RoundArtifacts(file_comm, round_num)
     design_contract = DesignContractContext.load(file_comm)
     required_reads = list(_EVALUATOR_REQUIRED_READS)
+    target_profile = file_comm.read_target_profile()
+    if target_profile:
+        required_reads.append(".harness/target_profile.json")
     required_reads.extend(design_contract.required_refs())
     required_reads.extend(round_artifacts.previous_existing_refs())
+    if edit_guard is not None:
+        required_reads.extend([
+            ".harness/edit_dom_baseline.json",
+            f".harness/edit_scope_round_{round_num}.json",
+        ])
 
     sprint_context = sprint_run_context.sprint_context
     accepted_sprints = sprint_run_context.accepted_sprints
@@ -201,6 +237,26 @@ def _build_evaluator_prompt(
         "3. Phase C: Deferred Visual Review Capture",
         "4. Phase D: Source Inspection",
         "5. Phase E: Score Aggregation And Verdict",
+        "",
+        *(
+            [
+                "Edit Scope Contract (independent audit required):",
+                "- The generator declared a narrow editable surface set. Verify it is genuinely necessary for this sprint goal; it must not be a catch-all for unrelated accepted functionality.",
+                "- Treat an invalid semantic contract as a regression even if the requested feature works.",
+                "- Write `edit_scope_audit` as `pass` only when the declared scope is proportionate to the sprint; otherwise write `fail` and explain it in regressions_found.",
+                "- Machine guard result:",
+                json.dumps(edit_guard, ensure_ascii=False),
+                "",
+            ]
+            if edit_guard is not None else []
+        ),
+        target_profile_guidance(target_profile).strip(),
+        (
+            "During source inspection, verify that frontend/submission contains the requested "
+            "target-platform source and that it matches the browser preview."
+            if target_profile and target_profile.get("profile") != "web"
+            else ""
+        ),
         "",
         "Output Files:",
         f"1. {round_artifacts.feedback_ref}",

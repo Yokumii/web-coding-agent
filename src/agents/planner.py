@@ -8,7 +8,8 @@ from pydantic import ValidationError
 from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
-from src.prompts.planner import PLANNER_SYSTEM_PROMPT
+from src.orchestration.target_profile import target_profile_guidance
+from src.prompts.planner import planner_system_prompt
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -176,21 +177,38 @@ def _check_sprint_size_caps(
     sprint_plan: dict[str, Any], config: HarnessConfig
 ) -> None:
     """按配置限制每个 sprint 的 deliverable 与 exit_criterion 数量。"""
+    deliverable_cap = config.max_deliverables_per_sprint
+    exit_criteria_cap = config.max_exit_criteria_per_sprint
+    if config.planner_scope_mode == "expansive-data":
+        deliverable_cap = min(deliverable_cap, 3)
+        exit_criteria_cap = min(exit_criteria_cap, 3)
+        total_sprints = int(sprint_plan["total_sprints"])
+        if not 6 <= total_sprints <= 9:
+            raise PlannerValidationError(
+                "Planner wrote invalid expansive-data sprint_plan.json: "
+                f"expected 6..9 sprints, got {total_sprints}."
+            )
     for sprint in sprint_plan["sprints"]:
         deliverables = sprint["deliverables"]
-        if len(deliverables) > config.max_deliverables_per_sprint:
+        if len(deliverables) > deliverable_cap:
             raise PlannerValidationError(
                 f"Planner wrote invalid sprint_plan.json: sprint {sprint['number']} has "
                 f"{len(deliverables)} deliverables; max allowed is "
-                f"{config.max_deliverables_per_sprint}. Split into smaller sprints."
+                f"{deliverable_cap}. Split into smaller sprints."
             )
         exit_criteria = sprint["exit_criteria"]
-        if len(exit_criteria) > config.max_exit_criteria_per_sprint:
+        if len(exit_criteria) > exit_criteria_cap:
             raise PlannerValidationError(
                 f"Planner wrote invalid sprint_plan.json: sprint {sprint['number']} has "
                 f"{len(exit_criteria)} exit_criteria; max allowed is "
-                f"{config.max_exit_criteria_per_sprint}. Split into smaller sprints."
+                f"{exit_criteria_cap}. Split into smaller sprints."
             )
+        if config.planner_scope_mode == "expansive-data":
+            if len(deliverables) < 2 or len(exit_criteria) < 2:
+                raise PlannerValidationError(
+                    f"Planner wrote invalid expansive-data sprint {sprint['number']}: "
+                    "each sprint needs 2..3 deliverables and 2..3 exit_criteria."
+                )
 
 
 def _initialize_accepted_sprints(file_comm: FileComm) -> None:
@@ -213,6 +231,32 @@ def _initialize_accepted_sprints(file_comm: FileComm) -> None:
     )
 
 
+def _build_planner_prompt(
+    config: HarnessConfig, user_prompt: str, workdir: Path,
+    target_profile: dict | None = None,
+) -> str:
+    final_mode = ""
+    if config.final_project_mode:
+        final_mode = (
+            "FINAL PROJECT MODE: Plan the complete requested product using a natural number of Sprints "
+            "appropriate to its complexity. Keep each Sprint coherent and independently verifiable, "
+            "but ensure the full roadmap ends in a polished, runnable final website with no requested "
+            "features omitted. Do not optimize the roadmap for extracting edit or repair training samples. "
+        )
+    return (
+        f"Create a complete planning bundle for this product idea:\n\n"
+        f"{user_prompt}\n\n"
+        f"{target_profile_guidance(target_profile)}\n"
+        f"{final_mode}"
+        f"Update the existing planning artifact files under .harness using only file editing tools such as "
+        f"Write, Edit, and MultiEdit. Bash is unavailable for this task. "
+        f"The Harness has already prepared the workdir, the .harness directory, and the required artifact files. "
+        f"Replace the scaffold content in those files; do not create directories, rename files, or add alternate filenames. "
+        f"Use paths relative to the workdir only; do not use absolute paths. "
+        f"The workdir is: {workdir}"
+    )
+
+
 async def run_planner(
     config: HarnessConfig,
     user_prompt: str,
@@ -225,15 +269,8 @@ async def run_planner(
     file_comm.dir.mkdir(parents=True, exist_ok=True)
     file_comm.initialize_planning_artifacts()
 
-    prompt = (
-        f"Create a complete planning bundle for this product idea:\n\n"
-        f"{user_prompt}\n\n"
-        f"Update the existing planning artifact files under .harness using only file editing tools such as "
-        f"Write, Edit, and MultiEdit. Bash is unavailable for this task. "
-        f"The Harness has already prepared the workdir, the .harness directory, and the required artifact files. "
-        f"Replace the scaffold content in those files; do not create directories, rename files, or add alternate filenames. "
-        f"Use paths relative to the workdir only; do not use absolute paths. "
-        f"The workdir is: {workdir}"
+    prompt = _build_planner_prompt(
+        config, user_prompt, workdir, file_comm.read_target_profile()
     )
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
@@ -241,8 +278,8 @@ async def run_planner(
         config=config,
         workdir=workdir,
         model=config.planner_model,
-        system_prompt=PLANNER_SYSTEM_PROMPT,
-        max_turns=30,
+        system_prompt=planner_system_prompt(config.planner_scope_mode),
+        max_turns=16,
         allow_bash=False,
         stop_hooks=[_make_planner_stop_hook(file_comm, config)],
         trace_path=file_comm.dir / "traces" / "planner.jsonl",

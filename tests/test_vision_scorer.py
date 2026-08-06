@@ -416,6 +416,7 @@ def test_perform_visual_review_request_calls_completion_with_anthropic_model_str
     assert captured["kwargs"]["api_base"] == "https://api.anthropic.com"
     assert captured["kwargs"]["max_tokens"] == 600
     assert captured["kwargs"]["num_retries"] == 3
+    assert captured["kwargs"]["timeout"] == 300
     # System role + single user role with text + image blocks
     assert captured["messages"][0]["role"] == "system"
     assert captured["messages"][1]["role"] == "user"

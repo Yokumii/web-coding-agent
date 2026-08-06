@@ -6,9 +6,12 @@ requires-python = ">=3.11"
 dependencies = [
     "claude-agent-sdk>=0.1.65",
     "litellm>=1.50,<2.0",
+    "httpx[socks]>=0.27.0",
     "pydantic>=2.0,<3.0",
     "python-dotenv>=1.0.0",
+    "playwright>=1.50.0",
     "rich>=13.0.0",
+    "tenacity>=8.2.0",
 ]
 
 [project.scripts]

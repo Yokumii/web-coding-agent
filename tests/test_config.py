@@ -22,6 +22,8 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     monkeypatch.setenv("MAX_ROUNDS", "7")
     monkeypatch.setenv("FRONTEND_PORT", "4321")
     monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "true")
+    monkeypatch.setenv("FINAL_PROJECT_MODE", "true")
+    monkeypatch.setenv("PLANNER_SCOPE_MODE", "expansive-data")
 
     config = HarnessConfig()
 
@@ -43,6 +45,9 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     assert config.max_rounds == 7
     assert config.frontend_port == 4321
     assert config.playwright_headless is True
+    assert config.final_project_mode is True
+    assert config.planner_scope_mode == "expansive-data"
+    assert config.evaluator_mode == "full"
 
 
 def test_harness_config_uses_sdk_buffer_environment_variable(monkeypatch):

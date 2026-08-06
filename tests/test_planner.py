@@ -111,6 +111,17 @@ def _write_valid_planning_bundle(file_comm: FileComm) -> None:
     file_comm.write_progress("# Progress Log\n\n## planning\n- status: complete")
 
 
+def test_final_project_mode_instruction_requests_natural_complete_roadmap():
+    from src.agents.planner import _build_planner_prompt
+
+    prompt = _build_planner_prompt(
+        HarnessConfig(final_project_mode=True), "build everything", Path("/tmp/work")
+    )
+    assert "natural number of Sprints" in prompt
+    assert "complete requested product" in prompt
+    assert "exactly one Sprint" not in prompt
+
+
 @pytest.mark.anyio
 async def test_planner_initializes_accepted_sprints_after_successful_run(
     monkeypatch, tmp_path: Path
@@ -700,6 +711,33 @@ def test_validate_sprint_plan_respects_config_override_for_caps(tmp_path: Path):
     _validate_planning_bundle(file_comm, relaxed)
 
 
+def test_expansive_data_enforces_three_item_sprint_cap(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _seed_valid_bundle(file_comm)
+    sprint_plan = file_comm.read_sprint_plan()
+    feature_list = file_comm.read_feature_list()
+    feature_id = feature_list["features"][0]["id"]
+    sprint_plan["total_sprints"] = 6
+    template = sprint_plan["sprints"][0]
+    sprint_plan["sprints"] = []
+    for number in range(1, 7):
+        item = dict(template)
+        item["number"] = number
+        item["feature_ids"] = [feature_id]
+        item["deliverables"] = [f"D{i}" for i in range(5)]
+        sprint_plan["sprints"].append(item)
+    file_comm.write_sprint_plan(sprint_plan)
+    feature_list["features"][0]["sprint"] = 1
+    file_comm.write_feature_list(feature_list)
+    verification = file_comm.read_ui_verification_plan()
+    verification["sprints"] = [verification["sprints"][0]]
+    file_comm.write_ui_verification_plan(verification)
+
+    config = HarnessConfig(planner_scope_mode="expansive-data")
+    with pytest.raises(PlannerValidationError, match=r"deliverables.*max allowed is 3"):
+        _validate_planning_bundle(file_comm, config)
+
+
 def test_planner_prompt_documents_sprint_size_caps():
     from src.prompts.planner import PLANNER_SYSTEM_PROMPT
 
@@ -708,3 +746,20 @@ def test_planner_prompt_documents_sprint_size_caps():
     assert "5 deliverables" in PLANNER_SYSTEM_PROMPT
     assert "5 exit_criteria" in PLANNER_SYSTEM_PROMPT
     assert "vertical slice" in PLANNER_SYSTEM_PROMPT.lower()
+
+
+def test_expansive_data_scope_uses_shallow_natural_sprint_expansion():
+    from src.prompts.planner import planner_system_prompt
+
+    prompt = planner_system_prompt("expansive-data")
+    assert "6-9 dependency-ordered Sprints" in prompt
+    assert "2-3 closely related user-visible deliverables" in prompt
+    assert 'standalone\n   "polish/refactor/cleanup" Sprint' in prompt
+    assert "generate/edit" in prompt
+
+
+def test_query_aligned_scope_does_not_enable_legacy_expansion():
+    from src.prompts.planner import planner_system_prompt
+
+    prompt = planner_system_prompt("query-aligned")
+    assert "Scope Profile: Expansive Data Construction" not in prompt

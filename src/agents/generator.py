@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from typing import Any, Literal
 
 from src.agents._shared import expose_local_claude_skills
@@ -12,8 +13,13 @@ from src.agents.sdk_runner import (
 from src.config import HarnessConfig
 from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.file_comm import FileComm
+from src.orchestration.git_journal import ensure_repo
 from src.orchestration.round_artifacts import RoundArtifacts
 from src.orchestration.sprint_state import SprintState
+from src.orchestration.target_profile import (
+    target_profile_guidance,
+    validate_target_submission,
+)
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
 from src.prompts.grading import criterion_threshold
 from src.utils.logger import get_logger
@@ -29,6 +35,138 @@ _GENERATE_REQUIRED_READS = (
     ".harness/design_tokens.json",
     ".harness/accepted_sprints.json",
 )
+_MAX_REPAIR_FILES = 4
+_MAX_REPAIR_CHANGED_LINES = 1000
+
+
+def _git_output(frontend_dir: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=frontend_dir, check=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).stdout.strip()
+
+
+async def _ensure_generator_baseline(frontend_dir: Path) -> str:
+    frontend_dir.mkdir(parents=True, exist_ok=True)
+    await ensure_repo(frontend_dir)
+    try:
+        return _git_output(frontend_dir, "rev-parse", "HEAD")
+    except subprocess.CalledProcessError:
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", "chore: baseline"],
+            cwd=frontend_dir, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return _git_output(frontend_dir, "rev-parse", "HEAD")
+
+
+def _validate_generator_commits(
+    frontend_dir: Path, baseline_commit: str, mode: GeneratorMode
+) -> str | None:
+    expected = "feat" if mode == "generate" else "fix"
+    try:
+        subjects = _git_output(
+            frontend_dir, "log", "--format=%s", f"{baseline_commit}..HEAD"
+        ).splitlines()
+        status = _git_output(frontend_dir, "status", "--porcelain")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"Git validation failed: {exc}. Initialize and use the existing frontend Git repository."
+    if not any(
+        subject.lower().startswith(expected + ":")
+        or subject.lower().startswith(expected + "(")
+        for subject in subjects
+    ):
+        return (
+            f"No `{expected}` commit was created during this run. Validate the work, then create "
+            f"an atomic `{expected}(scope): description` commit before stopping."
+        )
+    if status:
+        return "The frontend Git worktree is not clean. Commit the remaining intended changes before stopping."
+    return None
+
+
+def _validate_repair_scope(frontend_dir: Path, baseline_commit: str) -> str | None:
+    """Reject broad repair commits before they become accepted trajectory states."""
+    try:
+        output = _git_output(
+            frontend_dir, "diff", "--numstat", f"{baseline_commit}..HEAD", "--"
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"Repair scope validation failed: {exc}."
+    changed_files = 0
+    changed_lines = 0
+    for line in output.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        added, removed, path = parts
+        if Path(path).name in {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}:
+            continue
+        changed_files += 1
+        if added.isdigit():
+            changed_lines += int(added)
+        if removed.isdigit():
+            changed_lines += int(removed)
+    if changed_files > _MAX_REPAIR_FILES or changed_lines > _MAX_REPAIR_CHANGED_LINES:
+        return (
+            "Repair diff is too broad for an atomic repair: "
+            f"{changed_files} source files and {changed_lines} changed lines; allowed maximum is "
+            f"{_MAX_REPAIR_FILES} files and {_MAX_REPAIR_CHANGED_LINES} changed lines. "
+            "Reduce the committed diff to the evaluator-confirmed defect only. Preserve all "
+            "unrelated code and formatting byte-for-byte, then create a corrective fix commit."
+        )
+    return None
+
+
+def _validate_generator_runnable_files(frontend_dir: Path) -> str | None:
+    package_json = frontend_dir / "package.json"
+    if not package_json.is_file():
+        return (
+            "The frontend is missing package.json. Create a runnable frontend package with "
+            "at least a dev script, validate it, and commit it inside frontend/.git."
+        )
+    return None
+
+
+def _validate_edit_scope(workdir: Path, round_num: int) -> str | None:
+    """Make the declared edit boundary an explicit generator deliverable."""
+    if not (workdir / "seed_manifest.json").is_file():
+        return None
+    path = workdir / ".harness" / f"edit_scope_round_{round_num}.json"
+    if not path.is_file():
+        return f"Forward edit requires `{path.relative_to(workdir)}` before stopping."
+    try:
+        import json
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"Forward edit scope is not valid JSON: {exc}"
+    roots = payload.get("allowed_root_keys") if isinstance(payload, dict) else None
+    if not isinstance(roots, list) or not all(isinstance(item, str) for item in roots):
+        return "Forward edit scope must contain a string list `allowed_root_keys`."
+    if len(roots) > 2 or len(set(roots)) != len(roots):
+        return "Forward edit scope may declare at most two distinct root keys."
+    if not isinstance(payload.get("allow_new_roots", False), bool):
+        return "Forward edit scope field `allow_new_roots` must be boolean."
+    return None
+
+
+def _make_generator_stop_hook(
+    frontend_dir: Path, baseline_commit: str, mode: GeneratorMode, workdir: Path, round_num: int,
+    target_profile: dict[str, Any] | None = None,
+):
+    async def _hook(_input: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        error = _validate_generator_runnable_files(frontend_dir)
+        if error is None:
+            error = validate_target_submission(frontend_dir, target_profile)
+        if error is None:
+            error = _validate_generator_commits(frontend_dir, baseline_commit, mode)
+        if error is None:
+            error = _validate_edit_scope(workdir, round_num)
+        if error is None and mode == "repair":
+            error = _validate_repair_scope(frontend_dir, baseline_commit)
+        if error:
+            return {"decision": "block", "reason": error, "stopReason": error}
+        return {"continue_": True}
+    return _hook
 
 
 def _ensure_local_claude_skills(workdir: Path) -> None:
@@ -125,6 +263,9 @@ def _build_generator_prompt(
     round_artifacts = RoundArtifacts(file_comm, round_num)
     design_contract = DesignContractContext.load(file_comm)
     accepted = accepted_sprints.get("accepted", [])
+    target_profile = file_comm.read_target_profile()
+    target_guidance = target_profile_guidance(target_profile)
+    is_forward_edit = (file_comm.dir.parent / "seed_manifest.json").is_file()
     feature_ids = ", ".join(sprint_context.get("feature_ids", []))
     common_lines = [
         f"Mode: {mode}\n",
@@ -134,9 +275,19 @@ def _build_generator_prompt(
         f"Target Feature IDs: {feature_ids}\n"
         f"Accepted Sprints: {accepted}\n"
     ]
+    if is_forward_edit:
+        common_lines.extend([
+            "\nForward edit safety contract:\n",
+            f"- Before your final commit, write `.harness/edit_scope_round_{round_num}.json`.\n",
+            "- It must contain `allowed_root_keys` (at most two exact root keys from the baseline) and `allow_new_roots` (boolean).\n",
+            "- Root keys are shown in `.harness/edit_dom_baseline.json`; do not use wildcards or approve unrelated roots.\n",
+            "- The harness independently rejects semantic DOM/ARIA changes outside this declared scope.\n",
+        ])
 
     if mode == "generate":
         required_reads = list(_GENERATE_REQUIRED_READS)
+        if target_profile:
+            required_reads.append(".harness/target_profile.json")
         required_reads.extend(design_contract.required_refs())
         required_reads.extend(round_artifacts.previous_existing_refs())
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
@@ -150,8 +301,9 @@ def _build_generator_prompt(
             f"Exit Criteria:\n{exit_criteria}\n"
             f"Required Reads:\n{required_reads_text}\n\n"
             f"{design_guidance_block}"
+            f"{target_guidance}\n"
             f"Implement only sprint {sprint_num}.\n"
-            f"Set up or update the frontend-only project in `frontend/`.\n"
+            f"Set up or update the runnable browser preview in `frontend/`.\n"
             f"Do not implement future sprint functionality or unrelated refactors.\n"
             f"If previous-round feedback or grades are present, read them to preserve accepted work, "
             f"avoid regressions, and carry forward non-blocking polish notes without re-opening already accepted sprint scope.\n"
@@ -186,17 +338,23 @@ def _build_generator_prompt(
             ".harness/accepted_sprints.json",
             *design_contract.required_refs(),
         ]
+        if target_profile:
+            required_reads.append(".harness/target_profile.json")
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
         mode_lines = [
             "Repair Scope: Fix evaluator-reported issues for the current sprint only\n"
             f"Required Reads:\n{required_reads_text}\n\n"
             f"{design_guidance_block}"
+            f"{target_guidance}\n"
             "## Previous evaluation findings\n\n"
             f"{failures_text}\n\n"
             "## Your task\n"
             "Address every failure above. Do not stop until each one is fixed. "
             "There is no self-report file; the next evaluation round verifies your work.\n"
             "Fix ONLY the issues needed for sprint acceptance or regression recovery.\n"
+            "Use localized patches and preserve untouched code exactly; broad rewrites or "
+            "formatting churn make the repair unusable as training data. Normally touch no "
+            "more than four source files.\n"
             "Do not implement new features from future sprints.\n"
             "Do not start work for the next sprint.\n"
         ]
@@ -233,7 +391,12 @@ def _validate_generator_outputs(file_comm: FileComm, workdir: Path, result_summa
     package_json = frontend_dir / "package.json"
 
     if frontend_dir.exists() and package_json.exists():
-        return
+        target_error = validate_target_submission(
+            frontend_dir, file_comm.read_target_profile()
+        )
+        if target_error is None:
+            return
+        raise RuntimeError(target_error)
 
     if result_summary and not file_comm.read_build_log():
         file_comm.write_build_log(result_summary)
@@ -271,6 +434,9 @@ async def run_generator(
     )
     _ensure_local_claude_skills(workdir)
 
+    frontend_dir = workdir / "frontend"
+    baseline_commit = await _ensure_generator_baseline(frontend_dir)
+
     sprint_run_context = SprintState.load(file_comm).required_run_context(
         sprint_num,
         owner="Generator",
@@ -283,6 +449,7 @@ async def run_generator(
         sprint_context=sprint_run_context.sprint_context,
         accepted_sprints=sprint_run_context.accepted_sprints,
     )
+    target_profile = file_comm.read_target_profile()
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
         prompt=user_msg,
@@ -292,6 +459,9 @@ async def run_generator(
         system_prompt=GENERATOR_SYSTEM_PROMPT,
         max_turns=config.generator_max_turns,
         allow_bash=True,
+        stop_hooks=[_make_generator_stop_hook(
+            frontend_dir, baseline_commit, mode, workdir, round_num, target_profile
+        )],
         trace_path=RoundArtifacts(file_comm, round_num).trace_path("generator"),
     )
 

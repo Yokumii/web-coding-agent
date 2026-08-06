@@ -1,0 +1,103 @@
+import pytest
+from aiohttp import web
+
+from src.config import HarnessConfig
+from src.orchestration.edit_dom_guard import capture_baseline, compare_contract
+from src.orchestration.file_comm import FileComm
+from src.agents.generator import _validate_edit_scope
+
+
+def _snapshot(*items):
+    return {"roots": [{"key": key, "fingerprint": fingerprint} for key, fingerprint in items]}
+
+
+def test_guard_allows_only_declared_semantic_surface():
+    result = compare_contract(
+        _snapshot(("header", "a"), ("main", "b"), ("footer", "c")),
+        _snapshot(("header", "a"), ("main", "changed"), ("footer", "c")),
+        {"allowed_root_keys": ["main"], "allow_new_roots": False},
+    )
+    assert result["passed"] is True
+
+
+def test_guard_rejects_unrelated_change_even_when_task_root_is_allowed():
+    result = compare_contract(
+        _snapshot(("header", "a"), ("main", "b"), ("footer", "c")),
+        _snapshot(("header", "changed"), ("main", "changed"), ("footer", "c")),
+        {"allowed_root_keys": ["main"], "allow_new_roots": False},
+    )
+    assert result["passed"] is False
+    assert result["violations"] == [{"root": "header", "kind": "semantic_changed"}]
+
+
+def test_guard_requires_explicit_permission_for_new_surface():
+    result = compare_contract(
+        _snapshot(("main", "a")), _snapshot(("main", "a"), ("dialog", "b")),
+        {"allowed_root_keys": [], "allow_new_roots": False},
+    )
+    assert result["passed"] is False
+    assert result["violations"] == [{"root": "dialog", "kind": "unexpected_added"}]
+
+
+def test_guard_allows_many_changes_inside_one_declared_surface():
+    """A main-surface edit may change its cards without weakening header/footer guards."""
+    result = compare_contract(
+        _snapshot(("header", "same"), ("main", "twelve cards"), ("footer", "same")),
+        _snapshot(("header", "same"), ("main", "five filtered cards"), ("footer", "same")),
+        {"allowed_root_keys": ["main"], "allow_new_roots": False},
+    )
+    assert result["passed"] is True
+
+
+def test_guard_protects_keyboard_reachability_as_part_of_surface_fingerprint():
+    result = compare_contract(
+        _snapshot(("header", "focusable-nav"), ("main", "editable")),
+        _snapshot(("header", "lost-keyboard-focus"), ("main", "editable")),
+        {"allowed_root_keys": ["main"], "allow_new_roots": False},
+    )
+    assert result["passed"] is False
+    assert result["violations"] == [{"root": "header", "kind": "semantic_changed"}]
+
+
+def test_forward_edit_requires_small_machine_readable_scope(tmp_path):
+    (tmp_path / "seed_manifest.json").write_text("{}")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    assert _validate_edit_scope(tmp_path, 1) is not None
+    (harness / "edit_scope_round_1.json").write_text(
+        '{"allowed_root_keys":["main"],"allow_new_roots":false}'
+    )
+    assert _validate_edit_scope(tmp_path, 1) is None
+
+
+@pytest.mark.anyio
+async def test_capture_baseline_uses_non_overlapping_semantic_surfaces(tmp_path):
+    async def page(_request):
+        return web.Response(text="""
+        <body><div id='root'><header><a href='/docs'>Docs</a></header>
+        <main><article aria-label='first'>One</article><article aria-label='second'>Two</article></main>
+        <footer><button>Help</button></footer></div></body>
+        """, content_type="text/html")
+
+    app = web.Application()
+    app.router.add_get("/", page)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        workdir = tmp_path / "edit"
+        workdir.mkdir()
+        snapshot = await capture_baseline(
+            workdir=workdir,
+            file_comm=FileComm(workdir / ".harness"),
+            config=HarnessConfig(playwright_headless=True),
+            app_url=f"http://127.0.0.1:{port}",
+        )
+    finally:
+        await runner.cleanup()
+
+    # The two articles are covered by main rather than becoming separately
+    # protected roots, so a legitimate list/filter edit can be scoped to main.
+    assert [root["key"] for root in snapshot["roots"]] == ["header:unnamed", "main:unnamed", "footer:unnamed"]

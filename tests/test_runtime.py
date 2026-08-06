@@ -22,9 +22,27 @@ from src.orchestration.runtime import (
 
 
 def test_build_frontend_command_defaults_to_npm(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"scripts":{"dev":"vite"}}')
     command = build_frontend_command(tmp_path, 5173)
     assert command[:3] == ["npm", "run", "dev"]
     assert command[-3:] == ["--port", "5173", "--strictPort"]
+
+
+def test_build_frontend_command_uses_python_static_server_without_package_json(tmp_path: Path):
+    (tmp_path / "index.html").write_text("<main>static</main>")
+
+    assert build_frontend_command(tmp_path, 5173) == [
+        "python3", "-m", "http.server", "5173", "--bind", "127.0.0.1",
+    ]
+
+
+def test_build_frontend_command_uses_static_server_for_empty_agent_npm_stub(tmp_path: Path):
+    (tmp_path / "index.html").write_text("<main>static</main>")
+    (tmp_path / "package.json").write_text('{"scripts": {"dev": "node dev-server.js"}}')
+
+    assert build_frontend_command(tmp_path, 5173) == [
+        "python3", "-m", "http.server", "5173", "--bind", "127.0.0.1",
+    ]
 
 
 def test_build_frontend_command_prefers_pnpm_lockfile(tmp_path: Path):
@@ -154,8 +172,12 @@ async def test_start_app_stack_requires_only_frontend(monkeypatch, tmp_path: Pat
     harness_dir = tmp_path / ".harness"
     calls: list[tuple[str, int | str]] = []
 
-    def fake_start_process(*, name: str, command: list[str], cwd: Path, log_path: Path):
+    def fake_start_process(
+        *, name: str, command: list[str], cwd: Path, log_path: Path,
+        env_overrides: dict[str, str] | None = None,
+    ):
         calls.append((name, "start"))
+        calls.append(("env", env_overrides))
         return ManagedProcess(
             name=name,
             process=DummyManagedProcess(),
@@ -180,6 +202,7 @@ async def test_start_app_stack_requires_only_frontend(monkeypatch, tmp_path: Pat
     assert calls == [
         ("ensure_port_available", 5173),
         ("frontend", "start"),
+        ("env", {"HOST": "127.0.0.1", "PORT": "5173"}),
         ("wait_for_http", "http://127.0.0.1:5173"),
     ]
 
@@ -207,10 +230,12 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
         command=["echo", "hi"],
         cwd=tmp_path,
         log_path=log_path,
+        env_overrides={"PORT": "4321"},
     )
 
     assert process.process.pid == 4242
     assert captured["kwargs"].get("start_new_session") is (not runtime.IS_WINDOWS)
+    assert captured["kwargs"]["env"]["PORT"] == "4321"
 
 
 @pytest.mark.anyio

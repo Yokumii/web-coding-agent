@@ -261,6 +261,9 @@ class Grades(_Artifact):
     regressions_found: list[Any] = Field(default_factory=list)
     missing_features: list[Any] = Field(default_factory=list)
     repair_instructions: list[Any] = Field(default_factory=list)
+    evaluation_infrastructure_failure: dict[str, Any] | None = None
+    edit_guard: dict[str, Any] | None = None
+    edit_scope_audit: str | None = None
 
     @classmethod
     def filename(cls, *, round_num: int, **params: Any) -> str:

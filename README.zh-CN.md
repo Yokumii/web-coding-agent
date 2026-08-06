@@ -14,6 +14,17 @@
 
 当前 harness **不包含后端生成与后端运行时**。
 
+## 在 Monorepo 中的职责
+
+在 `WebCoding_Data` 内，本子项目是**正向 agentic 数据 producer**。源码、测试、
+prompt 和 exporter 由父仓库统一版本控制，运行产物则与源码分离：
+
+- `../runs/agentic/`：任务 workdir、checkpoint、trace、截图和导出轨迹
+- `../logs/agentic/`：launcher、API probe 与 seed 同步的持久化日志
+
+同级 `construct/` 保持为逆向/受控 producer。两条路线共享发布级审计与 schema，
+但必须保留不同的 provenance 标签。
+
 ## 状态
 
 已实现的能力：
@@ -34,6 +45,24 @@
 - 为基于 SDK 的 agent 调用生成 Claude HTTP trace 配套文件：`*.http.jsonl` 保持为源 trace，旁边生成 `*.http.html` 供浏览器查看
 - 前端运行时失败的本地日志
 - 按阶段记录成本，并设有总预算硬上限
+- forward edit 的 DOM 契约保护：编辑前对已验收 seed 建立语义 DOM/ARIA surface 基线；除显式声明的最多两个 root 外，其他 surface 不得变化。该检查独立于截图/像素评分。
+
+### Forward edit 回归保护
+
+由 `scripts/prepare_forward_edit_seed.py` 创建的 workdir 含有已验证的
+`seed_manifest.json`。首次 edit build 前，harness 会启动该 seed 并写入
+`.harness/edit_dom_baseline.json`：其中是 landmark、role、`data-testid` root 与
+语义控件的 DOM/ARIA 指纹，也包含可聚焦控件是否确实能获得键盘焦点；不是截图。随后 generator 必须写入
+`.harness/edit_scope_round_N.json`，例如：
+
+```json
+{"allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
+```
+
+契约最多允许两个已命名 baseline surface 内发生变化；其他 surface 被删除或语义变化，
+或未授权新增 surface，都会作为 regression 使该轮失败，并写入
+`grade_round_N.json::edit_guard`。该门禁约束 edit 的边界；它不能替代正常 browser
+evaluator 对需求是否真正实现的验证。
 
 ## 环境要求
 
@@ -97,7 +126,7 @@ EVALUATOR_VISION_MODEL=claude-sonnet-4-6
 EVALUATOR_VISION_API_KEY=...
 EVALUATOR_VISION_BASE_URL=...
 EVALUATOR_VISION_ENDPOINT_TYPE=anthropic   # 或 "openai" 表示 OpenAI 兼容的 chat completions
-EVALUATOR_VISION_MAX_TOKENS=1200
+EVALUATOR_VISION_MAX_TOKENS=4096
 EVALUATOR_VISION_MAX_RETRIES=3             # 瞬时 5xx / URLError 重试次数（默认 3）
 EVALUATOR_VISION_RETRY_BASE_DELAY=2.0      # 指数退避基础秒数（默认 2.0）
 ```
@@ -127,6 +156,7 @@ PLAYWRIGHT_HEADLESS=false
 - `GENERATOR_MODEL`
 - `EVALUATOR_MODEL`
 - `EVALUATOR_VISION_MODEL`
+- `PLANNER_SCOPE_MODE`（默认 `query-aligned`；`expansive-data` 恢复原先用于数据构造的 5–10 Sprint 扩张路线）
 
 CLI 覆盖：
 
@@ -134,6 +164,7 @@ CLI 覆盖：
 - `--generator-model`
 - `--evaluator-model`
 - `--evaluator-vision-model`
+- `--planner-scope-mode query-aligned|expansive-data`
 
 运行参数：
 
@@ -141,6 +172,7 @@ CLI 覆盖：
 - `MAX_ROUNDS` ↔ `--max-rounds`
 - `FRONTEND_PORT` ↔ `--frontend-port`
 - `DESIGN_MODE` ↔ `--design-mode`
+- `PLANNER_SCOPE_MODE` ↔ `--planner-scope-mode`
 - `PLAYWRIGHT_HEADLESS` ↔ `--playwright-headless` / `--no-playwright-headless`
 
 内置默认值：

@@ -212,6 +212,17 @@ def test_grades_accepts_legacy_minimal_shape():
     Grades.model_validate({**_minimal_grades(), "bugs_found": [], "missing_features": []})
 
 
+def test_grades_accepts_evaluation_infrastructure_failure():
+    payload = {
+        **_minimal_grades(),
+        "evaluation_infrastructure_failure": {
+            "phase": "visual_review",
+            "reason": "screenshot missing",
+        },
+    }
+    assert Grades.model_validate(payload).evaluation_infrastructure_failure is not None
+
+
 def test_visual_manifest_rejects_unknown_field():
     with pytest.raises(ValidationError):
         VisualManifest.model_validate(

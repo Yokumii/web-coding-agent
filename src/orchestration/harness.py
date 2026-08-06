@@ -19,6 +19,7 @@ from src.orchestration.phases import (
     run_planner_phase,
 )
 from src.orchestration.sprint_state import SprintState
+from src.orchestration.target_profile import detect_target_profile
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -54,6 +55,7 @@ async def run_harness(
         if resume:
             logger.warning("[bold]Resume requested but no checkpoint found.[/]")
         file_comm.reset_run_artifacts()
+        file_comm.write_target_profile(detect_target_profile(user_prompt))
         if not keep_frontend:
             _reset_frontend_dir(workdir)
         phase_metrics = {}
@@ -62,6 +64,9 @@ async def run_harness(
         logger.info(f"[bold]Harness started[/] — prompt: {user_prompt[:80]}...")
 
     logger.info(f"Workdir: {workdir}")
+
+    if file_comm.read_target_profile() is None:
+        file_comm.write_target_profile(detect_target_profile(user_prompt))
 
     sprint_state = SprintState.load(file_comm)
     ctx = HarnessContext(
@@ -100,19 +105,26 @@ async def run_harness(
 
     ctx.sprint_state = SprintState.load(file_comm)
 
+    # Final-project runs follow the natural roadmap to completion instead of
+    # accidentally stopping at the generic three-round dataset default. Keep
+    # a small repair allowance while retaining the global budget and timeouts.
+    max_rounds = config.max_rounds
+    if config.final_project_mode:
+        max_rounds = max(max_rounds, ctx.sprint_state.total_sprints + 3)
+
     start_round = _resolve_start_round(skip_until_phase, existing_state)
     if ctx.sprint_state.current_target > ctx.sprint_state.total_sprints > 0:
         logger.info("[bold green]All sprints already accepted.[/]")
         _print_summary(cost_tracker, time.time() - start, max(start_round - 1, 0), True)
         return
-    if start_round > config.max_rounds:
-        logger.info(f"[bold]All rounds completed (max_rounds={config.max_rounds}).[/]")
-        _print_summary(cost_tracker, time.time() - start, config.max_rounds, False)
+    if start_round > max_rounds:
+        logger.info(f"[bold]All rounds completed (max_rounds={max_rounds}).[/]")
+        _print_summary(cost_tracker, time.time() - start, max_rounds, False)
         return
 
-    for round_num in range(start_round, config.max_rounds + 1):
+    for round_num in range(start_round, max_rounds + 1):
         logger.info(f"[bold cyan]═" * 40)
-        logger.info(f"[bold cyan]ROUND {round_num}/{config.max_rounds}")
+        logger.info(f"[bold cyan]ROUND {round_num}/{max_rounds}")
 
         if skip_until_phase != f"build_r{round_num}":
             await run_build_phase(ctx, round_num, resume_state=existing_state)
@@ -162,7 +174,7 @@ async def run_harness(
         if skip_until_phase == f"build_r{round_num}":
             skip_until_phase = None
 
-    _print_summary(cost_tracker, time.time() - start, config.max_rounds, False)
+    _print_summary(cost_tracker, time.time() - start, max_rounds, False)
 
 
 def _restore_costs(tracker: CostTracker, costs: dict[str, float]) -> None:

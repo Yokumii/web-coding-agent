@@ -222,6 +222,7 @@ def _perform_visual_review_request(
         api_base=config.evaluator_vision_base_url or None,
         max_tokens=config.evaluator_vision_max_tokens,
         num_retries=getattr(config, "evaluator_vision_max_retries", 3),
+        timeout=getattr(config, "evaluator_vision_timeout_seconds", 300),
     )
     duration_ms = int((time.perf_counter() - started) * 1000)
 
@@ -268,6 +269,18 @@ def normalize_visual_review(
     if not isinstance(criteria_scores, dict):
         criteria_scores = {}
 
+    def criterion_value(name: str) -> tuple[Any, str]:
+        raw = criteria_scores.get(name)
+        if isinstance(raw, dict):
+            return raw.get("score"), str(raw.get("notes", "")).strip()
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return raw, ""
+        return None, ""
+
+    design_score, design_notes = criterion_value("design_quality")
+    originality_score, originality_notes = criterion_value("originality")
+    craft_score, craft_notes = criterion_value("craft")
+
     normalized = {
         "phase_result": str(review.get("phase_result", "pass")).strip().lower(),
         "appearance_review": {
@@ -307,25 +320,16 @@ def normalize_visual_review(
         "criteria_scores": {
             # 缺失或格式异常时一律按 0.0 处理，让评分逻辑向失败方向收敛。
             "design_quality": {
-                "score": _coerce_score(
-                    (criteria_scores.get("design_quality") or {}).get("score"),
-                    fallback=0.0,
-                ),
-                "notes": str((criteria_scores.get("design_quality") or {}).get("notes", "")).strip(),
+                "score": _coerce_score(design_score, fallback=0.0),
+                "notes": design_notes,
             },
             "originality": {
-                "score": _coerce_score(
-                    (criteria_scores.get("originality") or {}).get("score"),
-                    fallback=0.0,
-                ),
-                "notes": str((criteria_scores.get("originality") or {}).get("notes", "")).strip(),
+                "score": _coerce_score(originality_score, fallback=0.0),
+                "notes": originality_notes,
             },
             "craft": {
-                "score": _coerce_score(
-                    (criteria_scores.get("craft") or {}).get("score"),
-                    fallback=0.0,
-                ),
-                "notes": str((criteria_scores.get("craft") or {}).get("notes", "")).strip(),
+                "score": _coerce_score(craft_score, fallback=0.0),
+                "notes": craft_notes,
             },
         },
     }

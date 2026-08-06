@@ -82,7 +82,9 @@ class VisualReviewRound:
                 f"[bold yellow]Visual review[/] round {self.round_num} failed; "
                 f"failing the appearance phase closed: {exc}"
             )
-            return visual_review_failure(grades, str(exc)), None
+            return visual_review_failure(
+                grades, str(exc), infrastructure_failure=True
+            ), None
 
         normalized = normalizer(review, screenshot_paths)
         return apply_visual_review_scores(grades, normalized), vision_stats

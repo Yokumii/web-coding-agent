@@ -1,4 +1,3 @@
-import json
 import tempfile
 from pathlib import Path
 
@@ -305,3 +304,17 @@ def test_reset_run_artifacts_clears_new_planning_files():
         assert not logs_dir.exists()
         assert not traces_dir.exists()
         assert not (harness_dir / "design").exists()
+
+
+def test_reset_keeps_accepted_edit_baseline_but_removes_stale_edit_scope():
+    with tempfile.TemporaryDirectory() as tmp:
+        comm = FileComm(Path(tmp) / ".harness")
+        baseline = comm.dir / "edit_dom_baseline.json"
+        stale_scope = comm.dir / "edit_scope_round_1.json"
+        baseline.write_text('{"roots": []}')
+        stale_scope.write_text('{"allowed_root_keys": ["main"]}')
+
+        comm.reset_run_artifacts()
+
+        assert baseline.exists()
+        assert not stale_scope.exists()

@@ -5,9 +5,17 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk.types import ResultMessage
 
-from src.agents.generator import _describe_failures, run_generator
+from src.agents.generator import (
+    _describe_failures,
+    _validate_generator_commits,
+    _validate_repair_scope,
+    _validate_generator_runnable_files,
+    run_generator,
+)
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
+from src.agents._shared import expose_local_claude_skills
 
 
 @pytest.fixture
@@ -46,6 +54,21 @@ def _write_generator_context(file_comm: FileComm) -> None:
             "last_evaluated_round": 0,
         }
     )
+
+
+def test_expose_local_skills_replaces_external_symlink_with_copy(tmp_path: Path):
+    workdir = tmp_path / "workdir"
+    source = tmp_path / "repo-skills"
+    (source / "ui-skill").mkdir(parents=True)
+    (source / "ui-skill" / "SKILL.md").write_text("# skill\n")
+    (workdir / ".claude").mkdir(parents=True)
+    (workdir / ".claude" / "skills").symlink_to(source, target_is_directory=True)
+
+    expose_local_claude_skills(workdir, source)
+
+    exposed = workdir / ".claude" / "skills"
+    assert not exposed.is_symlink()
+    assert (exposed / "ui-skill" / "SKILL.md").read_text() == "# skill\n"
 
 
 @pytest.mark.anyio
@@ -105,8 +128,6 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
     assert "preserve accepted work" in captured["prompt"]
     assert ".claude/skills/ui-ux-pro-max/SKILL.md" in captured["prompt"]
     assert "npm --prefix frontend run build" in captured["prompt"]
-    assert "cd frontend && npm run build" in captured["prompt"]
-    assert "never run `npm run build` from the workdir root" in captured["prompt"]
     assert "Read the planning bundle first" not in captured["prompt"]
     assert ".harness/spec.md" not in captured["prompt"]
     assert ".harness/ui_verification_plan.json" not in captured["prompt"]
@@ -235,10 +256,20 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
     assert "Do not implement new features from future sprints." in captured["prompt"]
     assert "Do not start work for the next sprint." in captured["prompt"]
     assert "npm --prefix frontend run build" in captured["prompt"]
-    assert "cd frontend && npm run build" in captured["prompt"]
-    assert "never run `npm run build` from the workdir root" in captured["prompt"]
     assert ".harness/spec.md" not in captured["prompt"]
     assert ".harness/feature_list.json" not in captured["prompt"]
+
+
+def test_generator_system_prompt_limits_validation_and_git_workflow():
+    prompt = GENERATOR_SYSTEM_PROMPT
+
+    assert "The Harness, not you, starts the dev server" in prompt
+    assert "Never start or background a dev server" in prompt
+    assert "test_server.js" in prompt
+    assert "one optional `git status`, then `git add`, then `git commit`" in prompt
+    assert "no `&`, `&&`, `||`, `|`" in prompt
+    assert "Command chains and pipelines" not in prompt
+    assert "You own the Git history and decide when to commit" not in prompt
 
 
 @pytest.mark.anyio
@@ -345,10 +376,8 @@ async def test_generator_exposes_repo_local_claude_skills_to_workdir(monkeypatch
 
     exposed = tmp_path / ".claude" / "skills"
     assert exposed.exists()
-    if exposed.is_symlink():
-        assert exposed.resolve() == source_skills.resolve()
-    else:
-        assert (exposed / "ui-ux-pro-max" / "SKILL.md").read_text() == "# local skill\n"
+    assert not exposed.is_symlink()
+    assert (exposed / "ui-ux-pro-max" / "SKILL.md").read_text() == "# local skill\n"
 
 
 @pytest.mark.anyio
@@ -536,6 +565,91 @@ def test_describe_failures_includes_failed_exit_criterion():
 def test_describe_failures_empty_returns_fallback():
     text = _describe_failures({}, sprint_context={"feature_ids": []})
     assert "no specific failures" in text
+
+
+def test_generator_system_prompt_requires_agent_owned_feat_fix_commits():
+    assert "feat(scope):" in GENERATOR_SYSTEM_PROMPT
+    assert "fix(scope):" in GENERATOR_SYSTEM_PROMPT
+    assert "Create one final atomic commit" in GENERATOR_SYSTEM_PROMPT
+    assert "Do not amend or rewrite Git history" in GENERATOR_SYSTEM_PROMPT
+
+
+def test_generator_commit_gate_requires_mode_prefix_and_clean_tree(tmp_path: Path):
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True)
+    (frontend / "app.js").write_text("base\n")
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: baseline"], cwd=frontend, check=True, capture_output=True)
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, check=True, text=True, capture_output=True
+    ).stdout.strip()
+
+    assert "feat" in _validate_generator_commits(frontend, baseline, "generate")
+    (frontend / "app.js").write_text("feature\n")
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "feat(core): add timer"], cwd=frontend, check=True, capture_output=True)
+    assert _validate_generator_commits(frontend, baseline, "generate") is None
+
+
+def test_repair_scope_gate_rejects_large_diff(tmp_path: Path):
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True)
+    (frontend / "app.js").write_text("base\n")
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: baseline"], cwd=frontend, check=True, capture_output=True)
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    (frontend / "app.js").write_text("".join(f"line {i}\n" for i in range(1001)))
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "fix(core): broad rewrite"], cwd=frontend, check=True, capture_output=True)
+
+    error = _validate_repair_scope(frontend, baseline)
+    assert error is not None
+    assert "too broad" in error
+    assert "1002 changed lines" in error
+
+
+def test_repair_scope_gate_accepts_small_diff(tmp_path: Path):
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True)
+    (frontend / "app.js").write_text("const active = false;\n")
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: baseline"], cwd=frontend, check=True, capture_output=True)
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    (frontend / "app.js").write_text("const active = true;\n")
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "fix(core): enable interaction"], cwd=frontend, check=True, capture_output=True)
+
+    assert _validate_repair_scope(frontend, baseline) is None
+
+
+def test_generator_runnable_files_gate_requires_package_json(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+
+    assert "package.json" in _validate_generator_runnable_files(frontend)
+    (frontend / "package.json").write_text('{"scripts":{"dev":"vite"}}')
+    assert _validate_generator_runnable_files(frontend) is None
 
 
 @pytest.mark.anyio

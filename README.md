@@ -14,6 +14,18 @@ The current implementation is intentionally **frontend-only**:
 
 There is **no backend generation or backend runtime** in the current harness.
 
+## Monorepo role
+
+Inside `WebCoding_Data`, this package is the **agentic/forward data producer**.
+Its source, tests, prompts, and exporter are versioned with the parent monorepo, while
+runtime artifacts live outside this source directory:
+
+- `../runs/agentic/`: task workdirs, checkpoints, traces, screenshots, and exported trajectories
+- `../logs/agentic/`: persistent launcher, API probe, and seed-sync logs
+
+The sibling `construct/` pipeline remains the reverse/controlled producer. Both routes
+share release-level audits and schemas but retain distinct provenance labels.
+
 ## Status
 
 What is implemented:
@@ -34,6 +46,7 @@ What is implemented:
 - Claude HTTP trace pairs for SDK-backed agent runs: `*.http.jsonl` remains the source trace, and `*.http.html` is generated beside it for browser inspection
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
+- Forward edit DOM contract guard: a verified seed is snapshotted before editing; semantic DOM/ARIA surfaces outside the declared (max-two-root) edit scope must remain unchanged. This is independent of screenshot/pixel scoring.
 
 ## Requirements
 
@@ -97,7 +110,7 @@ EVALUATOR_VISION_MODEL=claude-sonnet-4-6
 EVALUATOR_VISION_API_KEY=...
 EVALUATOR_VISION_BASE_URL=...
 EVALUATOR_VISION_ENDPOINT_TYPE=anthropic   # or "openai" for OpenAI-compatible chat completions
-EVALUATOR_VISION_MAX_TOKENS=1200
+EVALUATOR_VISION_MAX_TOKENS=4096
 EVALUATOR_VISION_MAX_RETRIES=3             # transient 5xx / URLError retries (default 3)
 EVALUATOR_VISION_RETRY_BASE_DELAY=2.0      # exponential backoff base in seconds (default 2.0)
 ```
@@ -127,6 +140,7 @@ Model selectors:
 - `GENERATOR_MODEL`
 - `EVALUATOR_MODEL`
 - `EVALUATOR_VISION_MODEL`
+- `PLANNER_SCOPE_MODE` (`query-aligned` by default; `expansive-data` restores the legacy 5-10 Sprint data-construction roadmap)
 
 CLI overrides:
 
@@ -134,6 +148,7 @@ CLI overrides:
 - `--generator-model`
 - `--evaluator-model`
 - `--evaluator-vision-model`
+- `--planner-scope-mode query-aligned|expansive-data`
 
 Runtime knobs:
 
@@ -141,6 +156,7 @@ Runtime knobs:
 - `MAX_ROUNDS` ↔ `--max-rounds`
 - `FRONTEND_PORT` ↔ `--frontend-port`
 - `DESIGN_MODE` ↔ `--design-mode`
+- `PLANNER_SCOPE_MODE` ↔ `--planner-scope-mode`
 - `PLAYWRIGHT_HEADLESS` ↔ `--playwright-headless` / `--no-playwright-headless`
 
 Built-in defaults:
@@ -151,6 +167,55 @@ Built-in defaults:
 - frontend port: `5173`
 - design mode: `text-only`
 - Playwright headless: `false`
+
+OpenAI-compatible models use the native tool-calling runtime instead of Claude
+Agent SDK. Configure it without putting credentials in the repository:
+
+```bash
+export AGENT_RUNTIME=openai
+export OPENAI_AGENT_BASE_URL=https://api.deepseek.com
+export OPENAI_AGENT_API_KEY=...
+export PLANNER_MODEL=deepseek-chat
+export GENERATOR_MODEL=deepseek-chat
+export EVALUATOR_MODEL=deepseek-chat
+```
+
+`AGENT_RUNTIME=auto` (the default) selects the native runtime for common
+OpenAI-compatible model prefixes (`deepseek`, `qwen`, `gpt-`, `o1/o3/o4`)
+and preserves the existing SDK route for other configured aliases. Safety limits are
+configurable with `AGENT_PHASE_TIMEOUT_SECONDS` (default 600),
+`AGENT_REQUEST_TIMEOUT_SECONDS` (120), and `AGENT_MAX_TOOL_CALLS` (120).
+
+Evaluator modes:
+
+- `EVALUATOR_MODE=full` keeps the existing LLM browser evaluator and visual review.
+- `EVALUATOR_MODE=simple` uses a deterministic Playwright render/runtime gate with desktop and mobile screenshots and no LLM calls.
+
+### Forward edit regression guard
+
+Workdirs created by `scripts/prepare_forward_edit_seed.py` contain a verified
+`seed_manifest.json`. Before the first edit build, the harness starts that seed and
+writes `.harness/edit_dom_baseline.json`: a hash-only snapshot of meaningful
+DOM/ARIA surfaces (landmarks, roles, `data-testid` roots and semantic controls),
+including whether each normally focusable control can actually receive keyboard focus;
+it is not a screenshot. The generator must then write
+`.harness/edit_scope_round_N.json`, for example:
+
+```json
+{"allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
+```
+
+The contract permits changes inside at most two named baseline surfaces. Removal or
+semantic change of another surface, or an unapproved new surface, fails the round as
+a regression and is recorded in `grade_round_N.json::edit_guard`. Use this to keep
+an edit task narrow; do not use it as proof that the requested behavior works—the
+normal browser evaluator remains responsible for that.
+
+For final-website generation, set `FINAL_PROJECT_MODE=1` or pass
+`--final-project-mode`. The planner chooses a natural Sprint count and the harness
+continues until the complete product is accepted. Intermediate commits remain only
+for execution and recovery; consumers should not extract edit/repair samples from
+this run. This mode uses the full evaluator by default (`EVALUATOR_MODE=full`).
 
 Design image generation is configured by environment only:
 

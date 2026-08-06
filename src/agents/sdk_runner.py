@@ -518,13 +518,22 @@ def build_agent_options(
     if target_base_url:
         env["ANTHROPIC_BASE_URL"] = target_base_url
 
-    return ClaudeAgentOptions(
-        model=model,
-        system_prompt={
+    normalized_model = model.strip().lower()
+    sdk_system_prompt: str | dict[str, str]
+    if not normalized_model.startswith("qwen"):
+        sdk_system_prompt = {
             "type": "preset",
             "preset": "claude_code",
             "append": system_prompt,
-        },
+        }
+    else:
+        # OpenAI-compatible models should not inherit Claude Code-specific
+        # worktree, attribution, or product-behavior instructions.
+        sdk_system_prompt = system_prompt
+
+    return ClaudeAgentOptions(
+        model=model,
+        system_prompt=sdk_system_prompt,
         cwd=workdir,
         max_turns=max_turns,
         allowed_tools=allowed_tools,
@@ -561,6 +570,29 @@ async def run_sdk_agent(
     trace_path: Path | None = None,
 ) -> tuple[ResultMessage, float, str, list[Any]]:
     """运行单个 SDK agent，并统一收集文本、权限拒绝与成本信息。"""
+    runtime = config.agent_runtime.strip().lower()
+    if runtime not in {"auto", "claude", "openai"}:
+        raise ValueError(f"unsupported AGENT_RUNTIME: {config.agent_runtime!r}")
+    normalized_model = model.strip().lower()
+    openai_model_prefixes = ("deepseek", "qwen", "gpt-", "o1", "o3", "o4")
+    if runtime == "openai" or (
+        runtime == "auto" and normalized_model.startswith(openai_model_prefixes)
+    ):
+        from src.agents.openai_runner import run_openai_agent
+
+        return await run_openai_agent(
+            prompt=prompt,
+            config=config,
+            workdir=workdir,
+            model=model,
+            system_prompt=system_prompt,
+            max_turns=max_turns,
+            allow_bash=allow_bash,
+            allow_playwright=allow_playwright,
+            bash_profile=bash_profile,
+            stop_hooks=stop_hooks,
+            trace_path=trace_path,
+        )
     trace_writer = SdkTraceWriter(trace_path) if trace_path else None
     http_trace_path = trace_path.with_suffix(".http.jsonl") if trace_path else None
     upstream_base_url = resolve_claude_upstream_base_url(config.base_url)

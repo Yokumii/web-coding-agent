@@ -1658,10 +1658,7 @@ async def test_resume_does_not_clear_frontend_dir(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.anyio
-async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: Path):
-    """commit_round runs once per generator round with the right kwargs."""
-    from src.orchestration.git_journal import CommitResult
-
+async def test_harness_does_not_commit_on_behalf_of_generator(monkeypatch, tmp_path: Path):
     stack = DummyAppStack()
     file_comm = FileComm(tmp_path / ".harness")
     file_comm.write_sprint_plan(
@@ -1669,18 +1666,6 @@ async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: P
     )
     _write_feature_list(file_comm)
     file_comm.write_accepted_sprints({"accepted": [], "current_target": 1, "last_evaluated_round": 0})
-
-    commit_calls: list[dict] = []
-
-    async def fake_commit_round(frontend_dir, **kwargs):
-        commit_calls.append({"frontend_dir": Path(frontend_dir), **kwargs})
-        return CommitResult(
-            success=True,
-            commit_hash="0" * 40,
-            message="round msg",
-            error=None,
-            was_empty=False,
-        )
 
     async def fake_planner(*args, **kwargs):
         return 0.1
@@ -1709,7 +1694,6 @@ async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: P
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
-    monkeypatch.setattr("src.orchestration.phases.commit_round", fake_commit_round)
     monkeypatch.setattr("src.orchestration.phases.run_planner", fake_planner)
     monkeypatch.setattr("src.orchestration.phases.run_generator", fake_generator)
     monkeypatch.setattr("src.orchestration.phases.run_evaluator", fake_evaluator)
@@ -1718,23 +1702,8 @@ async def test_generator_commit_round_invoked_per_build(monkeypatch, tmp_path: P
 
     await run_harness("test prompt", tmp_path, HarnessConfig(max_rounds=1))
 
-    assert len(commit_calls) == 1, f"expected 1 commit, got {len(commit_calls)}"
-    call = commit_calls[0]
-    assert call["frontend_dir"] == tmp_path / "frontend"
-    assert call["round_n"] == 1
-    assert call["sprint_num"] == 1
-    # Round 1 is deterministic: _select_generator_mode short-circuits to
-    # "generate" before any state-dependent checks (harness.py:126-127).
-    assert call["mode"] == "generate"
-    # Round 1 has no prior grade.
-    assert call["prior_grade"] is None
-    assert call["accepted"] == []
-
-    # Task 5 also writes a build_log.md line on successful commit. Assert
-    # the harness consumes the CommitResult and surfaces the short SHA.
     build_log = file_comm.read_build_log() or ""
-    assert "git commit 0000000" in build_log
-    assert "round 01/sprint_1 (generate)" in build_log
+    assert "git commit" not in build_log
 
 
 @pytest.mark.anyio

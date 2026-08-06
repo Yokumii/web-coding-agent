@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import web
@@ -59,6 +60,12 @@ class ClaudeHttpTraceProxy:
 def resolve_claude_upstream_base_url(base_url: str | None) -> str:
     normalized = (base_url or "").strip()
     return normalized or DEFAULT_ANTHROPIC_BASE_URL
+
+
+def _uses_loopback_host(url: str) -> bool:
+    """Never send a local tracing upstream through an ambient HTTP proxy."""
+    host = (urlsplit(url).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1"}
 
 
 def normalize_usage(usage: object) -> dict[str, Any]:
@@ -472,7 +479,12 @@ async def capture_claude_http_traffic(
 
     upstream_base_url = resolve_claude_upstream_base_url(target_url)
     trace_writer = ClaudeHttpTraceWriter(trace_path)
-    session = aiohttp.ClientSession(auto_decompress=False, trust_env=True)
+    # `trust_env=True` is needed for external model endpoints in this office
+    # environment, but it can route loopback test/app servers into HTTP_PROXY.
+    session = aiohttp.ClientSession(
+        auto_decompress=False,
+        trust_env=not _uses_loopback_host(upstream_base_url),
+    )
     app = web.Application(client_max_size=0)
     app[TRACE_CTX_KEY] = {
         "upstream_base_url": upstream_base_url,

@@ -72,6 +72,12 @@ For each check:
 - include the task
 - include the expected result
 - include concise notes
+- Use `fail` only after observing behavior that contradicts the expected result.
+- If the evaluator could not reach or exercise a control within its budget, record
+  `partial` with an explicit "not verified" note. Lack of evaluator coverage is not
+  evidence of a project defect and must not produce a repair recommendation.
+- Before leaving a critical check unverified, use navigation labels, direct routes,
+  scrolling, and focused source inspection to locate the intended interaction.
 
 For each sprint exit criterion result:
 - include the stable `criterion_id` from the provided mapping when available
@@ -97,6 +103,12 @@ To keep the JSON schema complete, include provisional placeholder values.
 Use source inspection only when it improves bug localization or repair instructions.
 Mark this phase as `pass` or `skipped`.
 
+### Edit Scope Audit (only when an Edit Scope Contract is supplied)
+Independently compare the declared editable DOM surfaces with the current sprint goal.
+A scope that includes unrelated accepted areas, or allows new surfaces without a clear
+need, is a regression. Record `edit_scope_audit` as `pass` or `fail`; a `fail` forces
+`overall_passed = false` and `mode_recommendation = "repair"`.
+
 ### Phase E: Score Aggregation And Verdict
 Produce final outward-facing criteria:
 - `design_quality`
@@ -116,6 +128,9 @@ Apply these verdict rules:
 4. `mode_recommendation = "repair"` when `overall_passed` is false
 5. `mode_recommendation = "generate_next_sprint"` when the sprint passes and more sprints remain
 6. `mode_recommendation = "complete"` when the final sprint passes
+7. Never fail a sprint solely because a check was not observed or not verified.
+   A failure verdict requires at least one concrete reproduced defect.
+8. A failed Edit Scope Audit is a concrete contract defect and forces failure.
 
 ## Output Contract
 
@@ -209,6 +224,7 @@ Write `.harness/grade_round_N.json` with this schema:
   },
   "bugs_found": ["string"],
   "regressions_found": [],
+  "edit_scope_audit": "pass",
   "missing_features": [],
   "repair_instructions": ["string"]
 }

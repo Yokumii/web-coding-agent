@@ -1,9 +1,19 @@
 .env*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*service-account*.json
+*secrets*.json
 workdir/
 examples/*
 !examples/*.tgz
 runs/
+/runs
+.harness/
+.claude/worktrees/
 .claude/settings.local.json
 .playwright-mcp/
 
@@ -36,6 +46,7 @@ build/
 # Logs
 *.log
 app.log
+/logs
 
 # Test coverage
 .coverage

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Any, TypeVar
@@ -24,6 +25,7 @@ T = TypeVar("T", bound=_Artifact)
 _TEXT_ARTIFACTS = ("spec.md", "progress.md", "build_log.md")
 _ROUND_TEXT_PATTERNS = ("feedback_round_*.md",)
 _ROUND_IMAGE_PATTERNS = ("visual_round_*.png",)
+_EDIT_SCOPE_PATTERNS = ("edit_scope_round_*.json",)
 _PLANNING_TEXT_SCAFFOLDS = {
     "spec.md": (
         "# Draft Product - Working Title\n\n"
@@ -144,6 +146,16 @@ class FileComm:
         model = self._read(DesignTokens)
         return model.model_dump() if model else None
 
+    def write_target_profile(self, payload: dict[str, Any]) -> Path:
+        return self._write_text(
+            "target_profile.json",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+    def read_target_profile(self) -> dict[str, Any] | None:
+        text = self._read_text("target_profile.json")
+        return json.loads(text) if text else None
+
     def write_feature_list(self, feature_list: dict[str, Any]) -> Path:
         return self._write(FeatureList.model_validate(feature_list))
 
@@ -225,7 +237,10 @@ class FileComm:
         """在新一轮执行前清理本轮临时产物。"""
         for name in _TEXT_ARTIFACTS:
             self._path(name).unlink(missing_ok=True)
-        self._unlink_matching(*_ROUND_TEXT_PATTERNS, *_ROUND_IMAGE_PATTERNS)
+        self._path("target_profile.json").unlink(missing_ok=True)
+        self._unlink_matching(
+            *_ROUND_TEXT_PATTERNS, *_ROUND_IMAGE_PATTERNS, *_EDIT_SCOPE_PATTERNS
+        )
 
         # 通过 schema 注册表删除 JSON 产物。
         for model in ALL_ARTIFACT_MODELS:

@@ -7,9 +7,9 @@ import pytest
 from claude_agent_sdk.types import ResultMessage
 
 from src.agents.evaluator import _determine_passed, _extract_grades_from_response, run_evaluator
-from src.agents.sdk_runner import AgentRunStats
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.sprint_state import SprintState
 
 
 @pytest.fixture
@@ -159,6 +159,7 @@ def _passing_grades(round_num: int = 1) -> dict:
         "regressions_found": [],
         "missing_features": [],
         "repair_instructions": [],
+        "edit_scope_audit": "pass",
     }
 
 
@@ -236,6 +237,22 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
     assert "3. .harness/visual_manifest_round_2.json" in captured["prompt"]
     assert ".harness/visual_round_2_home.png" in captured["prompt"]
     assert "downstream VLM review" in captured["prompt"]
+
+
+def test_evaluator_prompt_requires_independent_edit_scope_audit(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_evaluator_context(file_comm)
+    from src.agents.evaluator import _build_evaluator_prompt
+
+    prompt = _build_evaluator_prompt(
+        file_comm=file_comm, workdir=tmp_path, round_num=1, sprint_num=1,
+        sprint_run_context=SprintState.load(file_comm).current_run_context(),
+        app_url="http://127.0.0.1:4173",
+        edit_guard={"passed": True, "allowed_root_keys": ["main"]},
+    )
+    assert ".harness/edit_dom_baseline.json" in prompt
+    assert ".harness/edit_scope_round_1.json" in prompt
+    assert "Edit Scope Contract (independent audit required)" in prompt
 
 
 @pytest.mark.anyio

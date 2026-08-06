@@ -14,23 +14,27 @@ DEFAULT_PLANNER_BUDGET_USD = 2.0
 DEFAULT_GENERATOR_BUDGET_USD = 80.0
 DEFAULT_EVALUATOR_BUDGET_USD = 10.0
 DEFAULT_MAX_ROUNDS = 3
-DEFAULT_GENERATOR_MAX_TURNS = 200
-DEFAULT_EVALUATOR_MAX_TURNS = 120
+DEFAULT_GENERATOR_MAX_TURNS = 50
+DEFAULT_EVALUATOR_MAX_TURNS = 30
 DEFAULT_MAX_DELIVERABLES_PER_SPRINT = 5
 DEFAULT_MAX_EXIT_CRITERIA_PER_SPRINT = 5
 DEFAULT_FRONTEND_PORT = 5173
 DEFAULT_BACKEND_PORT = 8000
 DEFAULT_PLAYWRIGHT_HEADLESS = False
 DEFAULT_DESIGN_MODE = "text-only"
+DEFAULT_PLANNER_SCOPE_MODE = "query-aligned"
 DEFAULT_DESIGN_IMAGE_BASE_URL = "https://right.codes/draw"
 DEFAULT_DESIGN_IMAGE_MODEL = "gpt-image-2"
 DEFAULT_DESIGN_IMAGE_SIZE = "1024x1024"
 DEFAULT_DESIGN_IMAGE_TIMEOUT_SECONDS = 180
 DEFAULT_VISION_ENDPOINT_TYPE = "anthropic"
-DEFAULT_VISION_MAX_TOKENS = 1200
+DEFAULT_VISION_MAX_TOKENS = 4096
 DEFAULT_VISION_MAX_RETRIES = 3
+DEFAULT_VISION_TIMEOUT_SECONDS = 300
 DEFAULT_VISION_RETRY_BASE_DELAY_SECONDS = 2.0
 DEFAULT_SDK_MAX_BUFFER_SIZE = 8 * 1024 * 1024
+DEFAULT_OPENAI_RECENT_MESSAGES = 18
+DEFAULT_OPENAI_TOOL_RESULT_CHARS = 8000
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -65,6 +69,22 @@ class HarnessConfig:
 
     api_key: str = field(default_factory=lambda: _env_str("ANTHROPIC_API_KEY"))
     base_url: str = field(default_factory=lambda: _env_str("ANTHROPIC_BASE_URL"))
+    agent_runtime: str = field(default_factory=lambda: _env_str("AGENT_RUNTIME", "auto"))
+    openai_api_key: str = field(default_factory=lambda: _env_str("OPENAI_AGENT_API_KEY"))
+    openai_base_url: str = field(default_factory=lambda: _env_str("OPENAI_AGENT_BASE_URL"))
+    agent_phase_timeout_seconds: int = field(default_factory=lambda: _env_int("AGENT_PHASE_TIMEOUT_SECONDS", 600))
+    agent_request_timeout_seconds: int = field(default_factory=lambda: _env_int("AGENT_REQUEST_TIMEOUT_SECONDS", 120))
+    agent_max_tool_calls: int = field(default_factory=lambda: _env_int("AGENT_MAX_TOOL_CALLS", 120))
+    openai_recent_messages: int = field(
+        default_factory=lambda: _env_int(
+            "OPENAI_RECENT_MESSAGES", DEFAULT_OPENAI_RECENT_MESSAGES
+        )
+    )
+    openai_tool_result_chars: int = field(
+        default_factory=lambda: _env_int(
+            "OPENAI_TOOL_RESULT_CHARS", DEFAULT_OPENAI_TOOL_RESULT_CHARS
+        )
+    )
 
     planner_model: str = field(
         default_factory=lambda: _env_str("PLANNER_MODEL", DEFAULT_MODEL)
@@ -74,6 +94,13 @@ class HarnessConfig:
     )
     evaluator_model: str = field(
         default_factory=lambda: _env_str("EVALUATOR_MODEL", DEFAULT_MODEL)
+    )
+    evaluator_mode: str = field(default_factory=lambda: _env_str("EVALUATOR_MODE", "full"))
+    final_project_mode: bool = field(default_factory=lambda: _env_bool("FINAL_PROJECT_MODE", False))
+    planner_scope_mode: str = field(
+        default_factory=lambda: _env_str(
+            "PLANNER_SCOPE_MODE", DEFAULT_PLANNER_SCOPE_MODE
+        )
     )
     evaluator_vision_model: str = field(
         default_factory=lambda: _env_str(
@@ -109,6 +136,12 @@ class HarnessConfig:
         default_factory=lambda: _env_int(
             "EVALUATOR_VISION_MAX_RETRIES",
             DEFAULT_VISION_MAX_RETRIES,
+        )
+    )
+    evaluator_vision_timeout_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "EVALUATOR_VISION_TIMEOUT_SECONDS",
+            DEFAULT_VISION_TIMEOUT_SECONDS,
         )
     )
     evaluator_vision_retry_base_delay_seconds: float = field(
@@ -164,8 +197,16 @@ class HarnessConfig:
     max_rounds: int = field(
         default_factory=lambda: _env_int("MAX_ROUNDS", DEFAULT_MAX_ROUNDS)
     )
-    generator_max_turns: int = DEFAULT_GENERATOR_MAX_TURNS
-    evaluator_max_turns: int = DEFAULT_EVALUATOR_MAX_TURNS
+    generator_max_turns: int = field(
+        default_factory=lambda: _env_int(
+            "GENERATOR_MAX_TURNS", DEFAULT_GENERATOR_MAX_TURNS
+        )
+    )
+    evaluator_max_turns: int = field(
+        default_factory=lambda: _env_int(
+            "EVALUATOR_MAX_TURNS", DEFAULT_EVALUATOR_MAX_TURNS
+        )
+    )
 
     max_deliverables_per_sprint: int = field(
         default_factory=lambda: _env_int(

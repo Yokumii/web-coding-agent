@@ -98,6 +98,7 @@ def test_apply_dedicated_visual_review_marks_failure_when_scorer_raises(
 
     assert stats is None
     _assert_visual_failure_recorded(merged)
+    assert merged["evaluation_infrastructure_failure"]["phase"] == "visual_review"
     # The original placeholder grades dict must not be mutated in place.
     assert grades["overall_passed"] is True
 

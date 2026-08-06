@@ -9,10 +9,10 @@ from src.config import HarnessConfig
 from src.orchestration import phases
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
-from src.orchestration.git_journal import CommitResult
 from src.orchestration.phases import (
     HarnessContext,
     Verdict,
+    _edit_guard_requires_repair,
     run_build_phase,
     run_evaluate_phase,
     run_planner_phase,
@@ -34,6 +34,18 @@ def _stats(cost_usd: float) -> AgentRunStats:
         usage={"input_tokens": 100, "output_tokens": 20},
         model_usage={},
     )
+
+
+def test_edit_guard_requires_both_machine_contract_and_independent_scope_audit():
+    assert _edit_guard_requires_repair(
+        {"passed": True}, {"edit_scope_audit": "pass"}, evaluator_mode="full"
+    ) is False
+    assert _edit_guard_requires_repair(
+        {"passed": True}, {}, evaluator_mode="full"
+    ) is True
+    assert _edit_guard_requires_repair(
+        {"passed": False}, {"edit_scope_audit": "pass"}, evaluator_mode="simple"
+    ) is True
 
 
 def _stub_sprint(number: int) -> dict:
@@ -155,7 +167,7 @@ async def test_run_planner_phase_survives_delayed_cancellation(monkeypatch, tmp_
 
 
 @pytest.mark.anyio
-async def test_run_build_phase_survives_delayed_cancellation(monkeypatch, tmp_path: Path):
+async def test_run_build_phase_does_not_auto_commit(monkeypatch, tmp_path: Path):
     ctx = _make_ctx(tmp_path)
     parent_task: asyncio.Task | None = None
     frontend_dir = tmp_path / "frontend"
@@ -167,19 +179,11 @@ async def test_run_build_phase_survives_delayed_cancellation(monkeypatch, tmp_pa
         parent_task = asyncio.current_task()
         return _stats(0.2)
 
-    async def fake_commit_round(*args, **kwargs):
-        del args, kwargs
-        assert parent_task is not None
-        asyncio.get_running_loop().call_soon(parent_task.cancel)
-        return CommitResult(
-            success=True,
-            commit_hash="abc1234",
-            message="test commit",
-            was_empty=False,
-        )
+    async def forbidden_commit_round(*args, **kwargs):
+        raise AssertionError("Harness must not commit on behalf of the generator")
 
     monkeypatch.setattr("src.orchestration.phases.run_generator", fake_run_generator)
-    monkeypatch.setattr("src.orchestration.phases.commit_round", fake_commit_round)
+    monkeypatch.setattr("src.orchestration.git_journal.commit_round", forbidden_commit_round)
 
     await run_build_phase(ctx, 1)
 

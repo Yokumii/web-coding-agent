@@ -62,6 +62,26 @@ VISION_OWNED_CRITERIA = ("design_quality", "originality", "craft")
 _TRUTHY_STRINGS = frozenset({"true", "yes", "1", "y", "t", "pass", "passed", "ok"})
 _FALSEY_STRINGS = frozenset({"false", "no", "0", "n", "f", "fail", "failed"})
 _FAIL_STATUSES = frozenset({"fail", "failed", "partial"})
+_UNVERIFIED_MARKERS = (
+    "could not verify",
+    "not verified",
+    "unable to verify",
+    "not conclusively",
+    "not explicitly tested",
+    "not fully tested",
+    "not fully verified",
+    "within evaluation budget",
+    "cannot confirm",
+    "not confirmed",
+    "not observed",
+    "not directly verified",
+    "may not",
+    "appear incomplete",
+    "not captured",
+    "budget exhaustion",
+    "not tested",
+    "testing constraints",
+)
 
 
 def criterion_threshold(name: str, *, default: float = 0.0) -> float:
@@ -120,6 +140,28 @@ def _has_failed_critical_ui_checks(grades: dict[str, Any]) -> bool:
     return False
 
 
+def _only_unverified_partial_blockers(grades: dict[str, Any]) -> bool:
+    """Accept when the sole negative signal is evaluator coverage uncertainty."""
+    if not check_grades(grades) or _has_failed_critical_exit_criteria(grades):
+        return False
+    phase_results = grades.get("phase_results") or {}
+    if any(str(value).lower() == "fail" for value in phase_results.values()):
+        return False
+    found_partial = False
+    for check in grades.get("ui_checks", []):
+        if not isinstance(check, dict) or parse_tristate(check.get("critical")) is not True:
+            continue
+        status = str(check.get("status", "")).strip().lower()
+        if status in {"fail", "failed"}:
+            return False
+        if status == "partial":
+            found_partial = True
+            notes = str(check.get("notes", "")).lower()
+            if not any(marker in notes for marker in _UNVERIFIED_MARKERS):
+                return False
+    return found_partial
+
+
 def _has_failed_critical_exit_criteria(grades: dict[str, Any]) -> bool:
     for result in grades.get("target_exit_criteria_results", []):
         if not isinstance(result, dict):
@@ -131,10 +173,37 @@ def _has_failed_critical_exit_criteria(grades: dict[str, Any]) -> bool:
     return False
 
 
+def evaluation_is_inconclusive(grades: dict[str, Any] | None) -> bool:
+    """True when a fail verdict contains uncertainty but no reproduced defect."""
+    if not grades:
+        return False
+    phase = grades.get("phase_results") or {}
+    if str(phase.get("render_gate", "")).lower() == "fail":
+        return False
+    negative_notes: list[str] = []
+    for item in grades.get("target_exit_criteria_results", []):
+        if isinstance(item, dict) and parse_tristate(item.get("passed")) is False:
+            negative_notes.append(str(item.get("notes", "")))
+    for item in grades.get("ui_checks", []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status", "")).lower() in _FAIL_STATUSES:
+            negative_notes.append(str(item.get("notes", "")))
+    if not negative_notes:
+        return False
+    return all(
+        any(marker in note.lower() for marker in _UNVERIFIED_MARKERS)
+        for note in negative_notes
+    )
+
+
 def determine_passed(grades: dict[str, Any] | None) -> bool:
     """按关键字段与评分阈值综合判断当前轮是否通过。"""
     if not grades:
         return False
+
+    if _only_unverified_partial_blockers(grades):
+        return True
 
     if parse_tristate(grades.get("sprint_passed")) is False:
         return False
@@ -152,7 +221,9 @@ def determine_passed(grades: dict[str, Any] | None) -> bool:
     return check_grades(grades)
 
 
-def visual_review_failure(grades: dict[str, Any], reason: str) -> dict[str, Any]:
+def visual_review_failure(
+    grades: dict[str, Any], reason: str, *, infrastructure_failure: bool = False
+) -> dict[str, Any]:
     """复制 grades，并把视觉评分负责的字段统一标记为失败。"""
     merged = json.loads(json.dumps(grades))
 
@@ -176,6 +247,11 @@ def visual_review_failure(grades: dict[str, Any], reason: str) -> dict[str, Any]
 
     merged["overall_passed"] = False
     merged["mode_recommendation"] = "repair"
+    if infrastructure_failure:
+        merged["evaluation_infrastructure_failure"] = {
+            "phase": "visual_review",
+            "reason": reason,
+        }
     if merged.get("sprint_passed") is True:
         merged["sprint_passed"] = False
     return merged

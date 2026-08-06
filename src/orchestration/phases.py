@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -23,19 +24,39 @@ from src.config import HarnessConfig
 from src.orchestration.checkpoints import CheckpointTransaction
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
-from src.orchestration.git_journal import commit_round
+from src.orchestration.edit_dom_guard import capture_baseline, evaluate_guard, is_forward_edit
 from src.orchestration.runtime import start_app_stack
 from src.orchestration.sprint_state import SprintState
+from src.prompts.grading import evaluation_is_inconclusive
 from src.utils.logger import get_logger
 from src.utils.sdk_session import safe_sdk_session
 
 logger = get_logger(__name__)
 
 
+@asynccontextmanager
+async def _agent_phase_session(ctx: "HarnessContext", *, phase_name: str):
+    """Use the SDK cancellation guard only for the Claude SDK runtime.
+
+    The native OpenAI runner has no SDK stream to clean up. Wrapping it in the
+    guard can swallow a real cancellation and falsely let a phase finish
+    without writing its checkpoint.
+    """
+    if ctx.config.agent_runtime.strip().lower() == "openai":
+        yield
+        return
+    async with safe_sdk_session(phase_name=phase_name):
+        yield
+
+
 class Verdict(StrEnum):
     completed = "completed"
     accepted_review = "accepted_review"
     failed_review = "failed_review"
+
+
+class EvaluationInfrastructureError(RuntimeError):
+    """Evaluation provider/tooling failed; project code must not enter repair."""
 
 
 @dataclass
@@ -97,7 +118,7 @@ async def run_planner_phase(ctx: HarnessContext) -> None:
     logger.info("[bold cyan]═" * 40)
     logger.info("[bold cyan]PHASE 1: PLAN")
     started = time.perf_counter()
-    async with safe_sdk_session(phase_name="planner"):
+    async with _agent_phase_session(ctx, phase_name="planner"):
         raw_stats = await run_planner(ctx.config, ctx.user_prompt, ctx.file_comm, ctx.workdir)
         _record_phase_stats(ctx, "planner", _coerce_stats(raw_stats), started_at=started)
         _checkpoint_transaction(ctx).record_plan_completed()
@@ -155,35 +176,6 @@ def _select_generator_mode(
     return "generate"
 
 
-def _record_build_log(
-    ctx: HarnessContext,
-    commit_result,
-    round_num: int,
-    sprint_num: int,
-    mode: str,
-) -> None:
-    """将本轮构建提交结果追加到 build_log.md。"""
-    if commit_result.success:
-        short = (commit_result.commit_hash or "")[:7]
-        empty = " (no changes)" if commit_result.was_empty else ""
-        logger.info(
-            f"[bold green]Generator commit[/] {short} round={round_num} "
-            f"sprint={sprint_num} mode={mode}{empty}"
-        )
-        line = f"round {round_num:02d}/sprint_{sprint_num} ({mode}): git commit {short}{empty}"
-    else:
-        logger.warning(
-            f"[bold yellow]Generator commit failed[/] round={round_num} "
-            f"sprint={sprint_num}: {commit_result.error}"
-        )
-        line = (
-            f"round {round_num:02d}/sprint_{sprint_num} ({mode}): "
-            f"git commit FAILED — {commit_result.error}"
-        )
-    existing = ctx.file_comm.read_build_log() or ""
-    ctx.file_comm.write_build_log((existing.rstrip() + "\n" + line + "\n").lstrip())
-
-
 async def run_build_phase(
     ctx: HarnessContext,
     round_num: int,
@@ -194,7 +186,19 @@ async def run_build_phase(
     logger.info("[bold green]BUILD phase")
     sprint_num = ctx.sprint_state.current_target
     mode = _select_generator_mode(ctx, round_num, sprint_num, resume_state)
-    async with safe_sdk_session(phase_name=f"generator round {round_num}"):
+    baseline_path = ctx.file_comm.dir / "edit_dom_baseline.json"
+    if is_forward_edit(ctx.workdir) and not baseline_path.exists():
+        # Capture the already accepted seed before the editor has a chance to
+        # touch it.  A capture problem is infrastructure, not a repair signal.
+        app_stack = await start_app_stack(ctx.workdir, ctx.file_comm.dir, ctx.config, round_num)
+        try:
+            await capture_baseline(
+                workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
+                app_url=app_stack.frontend_url,
+            )
+        finally:
+            await app_stack.close()
+    async with _agent_phase_session(ctx, phase_name=f"generator round {round_num}"):
         ctx.sprint_state.mark_sprint_in_progress(sprint_num)
         started = time.perf_counter()
         raw_stats = await run_generator(
@@ -207,23 +211,6 @@ async def run_build_phase(
             _coerce_stats(raw_stats),
             started_at=started,
         )
-
-        # `prior_grade` 只在 repair 模式下有意义。
-        prior_grade = (
-            ctx.file_comm.read_grades(round_num - 1)
-            if round_num > 1 and mode == "repair"
-            else None
-        )
-        accepted = (ctx.file_comm.read_accepted_sprints() or {}).get("accepted", [])
-        commit_result = await commit_round(
-            ctx.workdir / "frontend",
-            round_n=round_num,
-            sprint_num=sprint_num,
-            mode=mode,
-            prior_grade=prior_grade,
-            accepted=accepted,
-        )
-        _record_build_log(ctx, commit_result, round_num, sprint_num, mode)
 
         _checkpoint_transaction(ctx).record_build_completed(
             round_num=round_num,
@@ -291,45 +278,127 @@ def _build_verdict(recommendation: str) -> Verdict:
     return Verdict.failed_review
 
 
+def _edit_guard_requires_repair(
+    guard_result: dict[str, Any] | None,
+    grades: dict[str, Any],
+    *,
+    evaluator_mode: str,
+) -> bool:
+    """Combine the mechanical contract with the independent scope audit."""
+    if guard_result is None:
+        return False
+    if not guard_result.get("passed"):
+        return True
+    return evaluator_mode == "full" and grades.get("edit_scope_audit") != "pass"
+
+
 async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     """执行 evaluator 与视觉复核，推进 sprint 状态并写入检查点。"""
     logger.info("[bold yellow]EVALUATE phase")
     sprint_num = ctx.sprint_state.current_target
     sprint_ctx = ctx.sprint_state.sprint_context(sprint_num)
     started = time.perf_counter()
+    ev_stats = None
+    startup_error: Exception | None = None
+    grades: dict[str, Any] = {}
+    passed = False
 
-    async with safe_sdk_session(phase_name=f"evaluator round {round_num}"):
-        app_stack = await start_app_stack(ctx.workdir, ctx.file_comm.dir, ctx.config, round_num)
+    async with _agent_phase_session(ctx, phase_name=f"evaluator round {round_num}"):
         try:
-            passed, grades, ev_stats = await run_evaluator(
-                ctx.config, ctx.file_comm, ctx.workdir,
-                round_num=round_num, app_url=app_stack.frontend_url,
-            )
-        finally:
-            await app_stack.close()
+            app_stack = await start_app_stack(ctx.workdir, ctx.file_comm.dir, ctx.config, round_num)
+        except Exception as exc:
+            startup_error = exc
+            reason = f"Application startup failed: {type(exc).__name__}: {exc}"
+            logger.warning(f"[bold red]{reason}[/]")
+            grades = {
+                "round": round_num,
+                "sprint": sprint_num,
+                "mode_recommendation": "repair",
+                "phase_results": {
+                    "render_gate": "fail",
+                    "ui_functionality": "fail",
+                    "appearance": "fail",
+                    "source_inspection": "skipped",
+                },
+                "sprint_passed": False,
+                "regression_passed": False,
+                "overall_passed": False,
+                "criteria": {
+                    name: {"score": 0.0, "passed": False, "notes": reason}
+                    for name in ("design_quality", "functionality", "originality", "craft")
+                },
+                "bugs_found": [reason],
+                "repair_instructions": [
+                    "Make `npm run dev -- --host HOST --port PORT --strictPort` honor the supplied host and port, then verify the application starts successfully."
+                ],
+            }
+            passed = False
+        else:
+            try:
+                guard_result = await evaluate_guard(
+                    workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
+                    app_url=app_stack.frontend_url, round_num=round_num,
+                )
+                passed, grades, ev_stats = await run_evaluator(
+                    ctx.config, ctx.file_comm, ctx.workdir,
+                    round_num=round_num, app_url=app_stack.frontend_url, edit_guard=guard_result,
+                )
+                if guard_result is not None:
+                    grades["edit_guard"] = guard_result
+                    if _edit_guard_requires_repair(
+                        guard_result, grades, evaluator_mode=ctx.config.evaluator_mode
+                    ):
+                        passed = False
+                        grades["regression_passed"] = False
+                        grades["overall_passed"] = False
+                        grades.setdefault("regressions_found", []).append(
+                            "Edit guard failed: "
+                            + str(guard_result.get("violations") or guard_result.get("reason")
+                                  or "the independent scope audit did not pass")
+                        )
+                        grades.setdefault("repair_instructions", []).append(
+                            "Restore every out-of-scope DOM/ARIA surface, or narrow the edit to the declared roots."
+                        )
+            finally:
+                await app_stack.close()
+
+    if not passed and evaluation_is_inconclusive(grades):
+        reason = (
+            "Evaluator did not reproduce a concrete defect; all negative findings "
+            "are explicitly unverified. Retry evaluation instead of repairing code."
+        )
+        grades["evaluation_infrastructure_failure"] = {
+            "phase": "evaluator_coverage",
+            "reason": reason,
+        }
+        ctx.file_comm.write_grades(round_num, grades)
+        ctx.file_comm.write_feedback(round_num, render_feedback_from_grades(grades))
+        raise EvaluationInfrastructureError(reason)
 
     visual_manifest = ctx.file_comm.read_visual_manifest(round_num)
 
-    _record_phase_stats(
-        ctx,
-        f"evaluator_r{round_num}",
-        _coerce_stats(ev_stats),
-        started_at=started,
-    )
+    if ev_stats is not None:
+        _record_phase_stats(
+            ctx,
+            f"evaluator_r{round_num}",
+            _coerce_stats(ev_stats),
+            started_at=started,
+        )
 
     vs_started = time.perf_counter()
     vs_stats = None
-    async with safe_sdk_session(phase_name=f"visual review round {round_num}"):
-        grades, vs_stats = await apply_dedicated_visual_review(
-            config=ctx.config,
-            file_comm=ctx.file_comm,
-            workdir=ctx.workdir,
-            round_num=round_num,
-            sprint_num=sprint_num,
-            sprint_context=sprint_ctx,
-            grades=grades,
-            manifest=visual_manifest,
-        )
+    if ctx.config.evaluator_mode == "full" and startup_error is None:
+        async with _agent_phase_session(ctx, phase_name=f"visual review round {round_num}"):
+            grades, vs_stats = await apply_dedicated_visual_review(
+                config=ctx.config,
+                file_comm=ctx.file_comm,
+                workdir=ctx.workdir,
+                round_num=round_num,
+                sprint_num=sprint_num,
+                sprint_context=sprint_ctx,
+                grades=grades,
+                manifest=visual_manifest,
+            )
     if vs_stats is not None:
         _record_phase_stats(
             ctx,
@@ -341,6 +410,14 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     if grades:
         ctx.file_comm.write_grades(round_num, grades)
         ctx.file_comm.write_feedback(round_num, render_feedback_from_grades(grades))
+
+    infra_failure = grades.get("evaluation_infrastructure_failure")
+    if infra_failure:
+        reason = str(infra_failure.get("reason", "unknown evaluation failure"))
+        raise EvaluationInfrastructureError(
+            "Evaluation infrastructure failed; refusing to create a code repair round: "
+            + reason
+        )
 
     grades, passed, recommendation = _normalize_grades_and_recommendation(
         ctx,

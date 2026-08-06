@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, build_opener
 
 from src.config import HarnessConfig
 from src.utils.logger import get_logger
@@ -50,7 +51,24 @@ def build_frontend_command(frontend_dir: Path, port: int) -> list[str]:
         return ["pnpm", "dev", "--host", HOST, "--port", str(port), "--strictPort"]
     if (frontend_dir / "yarn.lock").exists():
         return ["yarn", "dev", "--host", HOST, "--port", str(port), "--strictPort"]
+    # WebCompass includes plain HTML/CSS/JS projects without a Node manifest.
+    # Serving those files directly keeps the forward harness on the same source
+    # distribution as the reverse-built corpus.
+    package_json = frontend_dir / "package.json"
+    if (frontend_dir / "index.html").is_file() and _is_static_html_project(package_json):
+        return ["python3", "-m", "http.server", str(port), "--bind", HOST]
     return ["npm", "run", "dev", "--", "--host", HOST, "--port", str(port), "--strictPort"]
+
+
+def _is_static_html_project(package_json: Path) -> bool:
+    """Return true for plain projects, including agent-added empty npm stubs."""
+    if not package_json.is_file():
+        return True
+    try:
+        package = json.loads(package_json.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return not package.get("dependencies") and not package.get("devDependencies")
 
 
 def find_listening_pids(port: int) -> list[int]:
@@ -184,6 +202,7 @@ async def start_app_stack(
             command=build_frontend_command(frontend_dir, config.frontend_port),
             cwd=frontend_dir,
             log_path=logs_dir / f"frontend_round_{round_num}.log",
+            env_overrides={"HOST": HOST, "PORT": str(config.frontend_port)},
         )
         processes.append(frontend)
         await wait_for_http(
@@ -212,10 +231,13 @@ def start_process(
     command: list[str],
     cwd: Path,
     log_path: Path,
+    env_overrides: dict[str, str] | None = None,
 ) -> ManagedProcess:
     """以独立会话启动子进程，并将日志落到文件。"""
     log_file = log_path.open("w", encoding="utf-8")
     env = _build_subprocess_env()
+    if env_overrides:
+        env.update(env_overrides)
     process = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -318,9 +340,13 @@ async def wait_for_http(
 
 
 def fetch_status_code(url: str) -> int:
-    """读取目标地址的 HTTP 状态码。"""
+    """读取本地就绪探针的 HTTP 状态码，不继承外部代理设置。"""
     try:
-        with urlopen(url, timeout=2) as response:
+        # The harness only probes its own loopback app.  Respecting HTTP_PROXY
+        # here can route 127.0.0.1 through a corporate proxy and turn a healthy
+        # app into a false startup timeout.
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(url, timeout=2) as response:
             return getattr(response, "status", 200)
     except URLError as exc:  # pragma: no cover - thin wrapper around stdlib
         raise RuntimeError(str(exc)) from exc

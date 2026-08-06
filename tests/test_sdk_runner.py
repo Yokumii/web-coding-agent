@@ -25,9 +25,16 @@ from src.config import HarnessConfig
 from src.orchestration.pricing import estimate_cost_usd
 from src.utils.claude_http_trace import (
     DEFAULT_ANTHROPIC_BASE_URL,
+    _uses_loopback_host,
     capture_claude_http_traffic,
     generate_claude_http_trace_html,
 )
+
+
+def test_claude_http_trace_bypasses_proxy_for_loopback_upstreams():
+    assert _uses_loopback_host("http://127.0.0.1:5173") is True
+    assert _uses_loopback_host("http://[::1]:5173") is True
+    assert _uses_loopback_host("https://api.example.com") is False
 
 
 @pytest.fixture
@@ -319,6 +326,19 @@ def test_build_agent_options_sets_allowed_tools(tmp_path: Path):
     )
     assert "Write" in options.allowed_tools
     assert "Bash" not in options.allowed_tools
+
+
+def test_build_agent_options_uses_plain_system_prompt_for_qwen(tmp_path: Path):
+    options = build_agent_options(
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="Qwen3-235B-A22B",
+        system_prompt="harness system",
+        max_turns=10,
+        allow_bash=True,
+    )
+
+    assert options.system_prompt == "harness system"
 
 
 def test_build_agent_options_sets_sdk_buffer_size(tmp_path: Path):
