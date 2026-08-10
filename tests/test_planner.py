@@ -14,6 +14,7 @@ from src.agents.planner import (
 )
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.prompts.planner import PLANNER_SYSTEM_PROMPT
 
 
 @pytest.fixture
@@ -35,6 +36,13 @@ def _valid_spec_text() -> str:
         "## Technical Architecture\nClient-only architecture.\n\n"
         "## Visual Design Direction\nMinimal but distinctive.\n"
     )
+
+
+def test_planner_requires_valid_form_precondition_for_submit_contracts():
+    assert "assert_form_valid" in PLANNER_SYSTEM_PROMPT
+    assert "including required select and textarea controls" in PLANNER_SYSTEM_PROMPT
+    assert "select_option" in PLANNER_SYSTEM_PROMPT
+    assert "do not infer a select value from ArrowDown/Enter" in PLANNER_SYSTEM_PROMPT
 
 
 def _write_valid_planning_bundle(file_comm: FileComm) -> None:
@@ -120,6 +128,86 @@ def test_final_project_mode_instruction_requests_natural_complete_roadmap():
     assert "natural number of Sprints" in prompt
     assert "complete requested product" in prompt
     assert "exactly one Sprint" not in prompt
+
+
+def test_planner_prompt_preserves_existing_frontend_stack(tmp_path: Path):
+    from src.agents.planner import _build_planner_prompt
+
+    (tmp_path / "frontend").mkdir()
+    prompt = _build_planner_prompt(HarnessConfig(), "add one interaction", tmp_path)
+
+    assert "existing runnable frontend" in prompt
+    assert "do not propose a stack migration" in prompt
+
+
+def test_planner_system_prompt_requires_economical_stack_preserving_plan():
+    from src.prompts.planner import PLANNER_SYSTEM_PROMPT
+
+    assert "preserve that stack" in PLANNER_SYSTEM_PROMPT
+    assert "no more than 700 words" in PLANNER_SYSTEM_PROMPT
+    assert "Do not spend tool calls rereading" in PLANNER_SYSTEM_PROMPT
+
+
+def test_planner_rejects_malformed_browser_action_contract(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Scroll and check.",
+        "expected_result": "Control is visible.", "critical": True, "category": "scroll",
+        "actions": [
+            {"action": "scroll", "count": 0},
+            {"action": "evaluate", "expression": "window.scrollTo(0, 500); return true"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="scroll action requires integer y"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_requires_final_boolean_evaluate_for_authored_contract(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Activate control.",
+        "expected_result": "State changes.", "critical": True, "category": "interaction",
+        "actions": [{"action": "click", "selector": "#control"}],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="must end with evaluate"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_multiple_evaluates_in_one_action_contract(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Activate control.",
+        "expected_result": "State changes.", "critical": True, "category": "interaction",
+        "actions": [
+            {"action": "click", "selector": "#control"},
+            {"action": "evaluate", "expression": "document.querySelector('#control') !== null"},
+            {"action": "evaluate", "expression": "document.querySelector('#control').classList.contains('active')"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="exactly one final evaluate"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_invalid_action_settle_time(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Type then check.",
+        "expected_result": "State changes.", "critical": True, "category": "interaction",
+        "actions": [
+            {"action": "fill", "selector": "#control", "value": "x", "settle_ms": 9000},
+            {"action": "evaluate", "expression": "true"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="settle_ms must be an integer from 0 to 5000"):
+        _validate_planning_bundle(file_comm)
 
 
 @pytest.mark.anyio
@@ -422,7 +510,7 @@ async def test_planner_prompt_explicitly_forbids_bash_and_uses_precreated_artifa
     assert "The Harness prepares the workdir, the `.harness/` directory, and the required artifact" in captured["system_prompt"]
     assert "Use `total_sprints` exactly as written, never `total_sprint`." in captured["system_prompt"]
     assert "Every sprint entry must include at least one item in `feature_ids`" in captured["system_prompt"]
-    assert "Before finishing, reread every required file under `.harness`" in captured["system_prompt"]
+    assert "ensure all six required artifacts were written" in captured["system_prompt"]
     assert len(captured["stop_hooks"]) == 1
 
 
@@ -491,7 +579,7 @@ async def test_planner_stop_hook_allows_valid_bundle(tmp_path: Path):
 
     result = await hook({}, None, None)
 
-    assert result == {"continue_": True}
+    assert result == {"decision": "complete"}
 
 
 # --- cross-ref consistency between the three plan files ---

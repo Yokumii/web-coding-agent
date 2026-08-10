@@ -35,6 +35,8 @@ DEFAULT_VISION_RETRY_BASE_DELAY_SECONDS = 2.0
 DEFAULT_SDK_MAX_BUFFER_SIZE = 8 * 1024 * 1024
 DEFAULT_OPENAI_RECENT_MESSAGES = 18
 DEFAULT_OPENAI_TOOL_RESULT_CHARS = 8000
+DEFAULT_MINIMALITY_MAX_ATOMS = 12
+DEFAULT_MINIMALITY_ORACLE_TIMEOUT_SECONDS = 240
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -83,6 +85,20 @@ class HarnessConfig:
     openai_tool_result_chars: int = field(
         default_factory=lambda: _env_int(
             "OPENAI_TOOL_RESULT_CHARS", DEFAULT_OPENAI_TOOL_RESULT_CHARS
+        )
+    )
+    minimality_guard_enabled: bool = field(
+        default_factory=lambda: _env_bool("MINIMALITY_GUARD_ENABLED", True)
+    )
+    minimality_max_atoms: int = field(
+        default_factory=lambda: _env_int(
+            "MINIMALITY_MAX_ATOMS", DEFAULT_MINIMALITY_MAX_ATOMS
+        )
+    )
+    minimality_oracle_timeout_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "MINIMALITY_ORACLE_TIMEOUT_SECONDS",
+            DEFAULT_MINIMALITY_ORACLE_TIMEOUT_SECONDS,
         )
     )
 

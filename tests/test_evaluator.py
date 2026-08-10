@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import pytest
 from claude_agent_sdk.types import ResultMessage
 
-from src.agents.evaluator import _determine_passed, _extract_grades_from_response, run_evaluator
+from src.agents.evaluator import (
+    _determine_passed,
+    _extract_grades_from_response,
+    _normalize_contract_grades,
+    run_evaluator,
+)
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.orchestration.sprint_state import SprintState
@@ -163,6 +168,32 @@ def _passing_grades(round_num: int = 1) -> dict:
     }
 
 
+def test_contract_grade_normalization_repairs_provider_schema_drift():
+    raw = {
+        "round": 1,
+        "sprint": "Back to Top Button",
+        "phase_results": {"phase_1": {"passed": False, "notes": "bad"}},
+        "criteria": {},
+        "ui_checks": [],
+    }
+    evidence = {"checks": [{"check_id": "UI-001", "status": "action_failed"}]}
+    checks = [{
+        "id": "UI-001", "feature_id": "F001", "critical": True,
+        "task": "Click it", "expected_result": "It works",
+    }]
+
+    grades = _normalize_contract_grades(
+        raw, round_num=1, sprint_num=1,
+        sprint_context={"exit_criteria": ["It works"]}, ui_checks=checks,
+        evidence=evidence, edit_guard={"passed": True},
+    )
+
+    assert grades["sprint"] == 1
+    assert grades["phase_results"]["ui_functionality"] == "fail"
+    assert grades["ui_checks"][0]["status"] == "fail"
+    assert grades["overall_passed"] is False
+
+
 @pytest.mark.anyio
 async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, tmp_path: Path):
     file_comm = FileComm(tmp_path / ".harness")
@@ -234,9 +265,36 @@ async def test_evaluator_builds_staged_prompt_with_sprint_context(monkeypatch, t
     assert "Phase B: UI Functionality Verification" in captured["prompt"]
     assert "Phase C: Deferred Visual Review Capture" in captured["prompt"]
     assert "Phase E: Score Aggregation And Verdict" in captured["prompt"]
-    assert "3. .harness/visual_manifest_round_2.json" in captured["prompt"]
-    assert ".harness/visual_round_2_home.png" in captured["prompt"]
-    assert "downstream VLM review" in captured["prompt"]
+    assert "3. .harness/visual_manifest_round_2.json" not in captured["prompt"]
+    assert ".harness/visual_round_2_home.png" not in captured["prompt"]
+    assert "downstream VLM review" not in captured["prompt"]
+
+
+@pytest.mark.anyio
+async def test_evaluator_prompt_prioritizes_harness_browser_evidence(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_evaluator_context(file_comm)
+    (file_comm.dir / "browser_evidence_round_1.json").write_text('{"checks": []}\n')
+    captured: dict = {}
+
+    async def fake_run_sdk_agent(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        file_comm.write_grades(1, _passing_grades(1))
+        return (
+            SimpleNamespace(duration_ms=1, duration_api_ms=1, usage={}, model_usage={}, result="done"),
+            0.0,
+            "",
+            [],
+        )
+
+    monkeypatch.setattr("src.agents.evaluator.run_sdk_agent", fake_run_sdk_agent)
+    await run_evaluator(
+        HarnessConfig(evaluator_model="qwen3-coder-plus"), file_comm, tmp_path,
+        round_num=1, app_url="http://127.0.0.1:4173",
+    )
+
+    assert ".harness/browser_evidence_round_1.json" in captured["prompt"]
+    assert "Treat `action_failed`, or an `evaluate` step with `ok: false`, as a concrete reproduced failure" in captured["prompt"]
 
 
 def test_evaluator_prompt_requires_independent_edit_scope_audit(tmp_path: Path):
@@ -253,6 +311,37 @@ def test_evaluator_prompt_requires_independent_edit_scope_audit(tmp_path: Path):
     assert ".harness/edit_dom_baseline.json" in prompt
     assert ".harness/edit_scope_round_1.json" in prompt
     assert "Edit Scope Contract (independent audit required)" in prompt
+
+
+def test_evaluator_prompt_makes_mobile_check_a_preflight(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_evaluator_context(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-mobile", "feature_id": "F001", "critical": True,
+        "category": "responsive",
+        "task": "Resize browser to mobile width and tap the control.",
+        "expected_result": "Touch target remains reachable.",
+    }]}]})
+    from src.agents.evaluator import _build_evaluator_prompt
+
+    prompt = _build_evaluator_prompt(
+        file_comm=file_comm, workdir=tmp_path, round_num=1, sprint_num=1,
+        sprint_run_context=SprintState.load(file_comm).current_run_context(),
+        app_url="http://127.0.0.1:4173",
+    )
+
+    assert "MANDATORY RESPONSIVE PREFLIGHT" in prompt
+    assert "width=375 and height=812" in prompt
+    assert "MANDATORY KEYBOARD PRIORITY" not in prompt
+
+
+def test_evaluator_system_prompt_requires_normal_click_before_force():
+    from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
+
+    assert "first call `browser_click` without\n`force`" in EVALUATOR_SYSTEM_PROMPT
+    assert "successful non-forced `browser_click`" in EVALUATOR_SYSTEM_PROMPT
+    assert "browser_set_viewport" in EVALUATOR_SYSTEM_PROMPT
+    assert "Mobile evidence is\notherwise often lost" in EVALUATOR_SYSTEM_PROMPT
 
 
 @pytest.mark.anyio
@@ -562,3 +651,10 @@ def test_extract_grades_from_response_handles_truncated_trailing_json():
     extracted = _extract_grades_from_response(response)
     assert extracted is not None
     assert extracted["round"] == 1
+
+
+def test_evaluator_prompt_prioritizes_verdict_artifacts_after_reproduced_defect():
+    from src.prompts.evaluator import EVALUATOR_SYSTEM_PROMPT
+
+    assert "write `grade_round_N.json` first" in EVALUATOR_SYSTEM_PROMPT
+    assert "Do not reread" in EVALUATOR_SYSTEM_PROMPT

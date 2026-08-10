@@ -8,6 +8,7 @@ import pytest
 from src.orchestration.checkpoints import (
     CheckpointTransaction,
     ResumeError,
+    reconcile_completed_evaluation,
     restore_resume_state,
 )
 from src.orchestration.file_comm import FileComm
@@ -143,3 +144,49 @@ def test_restore_resume_state_rejects_legacy_state(tmp_path: Path):
 
     with pytest.raises(ResumeError, match="older version"):
         restore_resume_state(file_comm, {"accepted_sprints": []})
+
+
+def test_reconcile_completed_evaluation_reopens_false_accepted_scope_failure(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_accepted_sprints(
+        {"accepted": [1], "current_target": 2, "last_evaluated_round": 2}
+    )
+    file_comm.write_grades(
+        2,
+        {
+            "round": 2,
+            "sprint": 1,
+            "sprint_passed": True,
+            "regression_passed": False,
+            "overall_passed": False,
+            "criteria": {
+                name: {"score": score, "passed": True, "notes": "ok"}
+                for name, score in {
+                    "design_quality": 7.0,
+                    "functionality": 7.0,
+                    "originality": 6.0,
+                    "craft": 7.0,
+                }.items()
+            },
+        },
+    )
+    state = {
+        "last_completed_phase": "evaluate_r2",
+        "round_num": 2,
+        "current_sprint": 1,
+        "generator_mode": "generate",
+        "last_verdict": "accepted_review",
+        "accepted_sprints_payload": {
+            "accepted": [1], "current_target": 2, "last_evaluated_round": 2
+        },
+    }
+
+    reconciled = reconcile_completed_evaluation(file_comm, state)
+
+    assert reconciled["last_verdict"] == "failed_review"
+    assert reconciled["generator_mode"] == "repair"
+    assert reconciled["accepted_sprints_payload"] == {
+        "accepted": [], "current_target": 1, "last_evaluated_round": 2
+    }
+    assert file_comm.read_accepted_sprints() == reconciled["accepted_sprints_payload"]
+    assert file_comm.read_state()["last_verdict"] == "failed_review"

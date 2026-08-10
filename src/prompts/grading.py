@@ -64,6 +64,7 @@ _FALSEY_STRINGS = frozenset({"false", "no", "0", "n", "f", "fail", "failed"})
 _FAIL_STATUSES = frozenset({"fail", "failed", "partial"})
 _UNVERIFIED_MARKERS = (
     "could not verify",
+    "could not be fully verified",
     "not verified",
     "unable to verify",
     "not conclusively",
@@ -202,6 +203,12 @@ def determine_passed(grades: dict[str, Any] | None) -> bool:
     if not grades:
         return False
 
+    # A regression/scope audit is a hard acceptance gate.  A feature may work
+    # while still mutating protected DOM or ARIA surfaces, which must schedule
+    # repair rather than advance the sprint state.
+    if parse_tristate(grades.get("regression_passed")) is False:
+        return False
+
     if _only_unverified_partial_blockers(grades):
         return True
 
@@ -282,4 +289,22 @@ def apply_visual_review_scores(
         merged["mode_recommendation"] = "repair"
         if merged.get("sprint_passed") is True:
             merged["sprint_passed"] = False
+        merged_criteria = merged.get("criteria")
+        visual_failures = (
+            [
+                str(merged_criteria.get(name, {}).get("notes", "")).strip()
+                for name in VISION_OWNED_CRITERIA
+                if merged_criteria.get(name, {}).get("passed") is False
+            ]
+            if isinstance(merged_criteria, dict)
+            else []
+        )
+        if visual_failures:
+            repair_instruction = (
+                "Address the visual-review finding while preserving the accepted "
+                "interaction behavior: " + " ".join(visual_failures)
+            )
+            instructions = merged.setdefault("repair_instructions", [])
+            if repair_instruction not in instructions:
+                instructions.append(repair_instruction)
     return merged

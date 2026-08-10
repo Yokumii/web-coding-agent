@@ -33,6 +33,32 @@ class OpenAIToolExecutor:
         self._browser_instance = None
         self._page = None
 
+    def _is_forward_static_seed(self) -> bool:
+        """Return whether this forward case originated as a plain static site."""
+        manifest = self.workdir / "seed_manifest.json"
+        if not manifest.is_file():
+            return False
+        try:
+            source = Path(json.loads(manifest.read_text(encoding="utf-8"))["source_frontend"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        return (source / "index.html").is_file() and not (source / "package.json").is_file()
+
+    def _validate_static_seed_write(self, path: Path) -> None:
+        """Keep a static seed dependency-free instead of changing its project class."""
+        if not self._is_forward_static_seed():
+            return
+        relative = path.relative_to(self.workdir).as_posix()
+        forbidden = {
+            "frontend/package.json", "frontend/server.js", "frontend/package-lock.json",
+            "frontend/pnpm-lock.yaml", "frontend/yarn.lock",
+        }
+        if relative in forbidden:
+            raise ValueError(
+                "This forward seed is a plain static site. Do not add package managers, "
+                "lockfiles, or a custom server; edit its existing HTML/CSS/JS instead."
+            )
+
     async def close(self) -> None:
         if self._browser_instance is not None:
             await self._browser_instance.close()
@@ -50,13 +76,33 @@ class OpenAIToolExecutor:
     async def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
         try:
             if name == "read_file":
-                return ToolResult(True, self._path(args["path"]).read_text(errors="replace"))
+                content = self._path(args["path"]).read_text(errors="replace")
+                start_line = args.get("start_line")
+                end_line = args.get("end_line")
+                if start_line is not None or end_line is not None:
+                    start = max(1, int(start_line or 1))
+                    end = max(start, int(end_line or start + 199))
+                    content = "".join(content.splitlines(keepends=True)[start - 1:end])
+                # A page's primary source file often needs one coherent read
+                # before a model can make a safe localized patch.  This stays
+                # well below the previous unbounded response while avoiding a
+                # counterproductive sequence of dozens of tiny range reads.
+                max_chars = 32_000
+                if len(content) > max_chars:
+                    content = (
+                        content[:max_chars]
+                        + "\n\n[read_file truncated at 32000 characters; use start_line/end_line "
+                        "or an allowlisted sed command to inspect another focused range.]\n"
+                    )
+                return ToolResult(True, content)
             if name == "write_file":
                 path = self._path(args["path"]); before = path.read_text(errors="replace") if path.exists() else None
+                self._validate_static_seed_write(path)
                 path.parent.mkdir(parents=True, exist_ok=True); path.write_text(args["content"])
                 return ToolResult(True, f"wrote {args['path']}", before != args["content"])
             if name == "apply_patch":
                 path = self._path(args["path"]); content = path.read_text()
+                self._validate_static_seed_write(path)
                 old = args["old_text"]
                 if old not in content: raise ValueError("old_text not found")
                 path.write_text(content.replace(old, args["new_text"], 1))
@@ -117,11 +163,26 @@ class OpenAIToolExecutor:
         if self._page.url == "about:blank" or current_url != requested_url:
             await self._page.goto(url, wait_until="networkidle", timeout=int(self.command_timeout * 1000))
         if name == "browser_click":
-            await self._page.click(args["selector"])
+            await self._page.click(args["selector"], force=bool(args.get("force", False)))
             return ToolResult(True, "clicked")
+        if name == "browser_set_viewport":
+            width = int(args["width"])
+            height = int(args["height"])
+            if not (240 <= width <= 3840 and 240 <= height <= 2160):
+                raise ValueError("viewport dimensions must be within 240..3840 by 240..2160")
+            await self._page.set_viewport_size({"width": width, "height": height})
+            await self._page.wait_for_timeout(100)
+            return ToolResult(True, f"viewport set to {width}x{height}")
         if name == "browser_fill":
             await self._page.fill(args["selector"], args["value"])
             return ToolResult(True, "filled")
+        if name == "browser_key_press":
+            count = int(args.get("count", 1))
+            if not 1 <= count <= 30:
+                raise ValueError("keyboard count must be between 1 and 30")
+            for _ in range(count):
+                await self._page.keyboard.press(str(args["key"]))
+            return ToolResult(True, f"pressed {args['key']} x{count}")
         if name == "browser_screenshot":
             position = args.get("position")
             if position in {"top", "middle", "bottom"}:
@@ -140,7 +201,7 @@ class OpenAIToolExecutor:
 
 def openai_tool_schemas(*, allow_bash: bool, allow_playwright: bool) -> list[dict[str, Any]]:
     specs = [
-        ("read_file", "Read a UTF-8 text file", {"path": {"type": "string"}}, ["path"]),
+        ("read_file", "Read a UTF-8 text file. Large output is capped; use line bounds for focused inspection.", {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, ["path"]),
         ("write_file", "Create or overwrite a text file", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
         ("apply_patch", "Replace one exact text occurrence", {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, ["path", "old_text", "new_text"]),
         ("list_files", "List files", {"path": {"type": "string"}, "glob": {"type": "string"}}, []),
@@ -150,8 +211,10 @@ def openai_tool_schemas(*, allow_bash: bool, allow_playwright: bool) -> list[dic
     if allow_playwright:
         specs += [
             ("browser_snapshot", "Open a local URL and return visible text", {"url": {"type": "string"}}, ["url"]),
-            ("browser_click", "Open a local URL and click a selector", {"url": {"type": "string"}, "selector": {"type": "string"}}, ["url", "selector"]),
+            ("browser_set_viewport", "Set the browser viewport for responsive checks", {"url": {"type": "string"}, "width": {"type": "integer"}, "height": {"type": "integer"}}, ["url", "width", "height"]),
+            ("browser_click", "Open a local URL and click a selector; use force only after confirming the target is visible but an unrelated overlay intercepts it", {"url": {"type": "string"}, "selector": {"type": "string"}, "force": {"type": "boolean"}}, ["url", "selector"]),
             ("browser_fill", "Open a local URL and fill a selector", {"url": {"type": "string"}, "selector": {"type": "string"}, "value": {"type": "string"}}, ["url", "selector", "value"]),
+            ("browser_key_press", "Send a keyboard key to the active page. Use count to send repeated keys efficiently, for example Tab x16.", {"url": {"type": "string"}, "key": {"type": "string"}, "count": {"type": "integer"}}, ["url", "key"]),
             ("browser_screenshot", "Screenshot a local URL", {"url": {"type": "string"}, "path": {"type": "string"}, "full_page": {"type": "boolean"}, "position": {"type": "string", "enum": ["top", "middle", "bottom"]}}, ["url", "path"]),
             ("browser_evaluate", "Evaluate JavaScript on a local page", {"url": {"type": "string"}, "expression": {"type": "string"}}, ["url", "expression"]),
         ]

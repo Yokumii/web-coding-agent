@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -24,7 +26,22 @@ from src.config import HarnessConfig
 from src.orchestration.checkpoints import CheckpointTransaction
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
-from src.orchestration.edit_dom_guard import capture_baseline, evaluate_guard, is_forward_edit
+from src.orchestration.edit_dom_guard import (
+    capture_baseline,
+    capture_sprint_source_baseline,
+    evaluate_guard,
+    is_forward_edit,
+    repair_baseline_name,
+    snapshot_semantic_dom,
+    sprint_baseline_name,
+)
+from src.orchestration.browser_evidence import collect_browser_evidence
+from src.orchestration.minimality_runtime import (
+    certify_round_minimality,
+    ensure_minimality_policy,
+    record_round_build_destination,
+    record_round_build_source,
+)
 from src.orchestration.runtime import start_app_stack
 from src.orchestration.sprint_state import SprintState
 from src.prompts.grading import evaluation_is_inconclusive
@@ -186,18 +203,66 @@ async def run_build_phase(
     logger.info("[bold green]BUILD phase")
     sprint_num = ctx.sprint_state.current_target
     mode = _select_generator_mode(ctx, round_num, sprint_num, resume_state)
+    frontend_dir = ctx.workdir / "frontend"
     baseline_path = ctx.file_comm.dir / "edit_dom_baseline.json"
-    if is_forward_edit(ctx.workdir) and not baseline_path.exists():
-        # Capture the already accepted seed before the editor has a chance to
-        # touch it.  A capture problem is infrastructure, not a repair signal.
+    sprint_baseline_path = ctx.file_comm.dir / sprint_baseline_name(sprint_num)
+    if is_forward_edit(ctx.workdir) and (
+        not baseline_path.exists() or not sprint_baseline_path.exists()
+    ):
+        # Capture the accepted source before the editor can touch it.  The
+        # global seed frame supports provenance; the per-sprint frame prevents
+        # earlier accepted edits from looking like new collateral damage.
         app_stack = await start_app_stack(ctx.workdir, ctx.file_comm.dir, ctx.config, round_num)
         try:
-            await capture_baseline(
-                workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
-                app_url=app_stack.frontend_url,
-            )
+            if not baseline_path.exists():
+                snapshot = await capture_baseline(
+                    workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
+                    app_url=app_stack.frontend_url,
+                )
+                if not sprint_baseline_path.exists():
+                    sprint_baseline_path.write_text(
+                        json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+            elif not sprint_baseline_path.exists():
+                await capture_sprint_source_baseline(
+                    file_comm=ctx.file_comm, config=ctx.config,
+                    app_url=app_stack.frontend_url, sprint_num=sprint_num,
+                )
         finally:
             await app_stack.close()
+    elif mode == "repair" and (frontend_dir / ".git").exists():
+        repair_baseline_path = ctx.file_comm.dir / repair_baseline_name(round_num)
+        previous = ctx.file_comm.read_grades(round_num - 1) or {}
+        render_failed = (previous.get("phase_results") or {}).get("render_gate") == "fail"
+        if not repair_baseline_path.exists() and not render_failed:
+            # For a repair that did not originate from a forward-edit seed,
+            # freeze the actual failed source. The repair may change its
+            # declared surface, while the rest becomes a semantic frame.
+            app_stack = await start_app_stack(
+                ctx.workdir, ctx.file_comm.dir, ctx.config, round_num
+            )
+            try:
+                snapshot = await snapshot_semantic_dom(
+                    app_stack.frontend_url, headless=ctx.config.playwright_headless
+                )
+                repair_baseline_path.write_text(
+                    json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            finally:
+                await app_stack.close()
+    track_minimality = (
+        ctx.config.minimality_guard_enabled
+        and (is_forward_edit(ctx.workdir) or mode == "repair")
+        and (frontend_dir / ".git").exists()
+    )
+    if track_minimality:
+        ensure_minimality_policy(ctx.file_comm.dir, ctx.config)
+        record_round_build_source(
+            ctx.file_comm.dir, frontend_dir, round_num=round_num,
+            sprint_num=sprint_num, mode=mode,
+        )
     async with _agent_phase_session(ctx, phase_name=f"generator round {round_num}"):
         ctx.sprint_state.mark_sprint_in_progress(sprint_num)
         started = time.perf_counter()
@@ -205,6 +270,10 @@ async def run_build_phase(
             ctx.config, ctx.file_comm, ctx.workdir,
             round_num=round_num, sprint_num=sprint_num, mode=mode,
         )
+        if track_minimality:
+            record_round_build_destination(
+                ctx.file_comm.dir, frontend_dir, round_num=round_num
+            )
         _record_phase_stats(
             ctx,
             f"generator_r{round_num}",
@@ -292,6 +361,258 @@ def _edit_guard_requires_repair(
     return evaluator_mode == "full" and grades.get("edit_scope_audit") != "pass"
 
 
+def _apply_browser_click_evidence_gate(
+    workdir: Path, round_num: int, grades: dict[str, Any]
+) -> dict[str, Any]:
+    """A real browser click failure cannot be overridden by a model's pass verdict.
+
+    Evaluators occasionally use a forced or programmatic click after a normal
+    user click is blocked, then report the underlying handler as working.  That
+    is not equivalent to the requested interaction being usable.  Preserve the
+    trace as the source of truth and route the reproduced defect to repair.
+    """
+    trace_path = workdir / ".harness" / "traces" / f"evaluator_round_{round_num}.jsonl"
+    if not trace_path.is_file():
+        return grades
+
+    failures: list[str] = []
+    forced_clicks: list[str] = []
+    normal_successes: set[str] = set()
+    pending_clicks: list[tuple[str, bool]] = []
+    for raw_line in trace_path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "assistant":
+            tool_calls = (event.get("message") or {}).get("tool_calls") or []
+            for tool_call in tool_calls:
+                function = tool_call.get("function") or {}
+                if function.get("name") != "browser_click":
+                    continue
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                selector = str(arguments.get("selector") or "<unknown>")
+                pending_clicks.append((selector, bool(arguments.get("force"))))
+            continue
+        if event.get("event") != "tool" or event.get("name") != "browser_click":
+            continue
+        selector, forced = pending_clicks.pop(0) if pending_clicks else ("<unknown>", False)
+        if event.get("ok") is False:
+            detail = " ".join(str(event.get("output", "")).split())
+            failures.append(detail[:500] if detail else "click did not complete")
+        elif forced:
+            forced_clicks.append(selector)
+        else:
+            normal_successes.add(selector)
+
+    for selector in forced_clicks:
+        if selector not in normal_successes:
+            failures.append(
+                f"forced browser_click for {selector} without a preceding successful normal click"
+            )
+
+    if not failures:
+        return grades
+
+    gated = json.loads(json.dumps(grades))
+    detail = failures[0]
+    finding = f"Observed browser_click evidence failed: {detail}"
+    bugs = gated.setdefault("bugs_found", [])
+    if finding not in bugs:
+        bugs.append(finding)
+    instructions = gated.setdefault("repair_instructions", [])
+    instruction = (
+        "Repair or re-evaluate the browser interaction reported by the evaluator trace; "
+        "a forced or programmatic click is not evidence that a user can activate it."
+    )
+    if instruction not in instructions:
+        instructions.append(instruction)
+
+    phase_results = gated.setdefault("phase_results", {})
+    if isinstance(phase_results, dict):
+        phase_results["ui_functionality"] = "fail"
+    gated["sprint_passed"] = False
+    gated["regression_passed"] = False
+    gated["overall_passed"] = False
+    gated["mode_recommendation"] = "repair"
+    logger.warning(
+        "[bold yellow]Evaluator[/] trace recorded invalid browser click evidence; "
+        "overriding model pass verdict and scheduling repair."
+    )
+    return gated
+
+
+def _reconcile_action_contract_evidence(
+    file_comm: FileComm, round_num: int, grades: dict[str, Any]
+) -> dict[str, Any]:
+    """Make planner-authored Playwright assertions authoritative per UI check.
+
+    The LLM may still inspect a different state or fail to reproduce an action.
+    It must not turn a recorded `evaluate: true` into a synthetic repair task.
+    This only reconciles checks that have an executable harness contract; all
+    uncontracted UI, visual, and source-review findings remain untouched.
+    """
+    path = file_comm.dir / f"browser_evidence_round_{round_num}.json"
+    if not path.is_file():
+        return grades
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        records = evidence.get("checks", [])
+    except (OSError, ValueError, TypeError):
+        return grades
+    if not isinstance(records, list):
+        return grades
+
+    status_by_id = {
+        str(item.get("check_id")): str(item.get("status"))
+        for item in records if isinstance(item, dict) and item.get("check_id")
+    }
+    if not status_by_id:
+        return grades
+    reconciled = json.loads(json.dumps(grades))
+    ui_checks = reconciled.get("ui_checks")
+    if not isinstance(ui_checks, list):
+        return reconciled
+    changed: list[str] = []
+    feature_status: dict[str, bool] = {}
+    for check in ui_checks:
+        if not isinstance(check, dict):
+            continue
+        check_id = str(check.get("check_id", ""))
+        observed = status_by_id.get(check_id)
+        if observed not in {"ok", "action_failed"}:
+            continue
+        passed = observed == "ok"
+        previous = str(check.get("status", "")).lower()
+        check["status"] = "pass" if passed else "fail"
+        check["notes"] = (
+            "Harness action contract " + ("passed" if passed else "failed")
+            + "; this recorded browser assertion supersedes conflicting exploratory evaluation."
+        )
+        if previous != check["status"]:
+            changed.append(check_id)
+        feature_id = str(check.get("feature_id", ""))
+        if feature_id:
+            feature_status[feature_id] = passed
+
+    if not changed:
+        return reconciled
+    for result in reconciled.get("target_exit_criteria_results", []):
+        if not isinstance(result, dict):
+            continue
+        feature_id = str(result.get("feature_id", ""))
+        if feature_id not in feature_status:
+            continue
+        result["passed"] = feature_status[feature_id]
+        result["notes"] = "Matched to the harness action-contract result for feature " + feature_id + "."
+    reconciled["browser_action_contract_reconciliation"] = {
+        "changed_check_ids": changed,
+        "evidence_ref": f".harness/browser_evidence_round_{round_num}.json",
+    }
+    logger.warning(
+        "[bold yellow]Evaluator[/] reconciled %s conflicting UI verdict(s) with harness action evidence.",
+        len(changed),
+    )
+    return reconciled
+
+
+def _action_contract_grade_conflicts(file_comm: FileComm, round_num: int, grades: dict[str, Any]) -> list[str]:
+    """Return checks where an LLM grade contradicts a complete browser contract.
+
+    Reconciliation can correct a checkbox, but it cannot safely repair model
+    prose such as invented missing features or repair instructions.  Such a
+    grade is not a valid natural-repair trajectory and must be re-evaluated.
+    """
+    path = file_comm.dir / f"browser_evidence_round_{round_num}.json"
+    try:
+        records = json.loads(path.read_text(encoding="utf-8")).get("checks", [])
+    except (OSError, ValueError, TypeError):
+        return []
+    expected = {
+        str(item.get("check_id")): "pass" if item.get("status") == "ok" else "fail"
+        for item in records if isinstance(item, dict) and item.get("status") in {"ok", "action_failed"}
+    }
+    conflicts: list[str] = []
+    for check in grades.get("ui_checks", []):
+        if not isinstance(check, dict):
+            continue
+        check_id = str(check.get("check_id", ""))
+        if check_id in expected and str(check.get("status", "")).lower() != expected[check_id]:
+            conflicts.append(check_id)
+    return conflicts
+
+
+def _merge_visual_evidence_manifest(
+    manifest: dict[str, Any] | None,
+    *,
+    round_num: int,
+    app_url: str,
+    evidence_refs: list[str],
+) -> dict[str, Any]:
+    """Add harness-owned screenshots without discarding evaluator captures."""
+    existing = manifest if isinstance(manifest, dict) else {}
+    refs = existing.get("screenshots")
+    screenshots = [str(ref) for ref in refs] if isinstance(refs, list) else []
+    for ref in evidence_refs:
+        if ref not in screenshots:
+            screenshots.append(ref)
+    prior_notes = str(existing.get("notes", "")).strip()
+    note = "Harness independently captured top and scrolled visual evidence."
+    return {
+        "round": round_num,
+        "app_url": app_url,
+        "screenshots": screenshots,
+        "notes": f"{prior_notes} {note}".strip(),
+    }
+
+
+async def _capture_independent_visual_evidence(
+    ctx: HarnessContext, *, app_url: str, round_num: int
+) -> None:
+    """Capture both top and scrolled viewport states for the visual reviewer.
+
+    This is deliberately harness-owned: an evaluator may legitimately inspect a
+    hidden-on-load control, but a visual scorer still needs a rendered state.
+    The app is never altered to make an element visible for a screenshot.
+    """
+    from playwright.async_api import async_playwright
+    from src.utils.playwright_browser import launch_chromium
+
+    refs = [f".harness/visual_round_{round_num}_auto_top.png"]
+    top_path = ctx.workdir / refs[0]
+    top_path.parent.mkdir(parents=True, exist_ok=True)
+    async with async_playwright() as playwright:
+        browser = await launch_chromium(playwright, headless=True)
+        try:
+            page = await browser.new_page(viewport={"width": 1440, "height": 900})
+            await page.goto(app_url, wait_until="networkidle", timeout=30_000)
+            await page.screenshot(path=str(top_path))
+            can_scroll = await page.evaluate(
+                "document.documentElement.scrollHeight > window.innerHeight + 80"
+            )
+            if can_scroll:
+                await page.evaluate(
+                    "window.scrollTo(0, Math.min(document.documentElement.scrollHeight - window.innerHeight, Math.max(500, window.innerHeight)));"
+                )
+                await page.wait_for_timeout(350)
+                scrolled_ref = f".harness/visual_round_{round_num}_auto_scrolled.png"
+                await page.screenshot(path=str(ctx.workdir / scrolled_ref))
+                refs.append(scrolled_ref)
+        finally:
+            await browser.close()
+
+    manifest = _merge_visual_evidence_manifest(
+        ctx.file_comm.read_visual_manifest(round_num),
+        round_num=round_num,
+        app_url=app_url,
+        evidence_refs=refs,
+    )
+    ctx.file_comm.write_visual_manifest(round_num, manifest)
+
+
 async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     """执行 evaluator 与视觉复核，推进 sprint 状态并写入检查点。"""
     logger.info("[bold yellow]EVALUATE phase")
@@ -300,6 +621,7 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     started = time.perf_counter()
     ev_stats = None
     startup_error: Exception | None = None
+    guard_result: dict[str, Any] | None = None
     grades: dict[str, Any] = {}
     passed = False
 
@@ -338,11 +660,70 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                 guard_result = await evaluate_guard(
                     workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
                     app_url=app_stack.frontend_url, round_num=round_num,
+                    sprint_num=sprint_num,
                 )
-                passed, grades, ev_stats = await run_evaluator(
-                    ctx.config, ctx.file_comm, ctx.workdir,
-                    round_num=round_num, app_url=app_stack.frontend_url, edit_guard=guard_result,
-                )
+                # Run planner-authored concrete actions independently.  Empty
+                # legacy plans remain valid; their evaluator falls back to the
+                # existing exploratory path.
+                browser_evidence_path = ctx.file_comm.dir / f"browser_evidence_round_{round_num}.json"
+                try:
+                    browser_evidence = await asyncio.wait_for(
+                        collect_browser_evidence(
+                            app_url=app_stack.frontend_url,
+                            checks=ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+                            output_path=browser_evidence_path,
+                            headless=ctx.config.playwright_headless,
+                        ),
+                        timeout=75,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise EvaluationInfrastructureError(
+                        "Browser action-contract execution exceeded its 75s hard timeout; "
+                        "refusing to fabricate a repair from missing evidence."
+                    ) from exc
+                invalid_contracts = [
+                    str(item.get("check_id", "unknown"))
+                    for item in (browser_evidence.get("checks") or [])
+                    if isinstance(item, dict) and item.get("status") == "invalid_test_contract"
+                ]
+                if invalid_contracts:
+                    raise EvaluationInfrastructureError(
+                        "Planner-authored browser contract is invalid for checks "
+                        + ", ".join(invalid_contracts)
+                        + "; refusing to fabricate a code repair from a broken test."
+                    )
+                try:
+                    passed, grades, ev_stats = await asyncio.wait_for(
+                        run_evaluator(
+                            ctx.config, ctx.file_comm, ctx.workdir,
+                            round_num=round_num, app_url=app_stack.frontend_url, edit_guard=guard_result,
+                        ),
+                        timeout=180,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise EvaluationInfrastructureError(
+                        "Evaluator exceeded its 180s hard timeout; refusing to fabricate a repair "
+                        "from an incomplete evaluation."
+                    ) from exc
+                conflicts = _action_contract_grade_conflicts(ctx.file_comm, round_num, grades)
+                if conflicts:
+                    raise EvaluationInfrastructureError(
+                        "Evaluator grade contradicted complete harness browser evidence for: "
+                        + ", ".join(conflicts)
+                    )
+                grades = _reconcile_action_contract_evidence(ctx.file_comm, round_num, grades)
+                grades = _apply_browser_click_evidence_gate(ctx.workdir, round_num, grades)
+                passed = _determine_passed(grades)
+                if passed:
+                    try:
+                        await _capture_independent_visual_evidence(
+                            ctx, app_url=app_stack.frontend_url, round_num=round_num
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[bold yellow]Visual evidence capture[/] skipped without "
+                            f"changing the evaluator verdict: {type(exc).__name__}: {exc}"
+                        )
                 if guard_result is not None:
                     grades["edit_guard"] = guard_result
                     if _edit_guard_requires_repair(
@@ -362,7 +743,16 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
             finally:
                 await app_stack.close()
 
-    if not passed and evaluation_is_inconclusive(grades):
+    # A semantic scope violation or a failed real browser click is a reproduced
+    # defect, even when the evaluator left unrelated checks unverified.
+    concrete_guard_failure = _edit_guard_requires_repair(
+        guard_result, grades, evaluator_mode=ctx.config.evaluator_mode
+    )
+    trace_click_failure = any(
+        "Observed browser_click evidence failed:" in str(item)
+        for item in (grades.get("bugs_found") or [])
+    )
+    if not passed and evaluation_is_inconclusive(grades) and not (concrete_guard_failure or trace_click_failure):
         reason = (
             "Evaluator did not reproduce a concrete defect; all negative findings "
             "are explicitly unverified. Retry evaluation instead of repairing code."
@@ -387,18 +777,25 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
 
     vs_started = time.perf_counter()
     vs_stats = None
-    if ctx.config.evaluator_mode == "full" and startup_error is None:
+    # A reproduced browser failure already establishes a repair source.  A
+    # costly visual review cannot turn that failure into an accepted edit and
+    # should not delay the next repair round.
+    if ctx.config.evaluator_mode == "full" and startup_error is None and passed:
         async with _agent_phase_session(ctx, phase_name=f"visual review round {round_num}"):
-            grades, vs_stats = await apply_dedicated_visual_review(
-                config=ctx.config,
-                file_comm=ctx.file_comm,
-                workdir=ctx.workdir,
-                round_num=round_num,
-                sprint_num=sprint_num,
-                sprint_context=sprint_ctx,
-                grades=grades,
-                manifest=visual_manifest,
-            )
+            try:
+                grades, vs_stats = await asyncio.wait_for(
+                    apply_dedicated_visual_review(
+                        config=ctx.config, file_comm=ctx.file_comm, workdir=ctx.workdir,
+                        round_num=round_num, sprint_num=sprint_num, sprint_context=sprint_ctx,
+                        grades=grades, manifest=visual_manifest,
+                    ),
+                    timeout=ctx.config.evaluator_vision_timeout_seconds + 5,
+                )
+            except asyncio.TimeoutError:
+                grades["evaluation_infrastructure_failure"] = {
+                    "phase": "visual_review",
+                    "reason": f"visual review exceeded {ctx.config.evaluator_vision_timeout_seconds + 5}s hard timeout",
+                }
     if vs_stats is not None:
         _record_phase_stats(
             ctx,
@@ -406,6 +803,62 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
             _coerce_stats(vs_stats),
             started_at=vs_started,
         )
+
+    if passed:
+        try:
+            minimality = await certify_round_minimality(
+                run_dir=ctx.workdir,
+                config=ctx.config,
+                round_num=round_num,
+                sprint_num=sprint_num,
+                checks=ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+            )
+        except asyncio.TimeoutError:
+            minimality = {
+                "status": "inconclusive",
+                "reason": "minimality_oracle_hard_timeout",
+            }
+        if minimality is not None:
+            summaries: dict[str, Any] = {}
+            for kind, certificate in (minimality.get("certificates") or {}).items():
+                summaries[kind] = {
+                    "status": certificate.get("status"),
+                    "reason": certificate.get("reason"),
+                    "kept_change_ids": certificate.get("kept_change_ids", []),
+                    "redundant_change_ids": certificate.get("redundant_change_ids", []),
+                    "artifact": f".harness/minimality_round_{round_num}_{kind}.json",
+                }
+            if not summaries:
+                summaries["runtime"] = minimality
+            grades["minimality_certificate"] = summaries
+
+            # A forward sprint is accepted only when its final source-to-dest
+            # edit is already irreducible.  Repair-delta certificates are an
+            # additional export gate and do not invalidate an otherwise clean
+            # edit when the round merely reverted earlier collateral churn.
+            gate = summaries.get("edit") or summaries.get("repair")
+            gate_status = gate.get("status") if isinstance(gate, dict) else None
+            if gate_status in {"non_minimal", "candidate_failed"}:
+                passed = False
+                grades["regression_passed"] = False
+                grades["overall_passed"] = False
+                redundant = ", ".join(gate.get("redundant_change_ids") or [])
+                message = (
+                    "Counterfactual patch guard rejected the destination: "
+                    + str(gate.get("reason") or gate_status)
+                )
+                if redundant:
+                    message += f". Removable change atoms: {redundant}"
+                grades.setdefault("regressions_found", []).append(message)
+                grades.setdefault("repair_instructions", []).append(
+                    "Remove the redundant atomic changes identified in the minimality "
+                    "certificate while preserving the passing browser and DOM/ARIA contracts."
+                )
+            elif gate_status not in {None, "certified", "not_applicable"}:
+                grades["evaluation_infrastructure_failure"] = {
+                    "phase": "counterfactual_minimality",
+                    "reason": str(gate.get("reason") or gate_status),
+                }
 
     if grades:
         ctx.file_comm.write_grades(round_num, grades)

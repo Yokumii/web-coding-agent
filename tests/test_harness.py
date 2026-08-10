@@ -9,7 +9,7 @@ import pytest
 from src.agents.sdk_runner import AgentRunStats
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
-from src.orchestration.harness import ResumeError, run_harness
+from src.orchestration.harness import ResumeError, _next_round_cost_reserve, run_harness
 
 
 class DummyAppStack:
@@ -54,6 +54,21 @@ def _failing_functionality_criteria() -> dict:
         "originality": {"score": 6.0, "passed": True},
         "craft": {"score": 7.0, "passed": True},
     }
+
+
+def test_next_round_cost_reserve_requires_both_observed_phases():
+    assert _next_round_cost_reserve({"generator_r1": {"cost_usd": 1.2}}) == 0.0
+    assert _next_round_cost_reserve({
+        "generator_r1": {"cost_usd": 1.2},
+        "evaluator_r1": {"cost_usd": 0.8},
+    }) == 2.0
+    assert _next_round_cost_reserve({
+        "generator_r1": {"cost_usd": 1.2}, "evaluator_r1": {"cost_usd": 0.8},
+        "generator_r2": {"cost_usd": 0.1}, "evaluator_r2": {"cost_usd": 0.1},
+    }) == 0.5
+    assert _next_round_cost_reserve({
+        "generator_r1": {"cost_usd": None}, "evaluator_r1": {"cost_usd": 0.8},
+    }) == 0.8
 
 
 def _write_feature_list(file_comm: FileComm, total: int = 1) -> None:
@@ -572,15 +587,15 @@ async def test_checkpoint_records_phase_metrics_with_tokens_and_durations(monkey
 
     async def fake_evaluator(*args, **kwargs):
         return (
-            False,
+            True,
             {
                 "round": 1,
                 "sprint": 1,
-                "mode_recommendation": "repair",
-                "overall_passed": False,
+                "mode_recommendation": "complete",
+                "overall_passed": True,
                 "criteria": {
                     "design_quality": {"score": 7.0, "passed": True},
-                    "functionality": {"score": 5.0, "passed": False},
+                    "functionality": {"score": 7.0, "passed": True},
                     "originality": {"score": 6.0, "passed": True},
                     "craft": {"score": 7.0, "passed": True},
                 },

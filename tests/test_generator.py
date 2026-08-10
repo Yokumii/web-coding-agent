@@ -6,10 +6,17 @@ import pytest
 from claude_agent_sdk.types import ResultMessage
 
 from src.agents.generator import (
+    _build_generator_prompt,
+    _checkpoint_interrupted_model_work,
     _describe_failures,
+    _is_scope_contract_only_repair,
+    _is_harness_checkpoint_for_round,
     _validate_generator_commits,
     _validate_repair_scope,
     _validate_generator_runnable_files,
+    _trace_confirms_commit,
+    _trace_has_successful_validation,
+    _trace_written_frontend_paths,
     run_generator,
 )
 from src.config import HarnessConfig
@@ -71,6 +78,102 @@ def test_expose_local_skills_replaces_external_symlink_with_copy(tmp_path: Path)
     assert (exposed / "ui-skill" / "SKILL.md").read_text() == "# skill\n"
 
 
+def test_trace_confirms_only_the_exact_recorded_commit(tmp_path: Path):
+    trace = tmp_path / "generator.jsonl"
+    trace.write_text(
+        '{"event":"tool","name":"run_command","output":"[main abc1234] feat(form): validate contact form\\n"}\n',
+        encoding="utf-8",
+    )
+    assert _trace_confirms_commit(trace, "abc1234def567", "feat(form): validate contact form")
+    assert not _trace_confirms_commit(trace, "abc1234def567", "feat(form): unrelated")
+    assert not _trace_confirms_commit(trace, "def9876", "feat(form): validate contact form")
+
+
+def test_trace_written_frontend_paths_requires_successful_explicit_source_writes(tmp_path: Path):
+    trace = tmp_path / "generator.jsonl"
+    trace.write_text(
+        '\n'.join([
+            '{"event":"assistant","message":{"tool_calls":[{"function":{"name":"write_file","arguments":"{\\"path\\": \\"frontend/main.js\\"}"}}]}}',
+            '{"event":"tool","name":"write_file","ok":true,"output":"wrote frontend/main.js"}',
+            '{"event":"assistant","message":{"tool_calls":[{"function":{"name":"apply_patch","arguments":"{\\"path\\": \\"frontend/styles.css\\"}"}}]}}',
+            '{"event":"tool","name":"apply_patch","ok":false,"output":"not found"}',
+            '{"event":"assistant","message":{"tool_calls":[{"function":{"name":"write_file","arguments":"{\\"path\\": \\".harness/progress.md\\"}"}}]}}',
+            '{"event":"tool","name":"write_file","ok":true,"output":"wrote .harness/progress.md"}',
+        ]) + '\n', encoding="utf-8",
+    )
+    assert _trace_written_frontend_paths(trace) == {"main.js"}
+
+
+def test_trace_validation_requires_a_successful_model_validation_command(tmp_path: Path):
+    trace = tmp_path / "generator.jsonl"
+    trace.write_text(
+        '\n'.join([
+            '{"event":"assistant","message":{"tool_calls":[{"function":{"name":"run_command","arguments":"{\\"command\\": \\"git diff --check\\"}"}}]}}',
+            '{"event":"tool","name":"run_command","ok":false,"output":"failed"}',
+            '{"event":"assistant","message":{"tool_calls":[{"function":{"name":"run_command","arguments":"{\\"command\\": \\"node --check main.js\\"}"}}]}}',
+            '{"event":"tool","name":"run_command","ok":true,"output":""}',
+        ]) + '\n', encoding="utf-8",
+    )
+    assert _trace_has_successful_validation(trace)
+
+
+def test_interrupted_checkpoint_requires_trace_recorded_validation(tmp_path: Path):
+    import json
+    import subprocess
+
+    workdir = tmp_path
+    frontend = workdir / "frontend"
+    frontend.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True)
+    (frontend / "main.js").write_text("const value = 1;\n")
+    subprocess.run(["git", "add", "main.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: baseline"], cwd=frontend, check=True, capture_output=True)
+    (frontend / "main.js").write_text("const value = 2;\n")
+    (workdir / "seed_manifest.json").write_text("{}\n")
+    file_comm = FileComm(workdir / ".harness")
+    file_comm.dir.mkdir(exist_ok=True)
+    (file_comm.dir / "edit_scope_round_1.json").write_text(
+        json.dumps({"allowed_root_keys": [], "allow_new_roots": False})
+    )
+    trace = file_comm.dir / "traces" / "generator_round_1.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("\n".join([
+        json.dumps({"event": "assistant", "message": {"tool_calls": [{"function": {"name": "write_file", "arguments": json.dumps({"path": "frontend/main.js"})}}]}}),
+        json.dumps({"event": "tool", "name": "write_file", "ok": True, "output": "wrote"}),
+    ]) + "\n")
+
+    assert _checkpoint_interrupted_model_work(frontend, file_comm, workdir, 1, "generate") is None
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=frontend, text=True, capture_output=True, check=True).stdout == " M main.js\n"
+
+
+def test_harness_checkpoint_requires_exact_metadata_commit_and_clean_tree(tmp_path: Path):
+    import json
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True)
+    (frontend / "main.js").write_text("const a = 1;\n")
+    subprocess.run(["git", "add", "main.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "chore: baseline"], cwd=frontend, check=True, capture_output=True)
+    (frontend / "main.js").write_text("const a = 2;\n")
+    subprocess.run(["git", "add", "main.js"], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-m", "feat(recovery): checkpoint interrupted model implementation"], cwd=frontend, check=True, capture_output=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=frontend, check=True, text=True, capture_output=True).stdout.strip()
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "recovery_commit_round_1.json").write_text(json.dumps({
+        "status": "ok", "commit_mode": "harness_checkpoint", "round": 1, "commit": head,
+        "source_change_author": "native_model_trace", "source_files": ["main.js"],
+    }))
+    assert _is_harness_checkpoint_for_round(frontend, file_comm, 1, "generate")
+    (frontend / "stray.txt").write_text("not committed\n")
+    assert not _is_harness_checkpoint_for_round(frontend, file_comm, 1, "generate")
+
+
 @pytest.mark.anyio
 async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, tmp_path: Path):
     file_comm = FileComm(tmp_path / ".harness")
@@ -118,19 +221,20 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
     assert "Sprint Title: Core counter" in captured["prompt"]
     assert "Target Feature IDs: F001" in captured["prompt"]
     assert "Required Reads:" in captured["prompt"]
+    assert "do not repeatedly reread a truncated whole source file" in captured["prompt"]
     assert "- .harness/sprint_plan.json" in captured["prompt"]
-    assert "- .harness/feature_list.json" in captured["prompt"]
     assert "- .harness/design_tokens.json" in captured["prompt"]
-    assert "- .harness/accepted_sprints.json" in captured["prompt"]
+    assert "Do not reread feature_list.json or accepted_sprints.json" in captured["prompt"]
     assert ".harness/feedback_round_1.md" not in captured["prompt"]
     assert ".harness/grade_round_1.json" not in captured["prompt"]
     assert "Do not implement future sprint functionality or unrelated refactors." in captured["prompt"]
     assert "preserve accepted work" in captured["prompt"]
-    assert ".claude/skills/ui-ux-pro-max/SKILL.md" in captured["prompt"]
+    assert "Do not attempt to read that path" in captured["prompt"]
     assert "npm --prefix frontend run build" in captured["prompt"]
     assert "Read the planning bundle first" not in captured["prompt"]
     assert ".harness/spec.md" not in captured["prompt"]
-    assert ".harness/ui_verification_plan.json" not in captured["prompt"]
+    assert ".harness/ui_verification_plan.json" in captured["prompt"]
+    assert "exact stable selector specified" in captured["prompt"]
 
 
 @pytest.mark.anyio
@@ -192,6 +296,7 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
     )
     (tmp_path / "frontend").mkdir()
     (tmp_path / "frontend" / "package.json").write_text("{}")
+    (tmp_path / "seed_manifest.json").write_text("{}\n")
     captured: dict = {}
 
     async def fake_run_sdk_agent(**kwargs):
@@ -246,18 +351,48 @@ async def test_generator_repair_mode_builds_feedback_scoped_prompt(monkeypatch, 
     assert "repair_report_round_" not in captured["prompt"]
     assert "Repair Completion Protocol" not in captured["prompt"]
     assert "next evaluation round verifies your work" in captured["prompt"]
-    assert "Required Reads:" in captured["prompt"]
-    assert ".harness/feedback_round_1.md" in captured["prompt"]
-    assert ".harness/grade_round_1.json" in captured["prompt"]
-    assert "- .harness/sprint_plan.json" in captured["prompt"]
-    assert "- .harness/design_tokens.json" in captured["prompt"]
-    assert "- .harness/accepted_sprints.json" in captured["prompt"]
-    assert ".claude/skills/ui-ux-pro-max/SKILL.md" in captured["prompt"]
+    assert "Required minimal reads:" in captured["prompt"]
+    assert ".harness/feedback_round_1.md" not in captured["prompt"]
+    assert ".harness/traces/evaluator_round_1.jsonl" not in captured["prompt"]
+    assert ".harness/edit_scope_round_1.json" in captured["prompt"]
+    assert "failed normal browser_click" in captured["prompt"]
+    assert "targeted line-range reads" in captured["prompt"]
+    assert "syntactically valid" in captured["prompt"]
+    assert "pending asynchronous work" in captured["prompt"]
+    assert "adding redundant event handlers" in captured["prompt"]
+    assert "FIRST ACTION" in captured["prompt"]
+    assert "copy `.harness/edit_scope_round_1.json` to `.harness/edit_scope_round_2.json`" in captured["prompt"]
+    assert "merely partial or unverified check is not by itself proof" in captured["prompt"]
+    assert "Never alter required product visibility" in captured["prompt"]
+    assert "Preserve the previous edit scope" in captured["prompt"]
+    assert "scope audit reports an undeclared new root" in captured["prompt"]
+    assert ".harness/grade_round_1.json" not in captured["prompt"]
+    assert "- .harness/sprint_plan.json" not in captured["prompt"]
+    assert "- .harness/design_tokens.json" not in captured["prompt"]
+    assert "- .harness/accepted_sprints.json" not in captured["prompt"]
+    assert "- .harness/ui_verification_plan.json" in captured["prompt"]
+    assert "Do not attempt to read that path" in captured["prompt"]
     assert "Do not implement new features from future sprints." in captured["prompt"]
     assert "Do not start work for the next sprint." in captured["prompt"]
     assert "npm --prefix frontend run build" in captured["prompt"]
     assert ".harness/spec.md" not in captured["prompt"]
     assert ".harness/feature_list.json" not in captured["prompt"]
+
+
+def test_generator_prompt_recovers_existing_uncommitted_sprint_without_reexploring(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+
+    prompt = _build_generator_prompt(
+        mode="generate", file_comm=file_comm, round_num=2, sprint_num=2,
+        sprint_context={"title": "Refine", "feature_ids": ["F002"], "goal": "Improve", "deliverables": [], "exit_criteria": []},
+        accepted_sprints={"accepted": [1]}, resume_uncommitted_work=True,
+    )
+
+    assert "Interrupted-attempt recovery" in prompt
+    assert "git -C frontend diff --stat" in prompt
+    assert "Do not reread whole source files" in prompt
+    assert "Verify the targeted diff" in prompt
 
 
 def test_generator_system_prompt_limits_validation_and_git_workflow():
@@ -567,6 +702,103 @@ def test_describe_failures_empty_returns_fallback():
     assert "no specific failures" in text
 
 
+def test_describe_failures_includes_counterfactual_regression_and_repair_action():
+    grades = {
+        "criteria": {},
+        "regressions_found": [
+            "Counterfactual patch guard found removable atom p006."
+        ],
+        "repair_instructions": [
+            "Remove p006 while preserving the passing target contract."
+        ],
+    }
+
+    text = _describe_failures(grades, sprint_context={"feature_ids": []})
+
+    assert "p006" in text
+    assert "Counterfactual patch guard" in text
+    assert "Remove p006" in text
+
+
+def test_repair_prompt_reads_non_minimal_certificate_artifact(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_grades(1, {
+        "round": 1,
+        "sprint": 1,
+        "criteria": {},
+        "overall_passed": False,
+        "minimality_certificate": {
+            "edit": {
+                "status": "non_minimal",
+                "artifact": ".harness/minimality_round_1_edit.json",
+            }
+        },
+        "regressions_found": ["Atom p006 is removable."],
+        "repair_instructions": ["Remove p006."],
+    })
+
+    prompt = _build_generator_prompt(
+        mode="repair",
+        file_comm=file_comm,
+        round_num=2,
+        sprint_num=1,
+        sprint_context={
+            "title": "Core counter",
+            "feature_ids": ["F001"],
+            "goal": "Ship the primary counter flow.",
+            "deliverables": [],
+            "exit_criteria": [],
+        },
+        accepted_sprints={"accepted": []},
+    )
+
+    assert "- .harness/minimality_round_1_edit.json" in prompt
+    assert "Atom p006 is removable." in prompt
+    assert "failed source did not render" in prompt
+
+
+def test_non_forward_repair_prompt_uses_failed_source_semantic_frame(tmp_path: Path):
+    import json
+
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_grades(1, {
+        "round": 1, "criteria": {}, "overall_passed": False,
+        "repair_instructions": ["Fix the broken control."],
+    })
+    (file_comm.dir / "repair_dom_source_round_2.json").write_text(json.dumps({
+        "roots": [{"key": "main", "fingerprint": "abc"}]
+    }))
+
+    prompt = _build_generator_prompt(
+        mode="repair", file_comm=file_comm, round_num=2, sprint_num=1,
+        sprint_context={
+            "title": "Repair", "feature_ids": ["F001"], "goal": "Repair",
+            "deliverables": [], "exit_criteria": [],
+        },
+        accepted_sprints={"accepted": []},
+    )
+
+    assert "- .harness/repair_dom_source_round_2.json" in prompt
+    assert "write `.harness/edit_scope_round_2.json`" in prompt
+    assert "main" in prompt
+
+
+def test_scope_contract_only_repair_requires_all_product_checks_to_pass():
+    grades = {
+        "sprint_passed": True,
+        "regression_passed": False,
+        "edit_scope_audit": "fail",
+        "ui_checks": [{"status": "pass"}],
+        "target_exit_criteria_results": [{"passed": True}],
+    }
+
+    assert _is_scope_contract_only_repair(grades) is True
+    grades["ui_checks"] = [{"status": "fail"}]
+    assert _is_scope_contract_only_repair(grades) is False
+
+
 def test_generator_system_prompt_requires_agent_owned_feat_fix_commits():
     assert "feat(scope):" in GENERATOR_SYSTEM_PROMPT
     assert "fix(scope):" in GENERATOR_SYSTEM_PROMPT
@@ -647,9 +879,9 @@ def test_generator_runnable_files_gate_requires_package_json(tmp_path: Path):
     frontend = tmp_path / "frontend"
     frontend.mkdir()
 
-    assert "package.json" in _validate_generator_runnable_files(frontend)
+    assert "package.json" in _validate_generator_runnable_files(frontend, tmp_path)
     (frontend / "package.json").write_text('{"scripts":{"dev":"vite"}}')
-    assert _validate_generator_runnable_files(frontend) is None
+    assert _validate_generator_runnable_files(frontend, tmp_path) is None
 
 
 @pytest.mark.anyio

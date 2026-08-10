@@ -47,6 +47,8 @@ def _frontend_url(port: int) -> str:
 
 def build_frontend_command(frontend_dir: Path, port: int) -> list[str]:
     """根据锁文件类型选择前端开发命令。"""
+    if _forward_seed_is_static(frontend_dir):
+        return ["python3", "-m", "http.server", str(port), "--bind", HOST]
     if (frontend_dir / "pnpm-lock.yaml").exists():
         return ["pnpm", "dev", "--host", HOST, "--port", str(port), "--strictPort"]
     if (frontend_dir / "yarn.lock").exists():
@@ -69,6 +71,17 @@ def _is_static_html_project(package_json: Path) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     return not package.get("dependencies") and not package.get("devDependencies")
+
+
+def _forward_seed_is_static(frontend_dir: Path) -> bool:
+    """Keep a forward edit's server choice anchored to its immutable seed."""
+    manifest_path = frontend_dir.parent / "seed_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    source = Path(str(manifest.get("source_frontend") or ""))
+    return source.is_dir() and (source / "index.html").is_file() and not (source / "package.json").is_file()
 
 
 def find_listening_pids(port: int) -> list[int]:

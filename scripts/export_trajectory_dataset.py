@@ -29,6 +29,7 @@ INFRA_FAILURE_MARKERS = (
 )
 UNCERTAIN_FAILURE_MARKERS = (
     "could not verify",
+    "could not be fully verified",
     "not verified",
     "unable to verify",
     "within evaluation budget",
@@ -166,8 +167,10 @@ def _quality_tier(task: str, patches: list[dict[str, str]], task_types: list[str
     if any(not patch.get("search") for patch in patches):
         reasons.append("empty_search_not_reverse_compatible")
     if task == "text-editing":
-        if not 2 <= len(task_types) <= 5:
-            reasons.append("edit_task_count_outside_2_to_5")
+        # Match the formal reverse-construction quota: task counts cycle
+        # uniformly across 1..7, so a focused one-task edit is valid data.
+        if not 1 <= len(task_types) <= 7:
+            reasons.append("edit_task_count_outside_1_to_7")
         if stats["changed_file_count"] > 8:
             reasons.append("edit_changes_too_many_files")
         if stats["total_patch_lines"] > 2500:
@@ -253,8 +256,23 @@ def _cumulative_description(sprints: dict[int, dict[str, Any]], target: int) -> 
 
 
 def _is_real_project_failure(grade: dict[str, Any]) -> bool:
+    # A scope audit by itself is provenance metadata, not a user-visible bug.
+    # It must not, however, erase a separately reproduced UI failure in the
+    # same round; the subsequent repair can legitimately fix that UI defect.
     if grade.get("overall_passed") is not False:
         return False
+    if grade.get("edit_scope_audit") == "fail":
+        reproduced_critical = any(
+            isinstance(item, dict) and item.get("critical") is True
+            and str(item.get("status", "")).lower() == "fail"
+            for item in grade.get("ui_checks") or []
+        ) or any(
+            isinstance(item, dict) and item.get("critical") is True
+            and item.get("passed") is False
+            for item in grade.get("target_exit_criteria_results") or []
+        )
+        if not reproduced_critical:
+            return False
     text = json.dumps(grade, ensure_ascii=False).lower()
     return (
         not any(marker in text for marker in INFRA_FAILURE_MARKERS)
@@ -266,6 +284,87 @@ def _is_confirmed_failure_text(value: Any) -> bool:
     text = str(value or "").strip()
     lowered = text.lower()
     return bool(text) and not any(marker in lowered for marker in UNCERTAIN_FAILURE_MARKERS)
+
+
+def _has_complete_critical_coverage(grade: dict[str, Any]) -> bool:
+    """Require observed evidence before accepting a forward edit as training data.
+
+    The harness may accept an evaluator-coverage gap so it does not invent a
+    repair task from an unobserved defect.  That is appropriate for runtime
+    control flow, but an edit example with an unexercised critical interaction
+    is not a trustworthy positive training pair and must stay out of exports.
+    """
+    for check in grade.get("ui_checks") or []:
+        if not isinstance(check, dict) or not check.get("critical"):
+            continue
+        if str(check.get("status", "")).strip().lower() != "pass":
+            return False
+        if not _is_confirmed_failure_text(check.get("notes")):
+            return False
+    for result in grade.get("target_exit_criteria_results") or []:
+        if not isinstance(result, dict) or not result.get("critical"):
+            continue
+        if result.get("passed") is not True:
+            return False
+        if not _is_confirmed_failure_text(result.get("notes")):
+            return False
+    return True
+
+
+def _trace_has_no_failed_browser_click(harness: Path, round_num: int) -> bool:
+    """Require a real user-level click, not merely a forced trace action."""
+    path = harness / "traces" / f"evaluator_round_{round_num}.jsonl"
+    if not path.is_file():
+        return True
+    forced_clicks: list[str] = []
+    normal_successes: set[str] = set()
+    pending_clicks: list[tuple[str, bool]] = []
+    for line in path.read_text(errors="ignore").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") == "assistant":
+            for tool_call in (event.get("message") or {}).get("tool_calls") or []:
+                function = tool_call.get("function") or {}
+                if function.get("name") != "browser_click":
+                    continue
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                pending_clicks.append(
+                    (str(arguments.get("selector") or "<unknown>"), bool(arguments.get("force")))
+                )
+            continue
+        if event.get("event") != "tool" or event.get("name") != "browser_click":
+            continue
+        selector, forced = pending_clicks.pop(0) if pending_clicks else ("<unknown>", False)
+        if event.get("ok") is False:
+            return False
+        if forced:
+            forced_clicks.append(selector)
+        else:
+            normal_successes.add(selector)
+    return all(selector in normal_successes for selector in forced_clicks)
+
+
+def _minimality_certificate(
+    harness: Path, round_num: int, kind: str
+) -> dict[str, Any] | None:
+    """Return a certificate only when the run opted into the new hard gate."""
+    policy = _read_json(harness / "minimality_policy.json", {})
+    if policy.get("enabled") is not True:
+        return None
+    certificate = _read_json(
+        harness / f"minimality_round_{round_num}_{kind}.json", {}
+    )
+    return certificate if isinstance(certificate, dict) else {}
+
+
+def _minimality_export_passed(harness: Path, round_num: int, kind: str) -> bool:
+    certificate = _minimality_certificate(harness, round_num, kind)
+    return certificate is None or certificate.get("status") == "certified"
 
 
 def _confirmed_failure_evidence(grade: dict[str, Any]) -> list[str]:
@@ -460,44 +559,111 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
     forward_baseline = str(seed_manifest.get("baseline_commit") or "")
     successful = {
         round_num: grade for round_num, grade in grades.items()
-        if grade.get("overall_passed") is True
+        if (
+            grade.get("overall_passed") is True
+            and _has_complete_critical_coverage(grade)
+            and _trace_has_no_failed_browser_click(harness, round_num)
+        )
     }
+    # A sprint may have an intermediate functional pass followed by a later
+    # scope/provenance repair.  Export only its terminal accepted checkpoint,
+    # otherwise the same edit appears twice under one instance id.
+    terminal_successful: dict[int, tuple[int, dict[str, Any]]] = {}
+    for round_num, grade in successful.items():
+        sprint_num = int(grade.get("sprint") or 0)
+        prior = terminal_successful.get(sprint_num)
+        if prior is None or round_num > prior[0]:
+            terminal_successful[sprint_num] = (round_num, grade)
     records: list[dict[str, Any]] = []
     checkpoint_by_sprint: dict[int, tuple[int, str]] = {}
 
-    for round_num, grade in sorted(successful.items()):
-        sprint_num = int(grade.get("sprint") or 0)
+    # Reverse construction emits one edit instance with 1--7 requested task
+    # types.  A forward run reaches the same state naturally over consecutive
+    # accepted sprints, so preserve that trajectory as *one* edit pair instead
+    # of turning every sprint into an unrelated one-task example (or, worse,
+    # mislabelling later edits as generation).  Build patches incrementally:
+    # a later patch is intentionally matched against the already-edited code.
+    if forward_baseline:
+        source_code = code_at_commit(frontend, forward_baseline)
+        previous_code = source_code
+        patch_chain: list[dict[str, str]] = []
+        task_types: list[str] = []
+        descriptions: list[dict[str, str]] = []
+        accepted: list[tuple[int, int, str]] = []
+        for sprint_num, (round_num, _grade) in sorted(terminal_successful.items()):
+            # A missing earlier sprint means this is not one continuous
+            # user-visible edit trajectory from the frozen source project.
+            if sprint_num != len(accepted) + 1:
+                break
+            if not _minimality_export_passed(harness, round_num, "edit"):
+                break
+            commit = round_commit[round_num]
+            destination_code = code_at_commit(frontend, commit)
+            sprint_types = _task_types(harness, sprint_num)
+            sprint_patches = make_patches(
+                previous_code, destination_code, sprint_types[0]
+            )
+            if apply_patches(previous_code, sprint_patches) != destination_code:
+                raise ValueError("forward sprint patches do not reproduce destination code")
+            patch_chain.extend(sprint_patches)
+            task_types.extend(sprint_types)
+            descriptions.extend(_task_descriptions(harness, sprint_num))
+            accepted.append((sprint_num, round_num, commit))
+            previous_code = destination_code
+
+        if patch_chain and accepted:
+            first_sprint, _, _ = accepted[0]
+            last_sprint, last_round, destination_commit = accepted[-1]
+            if apply_patches(source_code, patch_chain) != previous_code:
+                raise ValueError("aggregate forward edit patches do not reproduce destination code")
+            tier, rejection_reasons = _quality_tier(
+                "text-editing", patch_chain, task_types
+            )
+            suffix = (
+                f"s{first_sprint:02d}"
+                if first_sprint == last_sprint
+                else f"s{first_sprint:02d}_to_s{last_sprint:02d}"
+            )
+            records.append(_base_record(
+                run_dir=run_dir,
+                instance_id=f"{run_dir.name}__edit_{suffix}",
+                task="text-editing", task_types=task_types,
+                description=_cumulative_description(sprints, last_sprint),
+                src_code=source_code, dst_code=previous_code, patches=patch_chain,
+                src_images=[], dst_images=screenshots_for_round(run_dir, last_round),
+                source_commit=forward_baseline, destination_commit=destination_commit,
+                quality={
+                    "task_descriptions": descriptions,
+                    "accepted_sprints": [item[0] for item in accepted],
+                    "source_checkpoint_passed": True,
+                    "destination_checkpoint_passed": True,
+                    "changed_files": sorted({patch["path"] for patch in patch_chain}),
+                    "patches_reproduce_destination": True,
+                    "tier": tier, "rejection_reasons": rejection_reasons,
+                    "counterfactual_minimality": [
+                        {
+                            "round": item[1],
+                            "status": (
+                                _minimality_certificate(harness, item[1], "edit") or {}
+                            ).get("status", "legacy_not_required"),
+                            "artifact": f".harness/minimality_round_{item[1]}_edit.json",
+                        }
+                        for item in accepted
+                    ],
+                    **_patch_stats(patch_chain),
+                },
+            ))
+
+    for sprint_num, (round_num, grade) in sorted(terminal_successful.items()):
+        if forward_baseline:
+            # The aggregate record above is the only forward edit export.
+            continue
         commit = round_commit[round_num]
         dst_code = code_at_commit(frontend, commit)
         task_types = _task_types(harness, sprint_num)
         # A forward edit starts from an accepted real project, not an empty
         # generation prompt. Export its first accepted sprint as an edit from
         # the frozen seed baseline instead of incorrectly emitting generation.
-        if forward_baseline and sprint_num == 1:
-            src_code = code_at_commit(frontend, forward_baseline)
-            patches = make_patches(src_code, dst_code, task_types[0])
-            if patches and apply_patches(src_code, patches) == dst_code:
-                tier, rejection_reasons = _quality_tier("text-editing", patches, task_types)
-                records.append(_base_record(
-                    run_dir=run_dir,
-                    instance_id=f"{run_dir.name}__edit_s{sprint_num:02d}",
-                    task="text-editing", task_types=task_types,
-                    description=_sprint_description(sprints[sprint_num]),
-                    src_code=src_code, dst_code=dst_code, patches=patches,
-                    src_images=[], dst_images=screenshots_for_round(run_dir, round_num),
-                    source_commit=forward_baseline, destination_commit=commit,
-                    quality={
-                        "task_descriptions": _task_descriptions(harness, sprint_num),
-                        "source_checkpoint_passed": True,
-                        "destination_checkpoint_passed": True,
-                        "changed_files": sorted({patch["path"] for patch in patches}),
-                        "patches_reproduce_destination": True,
-                        "tier": tier, "rejection_reasons": rejection_reasons,
-                        **_patch_stats(patches),
-                    },
-                ))
-            checkpoint_by_sprint[sprint_num] = (round_num, commit)
-            continue
         records.append(_base_record(
             run_dir=run_dir,
             instance_id=f"{run_dir.name}__generate_s{sprint_num:02d}",
@@ -560,6 +726,8 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
         if destination is None:
             continue
         dst_round, _ = destination
+        if not _minimality_export_passed(harness, dst_round, "repair"):
+            continue
         src_commit, dst_commit = round_commit[failed_round], round_commit[dst_round]
         src_code = code_at_commit(frontend, src_commit)
         dst_code = code_at_commit(frontend, dst_commit)
@@ -590,6 +758,12 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
                 "patches_reproduce_destination": True,
                 "tier": tier,
                 "rejection_reasons": rejection_reasons,
+                "counterfactual_minimality": {
+                    "status": (
+                        _minimality_certificate(harness, dst_round, "repair") or {}
+                    ).get("status", "legacy_not_required"),
+                    "artifact": f".harness/minimality_round_{dst_round}_repair.json",
+                },
                 **_patch_stats(patches),
             },
         ))

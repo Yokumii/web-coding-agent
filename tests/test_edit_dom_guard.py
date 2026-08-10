@@ -64,10 +64,33 @@ def test_forward_edit_requires_small_machine_readable_scope(tmp_path):
     harness = tmp_path / ".harness"
     harness.mkdir()
     assert _validate_edit_scope(tmp_path, 1) is not None
+    (harness / "edit_dom_baseline.json").write_text('{"roots":[{"key":"main"}]}')
     (harness / "edit_scope_round_1.json").write_text(
         '{"allowed_root_keys":["main"],"allow_new_roots":false}'
     )
     assert _validate_edit_scope(tmp_path, 1) is None
+    (harness / "edit_scope_round_1.json").write_text(
+        '{"allowed_root_keys":["frontend"],"allow_new_roots":false}'
+    )
+    assert "unknown baseline roots" in _validate_edit_scope(tmp_path, 1)
+
+
+def test_non_forward_repair_scope_uses_failed_source_baseline(tmp_path):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "repair_dom_source_round_2.json").write_text(
+        '{"roots":[{"key":"dialog"},{"key":"main"}]}'
+    )
+    (harness / "edit_scope_round_2.json").write_text(
+        '{"allowed_root_keys":["dialog"],"allow_new_roots":false}'
+    )
+
+    assert _validate_edit_scope(
+        tmp_path,
+        2,
+        required=True,
+        baseline_filename="repair_dom_source_round_2.json",
+    ) is None
 
 
 @pytest.mark.anyio

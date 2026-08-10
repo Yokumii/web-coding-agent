@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
 from pathlib import Path
@@ -43,6 +44,16 @@ def test_build_frontend_command_uses_static_server_for_empty_agent_npm_stub(tmp_
     assert build_frontend_command(tmp_path, 5173) == [
         "python3", "-m", "http.server", "5173", "--bind", "127.0.0.1",
     ]
+
+
+def test_forward_static_seed_ignores_agent_added_package_with_dependencies(tmp_path: Path):
+    source = tmp_path / "source"; source.mkdir(); (source / "index.html").write_text("seed")
+    frontend = tmp_path / "case" / "frontend"; frontend.mkdir(parents=True)
+    (frontend / "index.html").write_text("edited")
+    (frontend / "package.json").write_text('{"devDependencies":{"http-server":"1"}}')
+    (frontend.parent / "seed_manifest.json").write_text('{"source_frontend": ' + json.dumps(str(source)) + '}')
+
+    assert build_frontend_command(frontend, 5173)[:3] == ["python3", "-m", "http.server"]
 
 
 def test_build_frontend_command_prefers_pnpm_lockfile(tmp_path: Path):

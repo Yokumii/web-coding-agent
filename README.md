@@ -46,7 +46,8 @@ What is implemented:
 - Claude HTTP trace pairs for SDK-backed agent runs: `*.http.jsonl` remains the source trace, and `*.http.html` is generated beside it for browser inspection
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
-- Forward edit DOM contract guard: a verified seed is snapshotted before editing; semantic DOM/ARIA surfaces outside the declared (max-two-root) edit scope must remain unchanged. This is independent of screenshot/pixel scoring.
+- Edit/repair DOM contract guard: a verified seed, each sprint's accepted source, and each renderable non-forward repair source are snapshotted before modification; semantic DOM/ARIA surfaces outside the declared (max-two-root) scope must remain unchanged. This is independent of screenshot/pixel scoring.
+- Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. New-policy exports require `certified` evidence.
 
 ## Requirements
 
@@ -124,6 +125,9 @@ MAX_BUDGET_USD=150
 MAX_ROUNDS=3
 FRONTEND_PORT=5173
 PLAYWRIGHT_HEADLESS=false
+MINIMALITY_GUARD_ENABLED=true       # real-browser edit/repair minimality gate
+MINIMALITY_MAX_ATOMS=12             # broader diffs are inconclusive, not accepted
+MINIMALITY_ORACLE_TIMEOUT_SECONDS=240
 ```
 
 ## Configuration Priority
@@ -210,6 +214,15 @@ semantic change of another surface, or an unapproved new surface, fails the roun
 a regression and is recorded in `grade_round_N.json::edit_guard`. Use this to keep
 an edit task narrow; do not use it as proof that the requested behavior works—the
 normal browser evaluator remains responsible for that.
+
+Each sprint also writes `.harness/edit_dom_source_sprint_N.json`. After a passing
+evaluation, the harness writes `.harness/minimality_round_N_edit.json` and, for a
+real repair round, `.harness/minimality_round_N_repair.json`. The certificate runs
+the planner's executable action contract and the DOM/ARIA frame against patch
+subsets. `non_minimal` becomes a repair signal; `invalid_contract` and
+`inconclusive` are evaluation problems and must not be mislabeled as product bugs.
+The full design rationale, 52-paper review, and calibration results are in
+[`docs/harness_research_and_architecture_20260811.md`](docs/harness_research_and_architecture_20260811.md).
 
 For final-website generation, set `FINAL_PROJECT_MODE=1` or pass
 `--final-project-mode`. The planner chooses a natural Sprint count and the harness

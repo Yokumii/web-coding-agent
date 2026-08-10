@@ -23,6 +23,14 @@ from src.utils.playwright_browser import launch_chromium
 BASELINE_NAME = "edit_dom_baseline.json"
 
 
+def sprint_baseline_name(sprint_num: int) -> str:
+    return f"edit_dom_source_sprint_{sprint_num}.json"
+
+
+def repair_baseline_name(round_num: int) -> str:
+    return f"repair_dom_source_round_{round_num}.json"
+
+
 def is_forward_edit(workdir: Path) -> bool:
     return (workdir / "seed_manifest.json").is_file()
 
@@ -72,7 +80,7 @@ def compare_contract(
     }
 
 
-async def _snapshot(app_url: str, *, headless: bool) -> dict[str, Any]:
+async def snapshot_semantic_dom(app_url: str, *, headless: bool) -> dict[str, Any]:
     async with async_playwright() as playwright:
         browser = await launch_chromium(playwright, headless=headless)
         try:
@@ -157,20 +165,47 @@ async def _snapshot(app_url: str, *, headless: bool) -> dict[str, Any]:
 
 
 async def capture_baseline(*, workdir: Path, file_comm: FileComm, config: HarnessConfig, app_url: str) -> dict[str, Any]:
-    snapshot = await _snapshot(app_url, headless=config.playwright_headless)
+    snapshot = await snapshot_semantic_dom(app_url, headless=config.playwright_headless)
     path = file_comm.dir / BASELINE_NAME
     path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return snapshot
 
 
-async def evaluate_guard(*, workdir: Path, file_comm: FileComm, config: HarnessConfig, app_url: str, round_num: int) -> dict[str, Any] | None:
-    path = file_comm.dir / BASELINE_NAME
-    if not is_forward_edit(workdir) or not path.is_file():
+async def capture_sprint_source_baseline(
+    *, file_comm: FileComm, config: HarnessConfig, app_url: str, sprint_num: int
+) -> dict[str, Any]:
+    """Freeze the accepted source state for one edit sprint.
+
+    Comparing every later sprint to the original seed incorrectly labels an
+    earlier accepted sprint as collateral damage.  Each sprint therefore gets
+    its own immutable frame; repair rounds reuse the same frame.
+    """
+    path = file_comm.dir / sprint_baseline_name(sprint_num)
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    snapshot = await snapshot_semantic_dom(app_url, headless=config.playwright_headless)
+    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return snapshot
+
+
+async def evaluate_guard(*, workdir: Path, file_comm: FileComm, config: HarnessConfig, app_url: str, round_num: int, sprint_num: int | None = None) -> dict[str, Any] | None:
+    repair_path = file_comm.dir / repair_baseline_name(round_num)
+    sprint_path = (
+        file_comm.dir / sprint_baseline_name(sprint_num)
+        if sprint_num is not None else None
+    )
+    path = (
+        repair_path if repair_path.is_file()
+        else sprint_path if sprint_path is not None and sprint_path.is_file()
+        else file_comm.dir / BASELINE_NAME
+    )
+    if not path.is_file():
         return None
     baseline = json.loads(path.read_text(encoding="utf-8"))
     scope_path = file_comm.dir / f"edit_scope_round_{round_num}.json"
     scope = json.loads(scope_path.read_text(encoding="utf-8")) if scope_path.is_file() else None
-    current = await _snapshot(app_url, headless=config.playwright_headless)
+    current = await snapshot_semantic_dom(app_url, headless=config.playwright_headless)
     result = compare_contract(baseline, current, scope)
+    result["baseline_file"] = f".harness/{path.name}"
     result["scope_file"] = f".harness/{scope_path.name}" if scope_path.is_file() else None
     return result

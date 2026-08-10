@@ -34,6 +34,21 @@ def _make_planner_stop_hook(file_comm: FileComm, config: HarnessConfig):
         try:
             _validate_planning_bundle(file_comm, config)
         except PlannerValidationError as exc:
+            # progress.md is operational provenance, not a semantic planning
+            # decision. Once every schema-bearing artifact is valid, the
+            # harness can record that milestone itself instead of spending an
+            # extra model turn that often causes the planner to rewrite the
+            # whole bundle.
+            if str(exc) == "Planner completed without writing .harness/progress.md.":
+                file_comm.write_progress(
+                    "# Progress Log\n\nPlanning bundle validated by the harness; ready for implementation.\n"
+                )
+                try:
+                    _validate_planning_bundle(file_comm, config)
+                except PlannerValidationError:
+                    pass
+                else:
+                    return {"decision": "complete"}
             return {
                 "decision": "block",
                 "reason": (
@@ -42,7 +57,7 @@ def _make_planner_stop_hook(file_comm: FileComm, config: HarnessConfig):
                 ),
                 "stopReason": "Planner artifacts failed validation; continue editing .harness.",
             }
-        return {"continue_": True}
+        return {"decision": "complete"}
 
     return _hook
 
@@ -117,7 +132,60 @@ def _validate_planning_bundle(
         sprint_plan=sprint_plan,
         verification_plan=verification_plan,
     )
+    _check_action_contracts(verification_plan)
     _check_sprint_size_caps(sprint_plan, config)
+
+
+def _check_action_contracts(verification_plan: dict[str, Any]) -> None:
+    """Reject planner-authored tests that would fabricate a product failure."""
+    for sprint in verification_plan.get("sprints") or []:
+        for check in sprint.get("checks") or []:
+            actions = check.get("actions") or []
+            if not actions:  # Backwards compatibility for legacy plans.
+                continue
+            check_id = str(check.get("id", "unknown"))
+            if str(actions[-1].get("action")) != "evaluate":
+                raise PlannerValidationError(
+                    f"Planner action contract {check_id} must end with evaluate "
+                    "so the observable result is asserted."
+                )
+            evaluate_count = sum(
+                1 for action in actions if str(action.get("action")) == "evaluate"
+            )
+            if evaluate_count != 1:
+                raise PlannerValidationError(
+                    f"Planner action contract {check_id} must contain exactly one final evaluate; "
+                    "combine related assertions into one boolean expression."
+                )
+            for action in actions:
+                kind = str(action.get("action", ""))
+                if "settle_ms" in action:
+                    settle_ms = action.get("settle_ms")
+                    if (
+                        isinstance(settle_ms, bool)
+                        or not isinstance(settle_ms, int)
+                        or not 0 <= settle_ms <= 5_000
+                    ):
+                        raise PlannerValidationError(
+                            f"Planner action contract {check_id} settle_ms must be an integer from 0 to 5000."
+                        )
+                if kind == "scroll":
+                    y = action.get("y")
+                    if isinstance(y, bool) or not isinstance(y, int):
+                        raise PlannerValidationError(
+                            f"Planner action contract {check_id} scroll action requires integer y."
+                        )
+                if kind == "evaluate":
+                    expression = str(action.get("expression", "")).strip()
+                    if not expression:
+                        raise PlannerValidationError(
+                            f"Planner action contract {check_id} evaluate requires an expression."
+                        )
+                    if "return " in expression or expression.startswith("return"):
+                        raise PlannerValidationError(
+                            f"Planner action contract {check_id} contains a top-level return; "
+                            "write a directly evaluable boolean expression instead."
+                        )
 
 
 def _check_cross_references(
@@ -243,11 +311,20 @@ def _build_planner_prompt(
             "but ensure the full roadmap ends in a polished, runnable final website with no requested "
             "features omitted. Do not optimize the roadmap for extracting edit or repair training samples. "
         )
+    existing_frontend_guidance = ""
+    frontend_dir = workdir / "frontend"
+    if frontend_dir.is_dir():
+        existing_frontend_guidance = (
+            "An existing runnable frontend is already present in `frontend/`. Treat its current "
+            "HTML/CSS/JS or framework stack as authoritative: plan only an in-place extension and "
+            "do not propose a stack migration, scaffold replacement, or React/Vite conversion. "
+        )
     return (
         f"Create a complete planning bundle for this product idea:\n\n"
         f"{user_prompt}\n\n"
         f"{target_profile_guidance(target_profile)}\n"
         f"{final_mode}"
+        f"{existing_frontend_guidance}"
         f"Update the existing planning artifact files under .harness using only file editing tools such as "
         f"Write, Edit, and MultiEdit. Bash is unavailable for this task. "
         f"The Harness has already prepared the workdir, the .harness directory, and the required artifact files. "
@@ -269,9 +346,23 @@ async def run_planner(
     file_comm.dir.mkdir(parents=True, exist_ok=True)
     file_comm.initialize_planning_artifacts()
 
+    # A timed-out planning call often leaves a nearly-complete bundle.  Give a
+    # real follow-up model the precise schema failure instead of making it
+    # rediscover and rewrite every artifact (which is both costly and prone to
+    # introducing new inconsistencies).
+    repair_context = ""
+    try:
+        _validate_planning_bundle(file_comm, config)
+    except PlannerValidationError as exc:
+        repair_context = (
+            "\n\nA previous planner attempt left an invalid bundle. Preserve valid "
+            "artifacts and fix this exact validation failure before finishing:\n"
+            f"{exc}\n"
+        )
+
     prompt = _build_planner_prompt(
         config, user_prompt, workdir, file_comm.read_target_profile()
-    )
+    ) + repair_context
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
         prompt=prompt,

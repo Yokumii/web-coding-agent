@@ -7,6 +7,7 @@ from typing import Any
 
 from src.orchestration.file_comm import FileComm
 from src.orchestration.sprint_state import SprintState
+from src.prompts.grading import determine_passed
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -140,3 +141,54 @@ def restore_resume_state(file_comm: FileComm, state: dict[str, Any]) -> None:
         )
     if file_comm.read_accepted_sprints() != payload:
         file_comm.write_accepted_sprints(payload)
+
+
+def reconcile_completed_evaluation(file_comm: FileComm, state: dict[str, Any]) -> dict[str, Any]:
+    """Reopen a checkpoint that an older verdict normalizer accepted incorrectly.
+
+    This recovery path is deliberately narrow: it only corrects an accepted
+    evaluation checkpoint when the persisted grade itself fails the current
+    acceptance predicate (for example, a failed DOM-scope regression audit).
+    """
+    phase = str(state.get("last_completed_phase", ""))
+    accepted_verdicts = {"accepted_review", "completed"}
+    if not phase.startswith("evaluate_r") or state.get("last_verdict") not in accepted_verdicts:
+        return state
+    try:
+        round_num = int(state["round_num"])
+        sprint_num = int(state["current_sprint"])
+    except (KeyError, TypeError, ValueError):
+        return state
+    grades = file_comm.read_grades(round_num)
+    # Legacy lightweight checkpoints may legitimately omit the grade artifact;
+    # only reopen when persisted grade evidence positively exists.
+    if grades is None:
+        return state
+    if determine_passed(grades):
+        return state
+
+    previous_payload = state.get("accepted_sprints_payload")
+    if not isinstance(previous_payload, dict):
+        return state
+    reconciled = dict(state)
+    accepted = [
+        int(item) for item in previous_payload.get("accepted", [])
+        if isinstance(item, int) and item < sprint_num
+    ]
+    payload = {
+        "accepted": accepted,
+        "current_target": sprint_num,
+        "last_evaluated_round": round_num,
+    }
+    reconciled["accepted_sprints"] = accepted
+    reconciled["accepted_sprints_payload"] = payload
+    reconciled["current_sprint"] = sprint_num
+    reconciled["generator_mode"] = "repair"
+    reconciled["last_verdict"] = "failed_review"
+    file_comm.write_accepted_sprints(payload)
+    file_comm.write_state(reconciled)
+    logger.warning(
+        "Reopened evaluation round %s for repair because persisted grades fail acceptance.",
+        round_num,
+    )
+    return reconciled

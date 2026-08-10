@@ -171,11 +171,19 @@ class FileComm:
         return model.model_dump() if model else None
 
     def write_ui_verification_plan(self, verification_plan: dict[str, Any]) -> Path:
-        return self._write(UIVerificationPlan.model_validate(verification_plan))
+        model = UIVerificationPlan.model_validate(verification_plan)
+        path = self._path(model.filename())
+        path.write_text(
+            model.model_dump_json(indent=2, exclude_unset=True), encoding="utf-8"
+        )
+        return path
 
     def read_ui_verification_plan(self) -> dict[str, Any] | None:
         model = self._read(UIVerificationPlan)
-        return model.model_dump() if model else None
+        # Keep legacy planning artifacts byte-semantically compatible: the
+        # optional `actions` default must not appear merely because a newer
+        # reader loaded an older action-less plan.
+        return model.model_dump(exclude_unset=True) if model else None
 
     def write_design_brief(self, payload: dict[str, Any]) -> Path:
         return self._write(DesignBrief.model_validate(payload))

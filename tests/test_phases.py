@@ -12,7 +12,11 @@ from src.orchestration.file_comm import FileComm
 from src.orchestration.phases import (
     HarnessContext,
     Verdict,
+    _apply_browser_click_evidence_gate,
+    _reconcile_action_contract_evidence,
+    _action_contract_grade_conflicts,
     _edit_guard_requires_repair,
+    _merge_visual_evidence_manifest,
     run_build_phase,
     run_evaluate_phase,
     run_planner_phase,
@@ -43,9 +47,119 @@ def test_edit_guard_requires_both_machine_contract_and_independent_scope_audit()
     assert _edit_guard_requires_repair(
         {"passed": True}, {}, evaluator_mode="full"
     ) is True
+
+
+def test_browser_click_evidence_gate_overrides_model_pass(tmp_path: Path):
+    trace = tmp_path / ".harness" / "traces"
+    trace.mkdir(parents=True)
+    (trace / "evaluator_round_1.jsonl").write_text(
+        '{"event":"tool","name":"browser_click","ok":false,'
+        '"output":"chatbot intercepts pointer events"}\n',
+        encoding="utf-8",
+    )
+    grades = {
+        "overall_passed": True,
+        "sprint_passed": True,
+        "regression_passed": True,
+        "mode_recommendation": "complete",
+        "phase_results": {"ui_functionality": "pass"},
+        "bugs_found": [],
+        "repair_instructions": [],
+    }
+
+    gated = _apply_browser_click_evidence_gate(tmp_path, 1, grades)
+
+    assert gated["overall_passed"] is False
+    assert gated["sprint_passed"] is False
+    assert gated["regression_passed"] is False
+    assert gated["mode_recommendation"] == "repair"
+    assert gated["phase_results"]["ui_functionality"] == "fail"
+    assert "browser_click evidence failed" in gated["bugs_found"][0]
+    assert gated["repair_instructions"]
+
+
+def test_browser_click_evidence_gate_rejects_force_only_click(tmp_path: Path):
+    trace = tmp_path / ".harness" / "traces"
+    trace.mkdir(parents=True)
+    (trace / "evaluator_round_1.jsonl").write_text(
+        '{"event":"assistant","message":{"tool_calls":[{"id":"click-1",'
+        '"function":{"name":"browser_click","arguments":"{\\"selector\\":\\"#save\\",\\"force\\":true}"}}]}}\n'
+        '{"event":"tool","name":"browser_click","ok":true,"output":"clicked"}\n',
+        encoding="utf-8",
+    )
+    grades = {
+        "overall_passed": True,
+        "sprint_passed": True,
+        "regression_passed": True,
+        "phase_results": {"ui_functionality": "pass"},
+        "bugs_found": [],
+        "repair_instructions": [],
+    }
+
+    gated = _apply_browser_click_evidence_gate(tmp_path, 1, grades)
+
+    assert gated["overall_passed"] is False
+    assert "forced browser_click" in gated["bugs_found"][0]
+
+
+def test_merge_visual_evidence_manifest_keeps_agent_refs_and_adds_independent_refs():
+    merged = _merge_visual_evidence_manifest(
+        {"round": 1, "app_url": "http://example.test", "screenshots": [".harness/agent.png"]},
+        round_num=1,
+        app_url="http://127.0.0.1:5173",
+        evidence_refs=[".harness/visual_round_1_auto_top.png", ".harness/visual_round_1_auto_scrolled.png"],
+    )
+
+    assert merged["app_url"] == "http://127.0.0.1:5173"
+    assert merged["screenshots"] == [
+        ".harness/agent.png",
+        ".harness/visual_round_1_auto_top.png",
+        ".harness/visual_round_1_auto_scrolled.png",
+    ]
+    assert "independently captured" in merged["notes"]
     assert _edit_guard_requires_repair(
         {"passed": False}, {"edit_scope_audit": "pass"}, evaluator_mode="simple"
     ) is True
+
+
+def test_action_contract_evidence_overrides_conflicting_llm_ui_check(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.dir.mkdir(parents=True, exist_ok=True)
+    (file_comm.dir / "browser_evidence_round_1.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"ok"},'
+        '{"check_id":"UI-002","status":"action_failed"}]}\n'
+    )
+    grades = {
+        "ui_checks": [
+            {"check_id": "UI-001", "feature_id": "F001", "status": "fail", "notes": "LLM mismatch"},
+            {"check_id": "UI-002", "feature_id": "F002", "status": "pass", "notes": "LLM mismatch"},
+        ],
+        "target_exit_criteria_results": [
+            {"feature_id": "F001", "passed": False},
+            {"feature_id": "F002", "passed": True},
+        ],
+    }
+
+    reconciled = _reconcile_action_contract_evidence(file_comm, 1, grades)
+
+    assert [item["status"] for item in reconciled["ui_checks"]] == ["pass", "fail"]
+    assert [item["passed"] for item in reconciled["target_exit_criteria_results"]] == [True, False]
+    assert reconciled["browser_action_contract_reconciliation"]["changed_check_ids"] == ["UI-001", "UI-002"]
+
+
+def test_action_contract_conflict_gate_only_checks_complete_contracts(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "browser_evidence_round_1.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"ok"},'
+        '{"check_id":"UI-002","status":"action_failed"},'
+        '{"check_id":"UI-003","status":"no_action_contract"}]}'
+    )
+    grades = {"ui_checks": [
+        {"check_id": "UI-001", "status": "partial"},
+        {"check_id": "UI-002", "status": "pass"},
+        {"check_id": "UI-003", "status": "partial"},
+    ]}
+    assert _action_contract_grade_conflicts(file_comm, 1, grades) == ["UI-001", "UI-002"]
 
 
 def _stub_sprint(number: int) -> dict:
@@ -257,6 +371,9 @@ async def test_run_evaluate_phase_normalizes_inconsistent_pass_and_recommendatio
     monkeypatch.setattr("src.orchestration.phases.run_evaluator", fake_run_evaluator)
     monkeypatch.setattr("src.orchestration.phases.start_app_stack", fake_start_app_stack)
     monkeypatch.setattr("src.orchestration.phases.apply_dedicated_visual_review", fake_visual_review)
+    async def fake_collect_browser_evidence(**kwargs):
+        return {"checks": []}
+    monkeypatch.setattr("src.orchestration.phases.collect_browser_evidence", fake_collect_browser_evidence)
 
     verdict = await run_evaluate_phase(ctx, 1)
 

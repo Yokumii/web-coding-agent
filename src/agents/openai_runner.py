@@ -24,7 +24,10 @@ class OpenAIRunLimits:
     error_repeat_limit: int = 3
     no_progress_limit: int = 8
     evaluation_exploration_limit: int = 40
-    evaluation_browser_evaluate_limit: int = 8
+    # A complete edit acceptance commonly needs: locate a page, record the
+    # initial state, exercise each critical interaction, then inspect the
+    # resulting state. Eight DOM probes is routinely exhausted before that.
+    evaluation_browser_evaluate_limit: int = 16
 
 
 @dataclass
@@ -38,10 +41,13 @@ class EvaluationToolPolicy:
     finalizing: bool = False
 
     _FINALIZATION_TOOLS = frozenset({"write_file", "apply_patch", "browser_screenshot"})
+    _BROWSER_VERIFICATION_TOOLS = frozenset({
+        "browser_snapshot", "browser_click", "browser_fill", "browser_screenshot",
+    })
 
     def check(self, tool_name: str) -> str | None:
         if self.finalizing:
-            if tool_name in self._FINALIZATION_TOOLS:
+            if tool_name in self._FINALIZATION_TOOLS | self._BROWSER_VERIFICATION_TOOLS:
                 return None
             return (
                 "Evaluation is in finalization mode. Stop investigating; only capture the "
@@ -57,7 +63,10 @@ class EvaluationToolPolicy:
                 )
             self.browser_evaluate_calls += 1
 
-        if tool_name not in self._FINALIZATION_TOOLS:
+        # Source exploration and browser interaction have different scarcity:
+        # reserve browser actions for the declared UI checks even after the
+        # model has consumed its inspection budget reading project files.
+        if tool_name not in self._FINALIZATION_TOOLS | self._BROWSER_VERIFICATION_TOOLS:
             if self.exploration_calls >= self.exploration_limit:
                 self.finalizing = True
                 return (
@@ -120,6 +129,17 @@ def _compact_messages(messages: list[dict[str, Any]], recent: int) -> list[dict[
     }] + messages[cut:]
 
 
+def _is_finalization_command(command: str) -> bool:
+    """Allow only commit-oriented commands once a generator is out of turns."""
+    normalized = " ".join(str(command).strip().split())
+    if normalized.startswith("cd frontend && "):
+        normalized = normalized.removeprefix("cd frontend && ")
+    return normalized.startswith((
+        "git add ", "git commit ", "git status --short", "git diff --check",
+        "node --check ", "npm run build",
+    ))
+
+
 class OpenAIHTTPClient:
     def __init__(self, config: HarnessConfig, timeout: float): self.config, self.timeout = config, timeout
     async def complete(self, **payload):
@@ -133,34 +153,46 @@ class OpenAIHTTPClient:
         # opt-in environment switch without coupling generic OpenAI providers to it.
         if os.getenv("OPENAI_ENABLE_THINKING") == "0" and str(payload.get("model", "")).lower().startswith("qwen"):
             payload["enable_thinking"] = False
+        # The request budget is end-to-end.  In particular, do not let five
+        # individually timed-out proxy retries turn a 120s calibration request
+        # into a ten-minute cost/control failure.
+        deadline = time.monotonic() + self.timeout
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout),
             verify=os.getenv("SSL_NO_VERIFY") != "1",
             trust_env=True,
         ) as client:
             for attempt in range(5):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"chat completion exhausted its {self.timeout:.0f}s total request budget"
+                    )
                 try:
                     response = await client.post(
                         base + "/chat/completions",
                         headers={"Authorization": f"Bearer {key}"},
                         json=payload,
+                        timeout=httpx.Timeout(remaining),
                     )
                 except httpx.TransportError:
                     # SOCKS/office-network connections occasionally fail before
                     # an HTTP response exists. Treat this exactly like a 5xx:
                     # retry the same idempotent chat request with bounded backoff.
                     if attempt < 4:
-                        await asyncio.sleep(min(2 ** (attempt + 1), 16))
+                        await asyncio.sleep(min(2 ** (attempt + 1), 16, max(0, deadline - time.monotonic())))
                         continue
                     raise
                 body = response.text[:2000]
                 provider_throttled = (
-                    "MPE-429" in body or "Throttling.BurstRate" in body
+                    "MPE-429" in body
+                    or "Throttling.BurstRate" in body
+                    or "limit_burst_rate" in body
                 )
                 retryable = response.status_code == 429 or response.status_code >= 500 or provider_throttled
                 if response.is_error and retryable and attempt < 4:
                     delay = min(10 * (2 ** attempt), 60) if provider_throttled else min(2 ** (attempt + 1), 16)
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(min(delay, max(0, deadline - time.monotonic())))
                     continue
                 if response.is_error:
                     raise httpx.HTTPStatusError(
@@ -271,14 +303,37 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                     try: args = json.loads(fn.get("arguments") or "{}")
                     except json.JSONDecodeError as exc: result = type("R", (), {"ok":False,"output":f"invalid JSON: {exc}","changed":False})()
                     else:
+                        # A generator must be able to persist its final
+                        # progress/scope artifacts as well as commit.  The old
+                        # non-Playwright branch allowed only run_command, so a
+                        # model entering FINAL CHANCE could be trapped in
+                        # denied write_file retries immediately before commit.
                         final_allowed = (
                             {"write_file", "apply_patch", "browser_screenshot"}
                             if allow_playwright
                             else {"write_file", "apply_patch", "run_command"}
                         )
-                        final_denial = final_chance and fn["name"] not in final_allowed
+                        # Generator turns are expensive. Reserve the final ten
+                        # model turns for making the last file edits, validating,
+                        # committing, and stopping; otherwise a model can keep
+                        # rereading files until the turn limit expires after it
+                        # has already implemented the requested change.
+                        # Do not force a generator that is still diagnosing a
+                        # real repair into whole-file writes.  Before its true
+                        # final chance it keeps normal tools; final chance is
+                        # commit/validation-only so incomplete diagnosis cannot
+                        # turn into an unrelated template rewrite.
+                        turn_finalization = final_chance
+                        final_denial = turn_finalization and (
+                            fn["name"] not in final_allowed
+                            or (fn["name"] == "run_command" and not _is_finalization_command(args.get("command", "")))
+                        )
                         policy_denial = evaluation_policy.check(fn["name"]) if evaluation_policy else None
-                        finalize_only = allow_playwright and calls > limits.max_tool_calls - 10
+                        # Reserve the last ten calls in every phase for a
+                        # useful terminal action. Generators otherwise spend
+                        # their whole budget rereading adjacent source ranges
+                        # and never reach apply_patch/commit.
+                        finalize_only = calls > limits.max_tool_calls - 10
                         if final_denial:
                             result = type("R", (), {
                                 "ok": False,
@@ -291,10 +346,16 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                                 "output": policy_denial,
                                 "changed": False,
                             })()
-                        elif finalize_only and fn["name"] not in {"write_file", "apply_patch", "browser_screenshot"}:
+                        elif finalize_only and fn["name"] not in final_allowed:
                             result = type("R", (), {
                                 "ok": False,
-                                "output": "Evaluation tool budget is nearly exhausted. Stop investigating now; capture any required screenshot and write the grades and visual manifest files.",
+                                "output": (
+                                    "Tool-call budget is nearly exhausted. Stop investigating now. "
+                                    "If you are implementing or repairing, apply the scoped source "
+                                    "changes you have already identified, validate, write the required "
+                                    "scope artifact, commit, and finish. If you are evaluating, capture "
+                                    "the required screenshot and write the grades and visual manifest files."
+                                ),
                                 "changed": False,
                             })()
                         else:
@@ -302,7 +363,15 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                     # Successful reads/searches advance the model's information state even
                     # when they do not mutate the filesystem. Count only failed tool turns
                     # as no progress; the global tool-call cap still bounds read-only loops.
-                    if result.ok: no_progress = 0
+                    if final_denial or policy_denial or finalize_only:
+                        # A planned finalization denial is control guidance, not
+                        # a failed tool invocation. Do not trip the generic
+                        # repeated-error circuit breaker before the model can
+                        # submit its required artifacts and finish. The same
+                        # applies to evaluator diagnostic-budget guidance.
+                        no_progress = 0
+                        last_error, consecutive_errors = None, 0
+                    elif result.ok: no_progress = 0
                     else: no_progress += 1
                     if no_progress >= limits.no_progress_limit: raise RuntimeError("no-progress circuit breaker")
                     if not result.ok:
@@ -320,7 +389,29 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                         )
                     messages.append({"role":"tool", "tool_call_id":call["id"], "content":tool_content})
                     if trace: trace.write(json.dumps({"event":"tool", "name":fn["name"], "ok":result.ok, "output":result.output[:2000]}, ensure_ascii=False)+"\n"); trace.flush()
-            raise RuntimeError("maximum agent turns exceeded")
+                    # Artifact-producing agents may finish through their
+                    # files alone. Let an approving hook stop here instead of
+                    # paying for a redundant read/rewrite cycle before a
+                    # natural-language epilogue.
+                    if result.ok:
+                        for hook in stop_hooks or []:
+                            verdict = await hook({}, None, {})
+                            if verdict.get("decision") == "complete":
+                                completed = OpenAIResult(last_text, [{"type":"text","text":last_text}], usage, {}, int((time.monotonic()-started)*1000), api_ms)
+                                return completed, estimate_cost_usd(model, usage), last_text, []
+            # A tool-using model sometimes completes the filesystem work and
+            # commit but never emits a final text turn. Preserve that valid
+            # trajectory when the same completion hooks approve it.
+            blocked_reason = None
+            for hook in stop_hooks or []:
+                verdict = await hook({}, None, {})
+                if verdict.get("decision") == "block":
+                    blocked_reason = verdict.get("reason") or verdict.get("stopReason")
+                    break
+            if blocked_reason is None:
+                result = OpenAIResult(last_text, [{"type":"text","text":last_text}], usage, {}, int((time.monotonic()-started)*1000), api_ms)
+                return result, estimate_cost_usd(model, usage), last_text, []
+            raise RuntimeError("maximum agent turns exceeded: " + blocked_reason)
         finally:
             if trace: trace.close()
             try:

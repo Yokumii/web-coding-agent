@@ -4,7 +4,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from scripts.export_trajectory_dataset import export_run
+from scripts.export_trajectory_dataset import apply_patches, export_run
 
 
 def _git(frontend: Path, *args: str) -> None:
@@ -96,12 +96,136 @@ def test_export_run_treats_accepted_seed_baseline_as_first_forward_edit(tmp_path
     _write_json(run_dir / "seed_manifest.json", {"baseline_commit": baseline})
     _write_json(harness / "sprint_plan.json", {"sprints": [{"number": 1, "title": "Aid", "goal": "Aid", "deliverables": []}]})
     _write_json(harness / "feature_list.json", {"features": [{"id": "F1", "name": "Reading aid", "description": "Add an aid.", "sprint": 1}]})
-    _write_json(harness / "grade_round_1.json", {"round": 1, "sprint": 1, "overall_passed": True})
+    _write_json(harness / "grade_round_1.json", {
+        "round": 1, "sprint": 1, "overall_passed": True,
+        "target_exit_criteria_results": [{
+            "critical": True, "passed": True, "notes": "Clicked the reading-aid control and observed its panel."
+        }],
+        "ui_checks": [{
+            "critical": True, "status": "pass", "notes": "Clicked the reading-aid control and observed its panel."
+        }],
+    })
 
     records = export_run(run_dir)
 
     assert [record["task"] for record in records] == ["text-editing"]
     assert records[0]["trajectory"]["source_commit"] == baseline
+
+
+def test_new_policy_excludes_forward_edit_without_certified_minimality(tmp_path: Path):
+    run_dir = tmp_path / "forward_guarded"
+    frontend = run_dir / "frontend"
+    harness = run_dir / ".harness"
+    frontend.mkdir(parents=True); harness.mkdir()
+    _git(frontend, "init", "-b", "main")
+    _git(frontend, "config", "user.name", "test"); _git(frontend, "config", "user.email", "test@example.com")
+    _commit(frontend, "chore: accepted forward-edit baseline", "<main>before</main>")
+    baseline = subprocess.run(["git", "rev-parse", "HEAD"], cwd=frontend, text=True, check=True, capture_output=True).stdout.strip()
+    _commit(frontend, "feat: add control", "<main>after</main>")
+    _write_json(run_dir / "seed_manifest.json", {"baseline_commit": baseline})
+    _write_json(harness / "minimality_policy.json", {"enabled": True})
+    _write_json(harness / "sprint_plan.json", {"sprints": [{"number": 1, "title": "Aid", "goal": "Aid", "deliverables": []}]})
+    _write_json(harness / "feature_list.json", {"features": [{"id": "F1", "name": "Aid", "description": "Add aid.", "sprint": 1}]})
+    _write_json(harness / "grade_round_1.json", {
+        "round": 1, "sprint": 1, "overall_passed": True,
+        "ui_checks": [{"critical": True, "status": "pass", "notes": "Observed aid."}],
+        "target_exit_criteria_results": [{"critical": True, "passed": True, "notes": "Observed aid."}],
+    })
+
+    assert export_run(run_dir) == []
+
+    _write_json(harness / "minimality_round_1_edit.json", {"status": "certified"})
+    records = export_run(run_dir)
+    assert [record["task"] for record in records] == ["text-editing"]
+    assert records[0]["quality"]["counterfactual_minimality"][0]["status"] == "certified"
+
+
+def test_export_run_aggregates_consecutive_forward_sprints(tmp_path: Path):
+    run_dir = tmp_path / "forward_aggregate"
+    frontend = run_dir / "frontend"
+    harness = run_dir / ".harness"
+    frontend.mkdir(parents=True); harness.mkdir()
+    _git(frontend, "init", "-b", "main")
+    _git(frontend, "config", "user.name", "test"); _git(frontend, "config", "user.email", "test@example.com")
+    _commit(frontend, "chore: accepted forward-edit baseline", "<main>before</main>")
+    baseline = subprocess.run(["git", "rev-parse", "HEAD"], cwd=frontend, text=True, check=True, capture_output=True).stdout.strip()
+    _commit(frontend, "feat: add controls", "<main>controls</main>")
+    _commit(frontend, "feat: add mobile layout", "<main>controls mobile</main>")
+    _write_json(run_dir / "seed_manifest.json", {"baseline_commit": baseline})
+    _write_json(harness / "sprint_plan.json", {"sprints": [
+        {"number": 1, "title": "Controls", "goal": "Controls", "deliverables": []},
+        {"number": 2, "title": "Mobile", "goal": "Mobile", "deliverables": []},
+    ]})
+    _write_json(harness / "feature_list.json", {"features": [
+        {"id": "F1", "name": "View controls", "description": "Add controls.", "sprint": 1},
+        {"id": "F2", "name": "Responsive layout", "description": "Add mobile layout.", "sprint": 2},
+    ]})
+    for round_num, sprint_num in ((1, 1), (2, 2)):
+        _write_json(harness / f"grade_round_{round_num}.json", {
+            "round": round_num, "sprint": sprint_num, "overall_passed": True,
+            "target_exit_criteria_results": [{"critical": True, "passed": True, "notes": "Observed control behavior."}],
+            "ui_checks": [{"critical": True, "status": "pass", "notes": "Observed control behavior."}],
+        })
+
+    records = export_run(run_dir)
+
+    assert [record["task"] for record in records] == ["text-editing"]
+    edit = records[0]
+    assert edit["task_type"] == ["View controls", "Responsive layout"]
+    assert edit["quality"]["accepted_sprints"] == [1, 2]
+    assert edit["reference"]["dst_code"][0]["code"] == "<main>controls mobile</main>"
+    assert apply_patches(edit["instruction"]["src_code"], edit["label_modified_files"]) == edit["reference"]["dst_code"]
+
+
+def test_export_run_excludes_accepted_edit_with_unverified_critical_interaction(tmp_path: Path):
+    run_dir = tmp_path / "forward_unverified_case"
+    frontend = run_dir / "frontend"
+    harness = run_dir / ".harness"
+    frontend.mkdir(parents=True); harness.mkdir()
+    _git(frontend, "init", "-b", "main")
+    _git(frontend, "config", "user.name", "test"); _git(frontend, "config", "user.email", "test@example.com")
+    _commit(frontend, "chore: accepted forward-edit baseline", "<main>before</main>")
+    baseline = subprocess.run(["git", "rev-parse", "HEAD"], cwd=frontend, text=True, check=True, capture_output=True).stdout.strip()
+    _commit(frontend, "feat: add reading aid", "<main>after</main>")
+    _write_json(run_dir / "seed_manifest.json", {"baseline_commit": baseline})
+    _write_json(harness / "sprint_plan.json", {"sprints": [{"number": 1, "title": "Aid", "goal": "Aid", "deliverables": []}]})
+    _write_json(harness / "feature_list.json", {"features": [{"id": "F1", "name": "Reading aid", "description": "Add an aid.", "sprint": 1}]})
+    _write_json(harness / "grade_round_1.json", {
+        "round": 1, "sprint": 1, "overall_passed": True,
+        "ui_checks": [{"critical": True, "status": "partial", "notes": "Not verified within evaluation budget."}],
+        "target_exit_criteria_results": [{"critical": True, "passed": True, "notes": "Could not verify the scroll interaction."}],
+    })
+
+    assert export_run(run_dir) == []
+
+
+def test_export_trace_gate_rejects_success_claim_with_failed_browser_click(tmp_path: Path):
+    from scripts.export_trajectory_dataset import _trace_has_no_failed_browser_click
+
+    harness = tmp_path / ".harness"
+    traces = harness / "traces"
+    traces.mkdir(parents=True)
+    (traces / "evaluator_round_1.jsonl").write_text(
+        '{"event":"tool","name":"browser_click","ok":false,"output":"timeout"}\n'
+    )
+
+    assert _trace_has_no_failed_browser_click(harness, 1) is False
+
+
+def test_export_trace_gate_rejects_force_only_click(tmp_path: Path):
+    from scripts.export_trajectory_dataset import _trace_has_no_failed_browser_click
+
+    harness = tmp_path / ".harness"
+    traces = harness / "traces"
+    traces.mkdir(parents=True)
+    (traces / "evaluator_round_1.jsonl").write_text(
+        '{"event":"assistant","message":{"tool_calls":[{"id":"click-1",'
+        '"function":{"name":"browser_click","arguments":"{\\"selector\\":\\"#save\\",\\"force\\":true}"}}]}}\n'
+        '{"event":"tool","name":"browser_click","ok":true,"output":"clicked"}\n',
+        encoding="utf-8",
+    )
+
+    assert _trace_has_no_failed_browser_click(harness, 1) is False
 
 
 def test_make_patches_uses_local_context_instead_of_whole_file():
@@ -217,6 +341,53 @@ def test_v2_repair_contract_hides_diagnosis_and_requires_paired_images():
     assert text["instruction"] == [{"path": "app.js", "code": "broken()"}]
     assert "description" not in text["instruction"]
     assert converted["image-repair.v2"] == []
+
+
+def test_scope_guard_failure_is_not_a_project_repair_candidate():
+    from scripts.export_trajectory_dataset import _is_real_project_failure
+
+    assert _is_real_project_failure({
+        "overall_passed": False,
+        "edit_scope_audit": "fail",
+        "ui_checks": [{"status": "fail", "notes": "A real-looking UI failure."}],
+    }) is False
+
+
+def test_scope_failure_does_not_hide_a_reproduced_ui_repair_candidate():
+    from scripts.export_trajectory_dataset import _is_real_project_failure
+
+    assert _is_real_project_failure({
+        "overall_passed": False,
+        "edit_scope_audit": "fail",
+        "ui_checks": [{
+            "critical": True,
+            "status": "fail",
+            "notes": "Navigator is visibly positioned on the left instead of the required right side.",
+        }],
+    }) is True
+
+
+def test_export_quality_uses_reverse_construction_one_to_seven_task_contract():
+    from scripts.export_trajectory_dataset import _quality_tier
+
+    patch = [{"path": "app.js", "search": "old", "replace": "new"}]
+    assert _quality_tier("text-editing", patch, ["Navigation"])[0] == "benchmark_aligned"
+    assert _quality_tier("text-editing", patch, [str(index) for index in range(7)])[0] == "benchmark_aligned"
+    assert "edit_task_count_outside_1_to_7" in _quality_tier(
+        "text-editing", patch, [str(index) for index in range(8)]
+    )[1]
+
+
+def test_unverified_failure_wording_is_not_a_project_repair_candidate():
+    from scripts.export_trajectory_dataset import _is_real_project_failure
+
+    assert _is_real_project_failure({
+        "overall_passed": False,
+        "ui_checks": [{
+            "status": "partial",
+            "notes": "Filtering behavior could not be fully verified within budget.",
+        }],
+    }) is False
 
 
 def test_v2_conversion_rejects_file_creation_patch_for_reverse_compatibility():

@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from src.config import HarnessConfig
-from src.orchestration.checkpoints import ResumeError, restore_resume_state
+from src.orchestration.checkpoints import (
+    ResumeError,
+    reconcile_completed_evaluation,
+    restore_resume_state,
+)
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
 from src.orchestration.phases import (
@@ -23,6 +27,31 @@ from src.orchestration.target_profile import detect_target_profile
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _next_round_cost_reserve(phase_metrics: dict[str, dict[str, Any]]) -> float:
+    """Estimate the minimum spend needed to make the next round decision-useful.
+
+    Once a run has measured both phases, starting another generator without
+    enough budget to also evaluate it only creates an unusable partial trace.
+    """
+    def recorded_cost(metric: dict[str, Any]) -> float:
+        value = metric.get("cost_usd")
+        return float(value) if isinstance(value, (int, float)) else 0.0
+
+    generator_costs = [
+        recorded_cost(metric)
+        for key, metric in phase_metrics.items()
+        if key.startswith("generator_r") and isinstance(metric, dict)
+    ]
+    evaluator_costs = [
+        recorded_cost(metric)
+        for key, metric in phase_metrics.items()
+        if key.startswith("evaluator_r") and isinstance(metric, dict)
+    ]
+    if not generator_costs or not evaluator_costs:
+        return 0.0
+    return max(0.50, generator_costs[-1] + evaluator_costs[-1])
 
 
 def _is_planner_checkpoint(phase: str | None) -> bool:
@@ -48,6 +77,7 @@ async def run_harness(
         user_prompt = existing_state.get("prompt", user_prompt)
         _restore_costs(cost_tracker, existing_state.get("costs", {}))
         restore_resume_state(file_comm, existing_state)
+        existing_state = reconcile_completed_evaluation(file_comm, existing_state)
         phase_metrics = _copy_metrics(existing_state.get("phase_metrics"))
         skip_until_phase = existing_state.get("last_completed_phase")
         logger.info(f"[bold]Harness resuming[/] from '{skip_until_phase}'")
@@ -125,6 +155,15 @@ async def run_harness(
     for round_num in range(start_round, max_rounds + 1):
         logger.info(f"[bold cyan]═" * 40)
         logger.info(f"[bold cyan]ROUND {round_num}/{max_rounds}")
+
+        reserve = _next_round_cost_reserve(ctx.phase_metrics)
+        if reserve and cost_tracker.remaining() < reserve:
+            logger.warning(
+                "[bold yellow]Budget reserve prevents an unevaluable new round. "
+                f"Remaining ${cost_tracker.remaining():.2f}; observed minimum "
+                f"generator+evaluator cost ${reserve:.2f}. Stopping.[/]"
+            )
+            break
 
         if skip_until_phase != f"build_r{round_num}":
             await run_build_phase(ctx, round_num, resume_state=existing_state)

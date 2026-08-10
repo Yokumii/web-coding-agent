@@ -29,6 +29,24 @@ def test_all_pass():
     assert check_grades(grades) is True
 
 
+def test_determine_passed_rejects_failed_regression_even_when_sprint_passed():
+    grades = {
+        "criteria": {
+            "design_quality": {"score": 7.0, "passed": True, "notes": "ok"},
+            "functionality": {"score": 8.0, "passed": True, "notes": "ok"},
+            "originality": {"score": 6.0, "passed": True, "notes": "ok"},
+            "craft": {"score": 7.0, "passed": True, "notes": "ok"},
+        },
+        "sprint_passed": True,
+        "regression_passed": False,
+        "overall_passed": False,
+        "bugs_found": [],
+        "missing_features": [],
+    }
+
+    assert determine_passed(grades) is False
+
+
 def test_one_fail():
     grades = {
         "criteria": {
@@ -180,6 +198,23 @@ def test_evaluation_is_inconclusive_when_all_failures_are_unverified():
     assert evaluation_is_inconclusive(grades) is True
 
 
+def test_evaluation_is_inconclusive_for_could_not_be_fully_verified_wording():
+    grades = {
+        "phase_results": {"render_gate": "pass", "ui_functionality": "fail"},
+        "target_exit_criteria_results": [{
+            "critical": True,
+            "passed": False,
+            "notes": "Filtering behavior could not be fully verified within budget.",
+        }],
+        "ui_checks": [{
+            "critical": True,
+            "status": "partial",
+            "notes": "Filter behavior was not verified.",
+        }],
+    }
+    assert evaluation_is_inconclusive(grades) is True
+
+
 def test_evaluation_is_not_inconclusive_with_reproduced_failure():
     grades = {
         "phase_results": {"render_gate": "pass", "ui_functionality": "fail"},
@@ -230,4 +265,5 @@ def test_apply_visual_review_scores_recomputes_overall_passed():
     assert merged["criteria"]["craft"]["passed"] is False
     assert merged["overall_passed"] is False
     assert merged["mode_recommendation"] == "repair"
+    assert "below threshold" in merged["repair_instructions"][-1]
     assert grades["overall_passed"] is True

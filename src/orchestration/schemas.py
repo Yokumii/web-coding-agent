@@ -118,6 +118,9 @@ class UIVerificationCheck(BaseModel):
     expected_result: str
     critical: bool
     category: str
+    # Planner-authored, declarative browser steps.  Optional for backwards
+    # compatibility with existing runs; new plans are asked to provide them.
+    actions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class UIVerificationSprint(BaseModel):
@@ -264,6 +267,7 @@ class Grades(_Artifact):
     evaluation_infrastructure_failure: dict[str, Any] | None = None
     edit_guard: dict[str, Any] | None = None
     edit_scope_audit: str | None = None
+    minimality_certificate: dict[str, Any] | None = None
 
     @classmethod
     def filename(cls, *, round_num: int, **params: Any) -> str:
