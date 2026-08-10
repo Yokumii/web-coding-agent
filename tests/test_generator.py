@@ -785,6 +785,60 @@ def test_non_forward_repair_prompt_uses_failed_source_semantic_frame(tmp_path: P
     assert "main" in prompt
 
 
+def test_forward_prompt_consumes_harness_owned_minimal_path_plan(tmp_path: Path):
+    import json
+
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    (tmp_path / "seed_manifest.json").write_text("{}")
+    (file_comm.dir / "edit_dom_baseline.json").write_text(
+        json.dumps({"roots": [{"key": "main", "fingerprint": "x"}]})
+    )
+    (file_comm.dir / "minimal_path_plan_round_1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "minimal-path-plan-v1",
+                "owner": "harness",
+                "round": 1,
+                "source_change_cone": {
+                    "local_paths": ["frontend/src/App.jsx"],
+                    "dependency_paths": ["frontend/src/app.css"],
+                },
+                "budgets": {"max_patch_lines": 120, "max_touched_files": 3},
+            }
+        )
+    )
+    (file_comm.dir / "edit_scope_round_1.json").write_text(
+        json.dumps(
+            {
+                "owner": "harness",
+                "allowed_root_keys": ["main"],
+                "allow_new_roots": False,
+            }
+        )
+    )
+
+    prompt = _build_generator_prompt(
+        mode="generate",
+        file_comm=file_comm,
+        round_num=1,
+        sprint_num=1,
+        sprint_context={
+            "title": "Scoped edit",
+            "feature_ids": ["F001"],
+            "goal": "Update search",
+            "deliverables": ["Search update"],
+            "exit_criteria": ["Search works"],
+        },
+        accepted_sprints={"accepted": []},
+    )
+
+    assert ".harness/minimal_path_plan_round_1.json" in prompt
+    assert "harness already materialized" in prompt
+    assert "Existing source overwrites are rejected" in prompt
+    assert "write `.harness/edit_scope_round_1.json`" not in prompt
+
+
 def test_scope_contract_only_repair_requires_all_product_checks_to_pass():
     grades = {
         "sprint_passed": True,

@@ -46,20 +46,28 @@ prompt 和 exporter 由父仓库统一版本控制，运行产物则与源码分
 - 前端运行时失败的本地日志
 - 按阶段记录成本，并设有总预算硬上限
 - forward edit 的 DOM 契约保护：编辑前对已验收 seed 建立语义 DOM/ARIA surface 基线；除显式声明的最多两个 root 外，其他 surface 不得变化。该检查独立于截图/像素评分。
+- harness 主导的最小路径引导：模型编辑前依据可执行 UI selector、DOM anchor、源码热点和 import/link 边生成 change cone；OpenAI 原生工具与 Claude SDK 都会在执行前拦截越界修改，并把放行、拒绝和依赖扩展写入 append-only ledger。
 
 ### Forward edit 回归保护
 
 由 `scripts/prepare_forward_edit_seed.py` 创建的 workdir 含有已验证的
 `seed_manifest.json`。首次 edit build 前，harness 会启动该 seed 并写入
 `.harness/edit_dom_baseline.json`：其中是 landmark、role、`data-testid` root 与
-语义控件的 DOM/ARIA 指纹，也包含可聚焦控件是否确实能获得键盘焦点；不是截图。随后 generator 必须写入
+语义控件的 DOM/ARIA 指纹，也包含可聚焦控件是否确实能获得键盘焦点和稳定的后代 anchor；不是截图。
+generator 启动前，harness 会结合可执行 action selector 与源码依赖边写入
+`.harness/minimal_path_plan_round_N.json` 和 harness 自己持有的
 `.harness/edit_scope_round_N.json`，例如：
 
 ```json
-{"allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
+{"owner":"harness","allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
 ```
 
-契约最多允许两个已命名 baseline surface 内发生变化；其他 surface 被删除或语义变化，
+模型不能修改这两个策略文件。已有源码只能用唯一匹配的 exact patch 修改；整文件覆盖、
+越出 change cone、过宽 patch 以及 Bash 文件/依赖写操作会在执行前被拒绝。依赖文件只有
+在 plan 中存在明确 import/link 边时才可进入范围；决策写入
+`.harness/minimal_path_ledger_round_N.jsonl`。
+
+DOM 契约最多允许两个已命名 baseline surface 内发生变化；其他 surface 被删除或语义变化，
 或未授权新增 surface，都会作为 regression 使该轮失败，并写入
 `grade_round_N.json::edit_guard`。该门禁约束 edit 的边界；它不能替代正常 browser
 evaluator 对需求是否真正实现的验证。

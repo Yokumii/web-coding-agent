@@ -382,6 +382,7 @@ def make_tool_permission_callback(
     bash_profile: str = "full",
     trace_writer: SdkTraceWriter | None = None,
     frontend_port: int = 5173,
+    mutation_policy: Any | None = None,
 ):
     if bash_profile not in {"full", "read_only"}:
         raise ValueError(f"unsupported bash_profile: {bash_profile!r}")
@@ -441,6 +442,17 @@ def make_tool_permission_callback(
                     message=str(exc),
                 )
                 return PermissionResultDeny(message=str(exc))
+            if mutation_policy is not None:
+                denial = mutation_policy.check(tool_name, tool_input)
+                if denial:
+                    _write_permission_trace(
+                        trace_writer,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        decision="deny",
+                        message=str(denial),
+                    )
+                    return PermissionResultDeny(message=str(denial))
             _write_permission_trace(
                 trace_writer,
                 tool_name=tool_name,
@@ -461,6 +473,18 @@ def make_tool_permission_callback(
                 message=str(exc),
             )
             return PermissionResultDeny(message=str(exc))
+
+        if mutation_policy is not None:
+            denial = mutation_policy.check(tool_name, tool_input)
+            if denial:
+                _write_permission_trace(
+                    trace_writer,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    decision="deny",
+                    message=str(denial),
+                )
+                return PermissionResultDeny(message=str(denial))
 
         _write_permission_trace(
             trace_writer,
@@ -486,6 +510,7 @@ def build_agent_options(
     stop_hooks: list[HookCallback] | None = None,
     trace_writer: SdkTraceWriter | None = None,
     anthropic_base_url_override: str | None = None,
+    mutation_policy: Any | None = None,
 ) -> ClaudeAgentOptions:
     """按 harness 约束组装单个 agent 的 ClaudeAgentOptions。"""
     mcp_servers: dict[str, McpStdioServerConfig] = {}
@@ -545,6 +570,7 @@ def build_agent_options(
             bash_profile=bash_profile,
             trace_writer=trace_writer,
             frontend_port=config.frontend_port,
+            mutation_policy=mutation_policy,
         ),
         hooks=hooks,
         mcp_servers=mcp_servers,
@@ -568,6 +594,7 @@ async def run_sdk_agent(
     bash_profile: str = "full",
     stop_hooks: list[HookCallback] | None = None,
     trace_path: Path | None = None,
+    mutation_policy: Any | None = None,
 ) -> tuple[ResultMessage, float, str, list[Any]]:
     """运行单个 SDK agent，并统一收集文本、权限拒绝与成本信息。"""
     runtime = config.agent_runtime.strip().lower()
@@ -592,6 +619,7 @@ async def run_sdk_agent(
             bash_profile=bash_profile,
             stop_hooks=stop_hooks,
             trace_path=trace_path,
+            mutation_policy=mutation_policy,
         )
     trace_writer = SdkTraceWriter(trace_path) if trace_path else None
     http_trace_path = trace_path.with_suffix(".http.jsonl") if trace_path else None
@@ -613,6 +641,7 @@ async def run_sdk_agent(
             stop_hooks=stop_hooks,
             trace_writer=trace_writer,
             anthropic_base_url_override=anthropic_base_url_override,
+            mutation_policy=mutation_policy,
         )
         if trace_writer:
             trace_writer.write(

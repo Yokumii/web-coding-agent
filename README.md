@@ -47,6 +47,7 @@ What is implemented:
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
 - Edit/repair DOM contract guard: a verified seed, each sprint's accepted source, and each renderable non-forward repair source are snapshotted before modification; semantic DOM/ARIA surfaces outside the declared (max-two-root) scope must remain unchanged. This is independent of screenshot/pixel scoring.
+- Harness-owned minimal-path guidance: executable UI selectors, semantic DOM anchors, source hotspots, and import/link edges produce a per-round change cone before the model edits. Both native OpenAI tools and Claude SDK mutations enforce that cone; existing source cannot be whole-file overwritten, dependency widening must follow a recorded edge, and every decision is appended to a ledger.
 - Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. New-policy exports require `certified` evidence.
 
 ## Requirements
@@ -128,6 +129,9 @@ PLAYWRIGHT_HEADLESS=false
 MINIMALITY_GUARD_ENABLED=true       # real-browser edit/repair minimality gate
 MINIMALITY_MAX_ATOMS=12             # broader diffs are inconclusive, not accepted
 MINIMALITY_ORACLE_TIMEOUT_SECONDS=240
+MINIMAL_PATH_GUIDANCE_ENABLED=true  # pre-edit and in-edit execution policy
+MINIMAL_PATH_MAX_PATCH_LINES=120    # per exact mutation, not an acceptance proof
+MINIMAL_PATH_MAX_TOUCHED_FILES=3    # local/dependency change-cone budget
 ```
 
 ## Configuration Priority
@@ -201,13 +205,22 @@ Workdirs created by `scripts/prepare_forward_edit_seed.py` contain a verified
 `seed_manifest.json`. Before the first edit build, the harness starts that seed and
 writes `.harness/edit_dom_baseline.json`: a hash-only snapshot of meaningful
 DOM/ARIA surfaces (landmarks, roles, `data-testid` roots and semantic controls),
-including whether each normally focusable control can actually receive keyboard focus;
-it is not a screenshot. The generator must then write
-`.harness/edit_scope_round_N.json`, for example:
+including whether each normally focusable control can actually receive keyboard focus
+and stable descendant anchors; it is not a screenshot. Before the generator runs, the
+harness combines those anchors with executable UI action selectors and source dependency
+edges to write `.harness/minimal_path_plan_round_N.json` and the corresponding
+harness-owned `.harness/edit_scope_round_N.json`, for example:
 
 ```json
-{"allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
+{"owner":"harness","allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
 ```
+
+The model cannot edit either policy artifact. Existing frontend source must be changed
+through an exact unique patch; whole-file overwrite, unrelated paths, broad patches, and
+filesystem/package mutations through Bash are rejected before execution. A direct
+dependency may enter the cone only through a recorded import/link edge. All allowed,
+denied, and widened mutations are appended to
+`.harness/minimal_path_ledger_round_N.jsonl` and exported as trajectory provenance.
 
 The contract permits changes inside at most two named baseline surfaces. Removal or
 semantic change of another surface, or an unapproved new surface, fails the round as
@@ -215,7 +228,8 @@ a regression and is recorded in `grade_round_N.json::edit_guard`. Use this to ke
 an edit task narrow; do not use it as proof that the requested behavior works—the
 normal browser evaluator remains responsible for that.
 
-Each sprint also writes `.harness/edit_dom_source_sprint_N.json`. After a passing
+This online controller guides the path but does not prove that the final diff is globally
+minimal. Each sprint also writes `.harness/edit_dom_source_sprint_N.json`. After a passing
 evaluation, the harness writes `.harness/minimality_round_N_edit.json` and, for a
 real repair round, `.harness/minimality_round_N_repair.json`. The certificate runs
 the planner's executable action contract and the DOM/ARIA frame against patch

@@ -16,6 +16,7 @@ from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.edit_dom_guard import repair_baseline_name
 from src.orchestration.file_comm import FileComm
 from src.orchestration.git_journal import ensure_repo
+from src.orchestration.minimal_path_guidance import MinimalPathPolicy, plan_name
 from src.orchestration.round_artifacts import RoundArtifacts
 from src.orchestration.sprint_state import SprintState
 from src.orchestration.target_profile import (
@@ -388,6 +389,16 @@ def _validate_edit_scope(
         return "Forward edit scope must contain a string list `allowed_root_keys`."
     if len(roots) > 2 or len(set(roots)) != len(roots):
         return "Forward edit scope may declare at most two distinct root keys."
+    harness_baseline = payload.get("baseline") if isinstance(payload, dict) else None
+    if baseline_filename is None and isinstance(harness_baseline, str):
+        candidate = Path(harness_baseline)
+        if (
+            candidate.is_absolute()
+            or ".." in candidate.parts
+            or candidate.parent.as_posix() not in {".", ".harness"}
+        ):
+            return "Forward edit scope contains an invalid harness baseline reference."
+        baseline_filename = candidate.name
     baseline_path = workdir / ".harness" / (
         baseline_filename or "edit_dom_baseline.json"
     )
@@ -572,6 +583,8 @@ def _build_generator_prompt(
     is_forward_edit = (file_comm.dir.parent / "seed_manifest.json").is_file()
     repair_frame_path = file_comm.dir / repair_baseline_name(round_num)
     has_repair_frame = mode == "repair" and repair_frame_path.is_file()
+    minimal_path_ref = f".harness/{plan_name(round_num)}"
+    minimal_path_owned = (file_comm.dir / plan_name(round_num)).is_file()
     feature_ids = ", ".join(sprint_context.get("feature_ids", []))
     common_lines = [
         f"Mode: {mode}\n",
@@ -595,7 +608,20 @@ def _build_generator_prompt(
             f"- The native-model trace already records the current atomic commit `{recovered_commit[:12]}` for this exact sprint.\n",
             "- Do NOT call tools, edit files, or create another commit. Respond immediately that this committed implementation is ready for browser evaluation.\n",
         ])
-    if is_forward_edit:
+    if minimal_path_owned:
+        common_lines.extend([
+            "\nHarness-owned minimal-path channel:\n",
+            f"- FIRST read `{minimal_path_ref}`. The harness already materialized "
+            f"`.harness/edit_scope_round_{round_num}.json`; do not create, copy, or edit either artifact.\n",
+            "- Start with `source_change_cone.local_paths`. A dependency path is admitted only when "
+            "the plan records its dependency edge; protected paths are rejected by the tool layer.\n",
+            "- Existing source overwrites are rejected. Use exact, unique patches within the plan's "
+            "line and touched-file budgets. Mutation attempts and dependency widening are recorded "
+            "in the minimal-path ledger.\n",
+            "- This is an execution policy enforced by the harness. The later counterfactual "
+            "certificate remains an independent final check.\n",
+        ])
+    if is_forward_edit and not minimal_path_owned:
         try:
             baseline = json.loads((file_comm.dir / "edit_dom_baseline.json").read_text(encoding="utf-8"))
             root_keys = [str(item["key"]) for item in baseline.get("roots", [])]
@@ -611,7 +637,7 @@ def _build_generator_prompt(
             "- The harness independently rejects semantic DOM/ARIA changes outside this declared scope.\n",
             "- If the frozen seed is a plain HTML/CSS/JS site, do not create package.json, lockfiles, dev servers, or dependencies; the harness serves it statically.\n",
         ])
-    elif has_repair_frame:
+    elif has_repair_frame and not minimal_path_owned:
         try:
             baseline = json.loads(repair_frame_path.read_text(encoding="utf-8"))
             root_keys = [str(item["key"]) for item in baseline.get("roots", [])]
@@ -627,6 +653,8 @@ def _build_generator_prompt(
 
     if mode == "generate":
         required_reads = list(_GENERATE_REQUIRED_READS)
+        if minimal_path_owned:
+            required_reads.append(minimal_path_ref)
         if target_profile:
             required_reads.append(".harness/target_profile.json")
         required_reads.extend(design_contract.required_refs())
@@ -684,7 +712,9 @@ def _build_generator_prompt(
         # repair reads; source inspection then stays targeted to the failure.
         required_reads = [
             *(
-                [f".harness/edit_scope_round_{feedback_round}.json"]
+                [minimal_path_ref, f".harness/edit_scope_round_{round_num}.json"]
+                if minimal_path_owned
+                else [f".harness/edit_scope_round_{feedback_round}.json"]
                 if is_forward_edit
                 else [f".harness/{repair_baseline_name(round_num)}"]
                 if has_repair_frame
@@ -703,7 +733,17 @@ def _build_generator_prompt(
                 str(edit_certificate.get("artifact") or f".harness/minimality_round_{feedback_round}_edit.json")
             )
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
-        if is_forward_edit:
+        if minimal_path_owned:
+            scope_first_action = (
+                f"FIRST ACTION: read `{minimal_path_ref}` and inspect only its local source "
+                "hotspots. The scope is already computed and immutable.\n"
+            )
+            scope_preservation_guidance = (
+                "Follow the harness-selected local paths and recorded dependency edges. If a "
+                "mutation is denied, use the returned source candidate instead of expanding to "
+                "an unrelated file.\n"
+            )
+        elif is_forward_edit:
             scope_first_action = (
                 f"FIRST ACTION: copy `.harness/edit_scope_round_{feedback_round}.json` to "
                 f"`.harness/edit_scope_round_{round_num}.json` before any investigation. This is a "
@@ -939,6 +979,11 @@ async def run_generator(
     target_profile = file_comm.read_target_profile()
     prior_grades = file_comm.read_grades(round_num - 1) if mode == "repair" else None
     scope_contract_only = isinstance(prior_grades, dict) and _is_scope_contract_only_repair(prior_grades)
+    mutation_policy = (
+        MinimalPathPolicy.load(workdir, round_num)
+        if config.minimal_path_guidance_enabled
+        else None
+    )
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
         prompt=user_msg,
@@ -953,6 +998,7 @@ async def run_generator(
             scope_contract_only=scope_contract_only,
         )],
         trace_path=RoundArtifacts(file_comm, round_num).trace_path("generator"),
+        mutation_policy=mutation_policy,
     )
 
     _validate_generator_outputs(file_comm, workdir, (result.result or "").strip())

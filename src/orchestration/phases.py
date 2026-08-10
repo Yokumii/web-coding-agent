@@ -42,6 +42,7 @@ from src.orchestration.minimality_runtime import (
     record_round_build_destination,
     record_round_build_source,
 )
+from src.orchestration.minimal_path_guidance import ensure_minimal_path_plan
 from src.orchestration.runtime import start_app_stack
 from src.orchestration.sprint_state import SprintState
 from src.prompts.grading import evaluation_is_inconclusive
@@ -252,6 +253,21 @@ async def run_build_phase(
                 )
             finally:
                 await app_stack.close()
+    guide_minimal_path = (
+        ctx.config.minimal_path_guidance_enabled
+        and (is_forward_edit(ctx.workdir) or mode == "repair")
+        and frontend_dir.is_dir()
+    )
+    if guide_minimal_path:
+        ensure_minimal_path_plan(
+            workdir=ctx.workdir,
+            harness_dir=ctx.file_comm.dir,
+            round_num=round_num,
+            sprint_num=sprint_num,
+            mode=mode,
+            max_patch_lines=ctx.config.minimal_path_max_patch_lines,
+            max_touched_files=ctx.config.minimal_path_max_touched_files,
+        )
     track_minimality = (
         ctx.config.minimality_guard_enabled
         and (is_forward_edit(ctx.workdir) or mode == "repair")

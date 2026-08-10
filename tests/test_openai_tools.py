@@ -19,6 +19,37 @@ async def test_write_file_overwrites_without_prior_read(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_mutation_policy_blocks_native_tool_before_source_change(tmp_path: Path):
+    target = tmp_path / "frontend" / "app.js"
+    target.parent.mkdir()
+    target.write_text("const value = 'old';\n")
+
+    class Policy:
+        def check(self, tool_name, tool_input):
+            assert tool_name == "apply_patch"
+            assert tool_input["path"] == "frontend/app.js"
+            return "outside the harness change cone"
+
+    tools = OpenAIToolExecutor(
+        workdir=tmp_path,
+        allow_bash=False,
+        mutation_policy=Policy(),
+    )
+    result = await tools.execute(
+        "apply_patch",
+        {
+            "path": "frontend/app.js",
+            "old_text": "'old'",
+            "new_text": "'new'",
+        },
+    )
+
+    assert not result.ok
+    assert "change cone" in result.output
+    assert target.read_text() == "const value = 'old';\n"
+
+
+@pytest.mark.anyio
 async def test_static_forward_seed_rejects_runtime_scaffold(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()

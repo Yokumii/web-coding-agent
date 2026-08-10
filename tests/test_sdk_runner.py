@@ -296,6 +296,34 @@ async def test_permission_callback_allows_plain_find(tmp_path: Path):
     assert result.behavior == "allow"
 
 
+@pytest.mark.anyio
+async def test_permission_callback_applies_minimal_path_policy(tmp_path: Path):
+    class Policy:
+        def check(self, tool_name, tool_input):
+            assert tool_name == "Edit"
+            assert tool_input["file_path"].endswith("frontend/App.jsx")
+            return "outside the harness change cone"
+
+    callback = make_tool_permission_callback(
+        workdir=tmp_path,
+        allow_bash=False,
+        allow_playwright=False,
+        mutation_policy=Policy(),
+    )
+    result = await callback(
+        "Edit",
+        {
+            "file_path": str(tmp_path / "frontend" / "App.jsx"),
+            "old_string": "old",
+            "new_string": "new",
+        },
+        None,
+    )
+
+    assert result.behavior == "deny"
+    assert "change cone" in result.message
+
+
 def test_build_agent_options_includes_playwright_server(tmp_path: Path):
     options = build_agent_options(
         config=HarnessConfig(playwright_headless=True),

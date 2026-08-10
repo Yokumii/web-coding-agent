@@ -6,11 +6,12 @@
 
 1. 任务目标由 planner 写成可执行 action contract，且每条检查必须以浏览器断言结束；
 2. 每个 edit sprint，以及每个可渲染 repair 的失败源，在修改前冻结自己的语义 DOM/ARIA frame，避免把之前已验收的 sprint 或无关失败源区域误判为本轮改动；
-3. generator 只声明最多两个允许变化的语义 surface，harness 独立检查其余 surface；
-4. 通过普通 evaluator 后，harness 把 Git 变化拆成精确、可重放的 patch atoms；
-5. 在隔离项目中逐组、逐个删除 atoms，真实启动 Chromium，重放目标契约和保护契约；
-6. 只有源版本不能完成目标、完整目标版本通过、且剩余每个 atom 都经反事实证明不可删除时，才生成 `certified` 证书；
-7. 新策略启用后的 edit/repair 没有相应证书，就不能进入数据导出。
+3. harness 从 action selector、DOM anchor 和源码依赖计算允许变化的 semantic surface 与 source change cone；
+4. OpenAI/Claude 两条工具链在写入前强制 exact patch、路径、文件数与依赖扩展策略，并记录 ledger；
+5. 通过普通 evaluator 后，harness 把 Git 变化拆成精确、可重放的 patch atoms；
+6. 在隔离项目中逐组、逐个删除 atoms，真实启动 Chromium，重放目标契约和保护契约；
+7. 只有源版本不能完成目标、完整目标版本通过、且剩余每个 atom 都经反事实证明不可删除时，才生成 `certified` 证书；
+8. 新策略启用后的 edit/repair 没有相应证书，就不能进入数据导出。
 
 这套机制称为 **UI Change Cone + Counterfactual Patch Certificate（UI 变化锥 + 反事实补丁证书）**。它不是像素 mask，也不依赖 agent 自报“我只改了必要部分”。截图仍可用于外观评分，但不承担 edit 保护或最小性证明。
 
@@ -137,7 +138,13 @@ accepted source C
    │
    ├── planner target contract T
    ├── per-sprint semantic frame F
-   └── declared change footprint S (≤2 source surfaces)
+   ├── harness-derived DOM footprint S (≤2 source surfaces)
+   └── source change cone G (hotspots → recorded dependencies)
+   │
+tool-gated edit trajectory
+   ├── existing source overwrite / unrelated path → denied
+   ├── exact local patch → allowed + ledger
+   └── recorded import/link edge → dependency widening + ledger
    │
 agent candidate C' + exact patches P
    │
@@ -157,9 +164,10 @@ agent candidate C' + exact patches P
 
 ### 为什么这是战略级而不是 prompt tweak
 
-- agent 无法通过文字承诺绕过证书；判断在 agent 停止后进行；
+- scope 与 source cone 由 harness 计算，OpenAI/Claude 两条工具链都在写入前执行同一门禁；
+- agent 无法通过文字承诺绕过在线门禁或最终证书；
 - “未改区域”来自运行时语义 frame，不是截图相似度；
-- “最少修改”来自反事实重放，不是文件数/行数阈值；
+- 文件/行预算只负责引导搜索路径；最终“是否还能更少”仍来自反事实重放，而不是阈值；
 - 测试本身也被验证：源版本若已通过，任务契约被拒绝；
 - edit 与 repair 同时有证书，但 source 定义不同：
   - edit：该 sprint 最初 accepted source → 最终 destination；
@@ -170,6 +178,12 @@ agent candidate C' + exact patches P
 
 ### 已实现
 
+- `src/orchestration/minimal_path_guidance.py`
+  - 从 action selector、DOM anchor、源码命中和 import/link 边生成 harness-owned change cone；
+  - 先走 local hotspot，只允许沿显式依赖边扩展；protected path 直接拒绝；
+  - 禁止已有源码整文件覆盖、非唯一 exact patch、过宽 patch 与 Bash 旁路修改；
+  - OpenAI 原生工具与 Claude SDK permission callback 共用 policy；
+  - append-only mutation ledger，并在 dataset exporter 中保存引导 provenance。
 - `src/orchestration/minimal_patch_guard.py`
   - exact atomic patch；
   - ddmin + exhaustive one-deletion；
@@ -201,10 +215,15 @@ agent candidate C' + exact patches P
   - append-only `status` rows；
   - attempt timeout、持久日志、断点续跑；
   - 不覆盖已有实验结果。
+- `scripts/calibrate_minimal_path_cases.py` / `run_minimal_path_calibration.sh`
+  - 从历史真实 source commit 建立隔离 workspace；
+  - 启动真实前端与 Chromium，重采 v2 DOM anchor frame；
+  - 把历史真实 patch 逐个送过在线 mutation policy；
+  - plan、ledger、decision 与 status row 全部持久化且可断点跳过。
 
 ### 自动测试
 
-完整 suite：`510 passed, 2 skipped`。两个 skip 是既有条件性测试；另有两条第三方 `aiohttp` deprecation warning。测试覆盖：
+完整 suite：`524 passed, 2 skipped`。两个 skip 是既有条件性测试；另有两条第三方 `aiohttp` deprecation warning。测试覆盖：
 
 - exact patches 的顺序与唯一匹配；
 - 冗余 atom 检出；
@@ -213,6 +232,10 @@ agent candidate C' + exact patches P
 - infra error 不冒充必要性；
 - build source map 恢复；
 - action contract 必须含断言；
+- DOM action selector → source hotspot/change cone；
+- OpenAI 与 Claude SDK 双运行时 mutation policy；
+- whole-file overwrite、越界路径、过宽 patch 和 Bash 旁路拒绝；
+- dependency-edge widening ledger；
 - exporter policy/certificate gate；
 - legacy action-less artifact 的兼容读取。
 
@@ -230,19 +253,32 @@ agent candidate C' + exact patches P
 
 这组结果说明门禁既不是“全部拒绝”，也不是“全部放过”；它能接受必要的跨 HTML/CSS/JS edit、接受真实单点 repair，并发现旧 evaluator 未发现的冗余修改。
 
+在线引导另有两条真实 source-commit 校准，写入
+`runs/agentic/minimal_path_calibration/20260811_v1/records.jsonl`：
+
+| Case | 在线 change cone | 历史真实 patch | 最终反事实结论 |
+|---|---|---|---|
+| `air_truthchecked_back_to_top...9431392_4837d9a` | `index.html + main.js + styles.css`，另 1 个源码路径受保护 | 3/3 在写入前获准 | `certified` |
+| `edit_3662_store_tools...933ff09_b5f1242` | 同样收敛到 3 文件，另 1 个源码路径受保护 | 7/7 在正确通道内获准 | `non_minimal`，`p006` 为锥内冗余 |
+
+第二条不是失败，而是重要边界：在线 controller 能阻止路径扩散，却不能仅凭
+source cone 判断同一路径内某条 CSS 是否必要；因此后置 counterfactual certificate
+仍必须保留。引导与证明分别回答“先去哪里改”和“最终还能不能更少”。
+
 ## 六、是否已经符合期待
 
 ### 已符合
 
 - 保护手段以 DOM/ARIA、可聚焦性、浏览器行为为主，不靠像素 mask；
-- edit/repair 最小性由反事实执行机械约束，不靠 prompt；
+- edit/repair 在模型运行前和写入时由 harness-owned change cone 引导，不靠 prompt 自律；
+- 最终最小性再由反事实执行机械证明，在线引导与后置验收相互独立；
 - 产物仍与 WebCompass-like `src_code + instruction + exact patches + destination` 兼容；
 - accepted/rejected/inconclusive 都保留，适合后续数据审计；
 - 一个旧的“看似合格 edit”被真实证据降级，证明策略有新增判别力。
 
 ### 仍未完成，不能夸大
 
-- 只校准 3 条证书记录，不能推断 corpus 通过率或训练收益；
+- 只校准 3 条证书记录与 2 条在线引导 replay，不能推断 corpus 通过率或训练收益；
 - v1 atom 是 exact diff hunk，不是 HTML/CSS/JS AST/依赖图；
 - frame 目前是顶层 semantic surfaces；全局 CSS、storage、network、timer 等跨 surface 副作用还需专门契约；
 - action contract 的覆盖强度仍由 planner 初始定义，需要 mutation calibration 量化“能杀死多少真实回归”；

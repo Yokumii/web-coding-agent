@@ -37,6 +37,8 @@ DEFAULT_OPENAI_RECENT_MESSAGES = 18
 DEFAULT_OPENAI_TOOL_RESULT_CHARS = 8000
 DEFAULT_MINIMALITY_MAX_ATOMS = 12
 DEFAULT_MINIMALITY_ORACLE_TIMEOUT_SECONDS = 240
+DEFAULT_MINIMAL_PATH_MAX_PATCH_LINES = 120
+DEFAULT_MINIMAL_PATH_MAX_TOUCHED_FILES = 3
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -99,6 +101,19 @@ class HarnessConfig:
         default_factory=lambda: _env_int(
             "MINIMALITY_ORACLE_TIMEOUT_SECONDS",
             DEFAULT_MINIMALITY_ORACLE_TIMEOUT_SECONDS,
+        )
+    )
+    minimal_path_guidance_enabled: bool = field(
+        default_factory=lambda: _env_bool("MINIMAL_PATH_GUIDANCE_ENABLED", True)
+    )
+    minimal_path_max_patch_lines: int = field(
+        default_factory=lambda: _env_int(
+            "MINIMAL_PATH_MAX_PATCH_LINES", DEFAULT_MINIMAL_PATH_MAX_PATCH_LINES
+        )
+    )
+    minimal_path_max_touched_files: int = field(
+        default_factory=lambda: _env_int(
+            "MINIMAL_PATH_MAX_TOUCHED_FILES", DEFAULT_MINIMAL_PATH_MAX_TOUCHED_FILES
         )
     )
 

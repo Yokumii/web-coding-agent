@@ -9,7 +9,8 @@ and a separate immutable source frame for each sprint:
 1. semantic DOM and ARIA trees for top-level landmarks / `data-testid` surfaces;
 2. control role, accessible name, destination/type, tab index and actual keyboard
    focus reachability; and
-3. a generator-declared edit scope with at most two baseline surfaces.
+3. a harness-derived edit scope with at most two baseline surfaces and stable
+   action-selector evidence.
 
 The per-sprint frame prevents an earlier accepted edit from being mistaken for
 collateral damage in a later sprint. The guard fails edits that change, remove,
@@ -18,6 +19,23 @@ independent evaluator must decide whether the declared scope is proportionate to
 sprint. This protects accepted areas without a screenshot, pixel mask, or a visual
 similarity threshold. It does not claim that the new feature works; the normal browser
 evaluator still owns that oracle.
+
+Before the generator starts, the harness converts the executable action
+contract and semantic anchors into a source change cone. Exact selector/token
+matches define local source hotspots; static import, stylesheet, and script-link
+edges define the only admissible widening tier. The same mutation policy runs in
+the native OpenAI executor and Claude SDK permission callback:
+
+- overwriting an existing frontend source file is denied;
+- an exact edit must identify one unique source occurrence and stay under the
+  configured per-patch budget;
+- protected paths and mutating Bash/package commands are denied;
+- dependency widening is allowed only along a recorded edge; and
+- every authorization, denial, and widening is appended to
+  `minimal_path_ledger_round_N.jsonl`.
+
+This is the online guidance layer. It reduces the search trajectory before and
+during editing; it is not treated as proof of final minimality.
 
 After the target evaluator passes, the counterfactual patch guard decomposes the
 source-to-destination transition into exact patch atoms. It verifies that the source

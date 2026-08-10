@@ -24,6 +24,9 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "true")
     monkeypatch.setenv("FINAL_PROJECT_MODE", "true")
     monkeypatch.setenv("PLANNER_SCOPE_MODE", "expansive-data")
+    monkeypatch.setenv("MINIMAL_PATH_GUIDANCE_ENABLED", "false")
+    monkeypatch.setenv("MINIMAL_PATH_MAX_PATCH_LINES", "73")
+    monkeypatch.setenv("MINIMAL_PATH_MAX_TOUCHED_FILES", "4")
 
     config = HarnessConfig()
 
@@ -48,6 +51,9 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     assert config.final_project_mode is True
     assert config.planner_scope_mode == "expansive-data"
     assert config.evaluator_mode == "full"
+    assert config.minimal_path_guidance_enabled is False
+    assert config.minimal_path_max_patch_lines == 73
+    assert config.minimal_path_max_touched_files == 4
 
 
 def test_harness_config_uses_sdk_buffer_environment_variable(monkeypatch):

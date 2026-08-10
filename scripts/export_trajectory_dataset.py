@@ -367,6 +367,50 @@ def _minimality_export_passed(harness: Path, round_num: int, kind: str) -> bool:
     return certificate is None or certificate.get("status") == "certified"
 
 
+def _minimal_path_provenance(harness: Path, round_num: int) -> dict[str, Any]:
+    """Summarize online guidance separately from post-hoc minimality proof."""
+    plan_path = harness / f"minimal_path_plan_round_{round_num}.json"
+    plan = _read_json(plan_path, {})
+    if not isinstance(plan, dict) or plan.get("owner") != "harness":
+        return {"status": "legacy_not_required"}
+    ledger_path = harness / f"minimal_path_ledger_round_{round_num}.jsonl"
+    ledger: list[dict[str, Any]] = []
+    if ledger_path.is_file():
+        for line in ledger_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                ledger.append(item)
+    counts = {
+        decision: sum(item.get("decision") == decision for item in ledger)
+        for decision in ("allow", "deny")
+    }
+    cone = plan.get("source_change_cone") or {}
+    dom = plan.get("dom_change_cone") or {}
+    return {
+        "status": "enforced",
+        "plan_artifact": f".harness/{plan_path.name}",
+        "ledger_artifact": f".harness/{ledger_path.name}",
+        "local_paths": list(cone.get("local_paths") or []),
+        "dependency_paths": list(cone.get("dependency_paths") or []),
+        "allowed_root_keys": list(dom.get("allowed_root_keys") or []),
+        "decision_counts": counts,
+        "touched_paths": sorted({
+            str(item["path"])
+            for item in ledger
+            if item.get("decision") == "allow" and item.get("path")
+        }),
+        "dependency_expansions": sorted({
+            str(item["path"])
+            for item in ledger
+            if item.get("expansion_reason") == "recorded_dependency_edge"
+            and item.get("path")
+        }),
+    }
+
+
 def _confirmed_failure_evidence(grade: dict[str, Any]) -> list[str]:
     evidence: list[str] = []
     for item in grade.get("target_exit_criteria_results") or []:
@@ -650,6 +694,10 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
                         }
                         for item in accepted
                     ],
+                    "minimal_path_guidance": [
+                        {"round": item[1], **_minimal_path_provenance(harness, item[1])}
+                        for item in accepted
+                    ],
                     **_patch_stats(patch_chain),
                 },
             ))
@@ -705,6 +753,9 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
                     "patches_reproduce_destination": True,
                     "tier": tier,
                     "rejection_reasons": rejection_reasons,
+                    "minimal_path_guidance": _minimal_path_provenance(
+                        harness, round_num
+                    ),
                     **_patch_stats(patches),
                 },
             ))
@@ -764,6 +815,9 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
                     ).get("status", "legacy_not_required"),
                     "artifact": f".harness/minimality_round_{dst_round}_repair.json",
                 },
+                "minimal_path_guidance": _minimal_path_provenance(
+                    harness, dst_round
+                ),
                 **_patch_stats(patches),
             },
         ))

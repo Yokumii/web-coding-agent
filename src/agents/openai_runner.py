@@ -207,12 +207,13 @@ class OpenAIHTTPClient:
 async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path, model: str,
     system_prompt: str, max_turns: int, allow_bash: bool, allow_playwright: bool = False,
     bash_profile: str = "full", stop_hooks=None, trace_path: Path | None = None,
-    client=None, limits: OpenAIRunLimits | None = None):
+    client=None, limits: OpenAIRunLimits | None = None, mutation_policy=None):
     limits = limits or OpenAIRunLimits(phase_timeout=config.agent_phase_timeout_seconds,
         request_timeout=config.agent_request_timeout_seconds, max_tool_calls=config.agent_max_tool_calls)
     client = client or OpenAIHTTPClient(config, limits.request_timeout)
     tools = OpenAIToolExecutor(workdir=workdir, allow_bash=allow_bash, allow_playwright=allow_playwright,
-        bash_profile=bash_profile, frontend_port=config.frontend_port, command_timeout=limits.command_timeout)
+        bash_profile=bash_profile, frontend_port=config.frontend_port, command_timeout=limits.command_timeout,
+        mutation_policy=mutation_policy)
     evaluation_policy = EvaluationToolPolicy(
         exploration_limit=limits.evaluation_exploration_limit,
         browser_evaluate_limit=limits.evaluation_browser_evaluate_limit,

@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 from pathlib import Path
 
 import pytest
@@ -305,6 +306,68 @@ async def test_run_build_phase_does_not_auto_commit(monkeypatch, tmp_path: Path)
     assert state is not None
     assert state["last_completed_phase"] == "build_r1"
     await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
+async def test_run_build_phase_materializes_harness_owned_minimal_path(monkeypatch, tmp_path: Path):
+    ctx = _make_ctx(tmp_path)
+    ctx.config.minimality_guard_enabled = False
+    (tmp_path / "seed_manifest.json").write_text("{}")
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main><button id="save">Save</button></main>', encoding="utf-8"
+    )
+    baseline = {
+        "version": 2,
+        "roots": [
+            {"key": "main:unnamed", "fingerprint": "x", "anchors": ["#save"]}
+        ],
+    }
+    for name in ("edit_dom_baseline.json", "edit_dom_source_sprint_1.json"):
+        (ctx.file_comm.dir / name).write_text(json.dumps(baseline), encoding="utf-8")
+    ctx.file_comm.write_ui_verification_plan(
+        {
+            "sprints": [
+                {
+                    "sprint": 1,
+                    "checks": [
+                        {
+                            "id": "UI-001",
+                            "feature_id": "F001",
+                            "task": "Click save",
+                            "expected_result": "Saved",
+                            "critical": True,
+                            "category": "interaction",
+                            "actions": [
+                                {"action": "click", "selector": "#save"},
+                                {"action": "evaluate", "expression": "true"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    async def fake_run_generator(*args, **kwargs):
+        del args, kwargs
+        return _stats(0.0)
+
+    monkeypatch.setattr("src.orchestration.phases.run_generator", fake_run_generator)
+
+    await run_build_phase(ctx, 1)
+
+    plan = json.loads(
+        (ctx.file_comm.dir / "minimal_path_plan_round_1.json").read_text(encoding="utf-8")
+    )
+    scope = json.loads(
+        (ctx.file_comm.dir / "edit_scope_round_1.json").read_text(encoding="utf-8")
+    )
+    assert plan["owner"] == "harness"
+    assert plan["source_change_cone"]["local_paths"] == ["frontend/index.html"]
+    assert scope["owner"] == "harness"
+    assert scope["allowed_root_keys"] == ["main:unnamed"]
 
 
 @pytest.mark.anyio

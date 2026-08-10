@@ -129,6 +129,21 @@ async def snapshot_semantic_dom(app_url: str, *, headless: bool) -> dict[str, An
                   || `${el.tagName.toLowerCase()}:${label || 'unnamed'}`;
                 const ordinal = seen.get(raw) || 0;
                 seen.set(raw, ordinal + 1);
+                const quoted = value => JSON.stringify(String(value || ''));
+                const anchorSet = new Set();
+                for (const target of [el, ...el.querySelectorAll('[id],[class],[data-testid],[role],[aria-label],a[href],button,input,select,textarea,summary')]) {
+                  if (target.id) anchorSet.add(`#${target.id}`);
+                  for (const className of [...target.classList].slice(0, 4)) anchorSet.add(`.${className}`);
+                  for (const name of ['data-testid', 'role', 'aria-label', 'name']) {
+                    if (target.hasAttribute(name)) anchorSet.add(`[${name}=${quoted(target.getAttribute(name))}]`);
+                  }
+                  if (/^(a|button|input|select|textarea|summary)$/.test(target.tagName.toLowerCase())) {
+                    anchorSet.add(target.tagName.toLowerCase());
+                  }
+                  if (target.tagName.toLowerCase() === 'a' && target.hasAttribute('href')) {
+                    anchorSet.add(`a[href=${quoted(target.getAttribute('href'))}]`);
+                  }
+                }
                 const focusables = [el, ...el.querySelectorAll('a[href],button,input,select,textarea,summary,[tabindex]')]
                   .filter((control, index, items) => items.indexOf(control) === index)
                   .filter(control => {
@@ -151,14 +166,25 @@ async def snapshot_semantic_dom(app_url: str, *, headless: bool) -> dict[str, An
                       receivesFocus,
                     };
                   });
-                return {key: ordinal ? `${raw}#${ordinal + 1}` : raw, tree: {semantic: node(el), focusables}};
+                return {
+                  key: ordinal ? `${raw}#${ordinal + 1}` : raw,
+                  anchors: [...anchorSet].sort().slice(0, 120),
+                  tree: {semantic: node(el), focusables}
+                };
               });
             }
             """)
             return {
-                "version": 1,
+                "version": 2,
                 "url": app_url,
-                "roots": [{"key": item["key"], "fingerprint": _fingerprint(item["tree"])} for item in roots],
+                "roots": [
+                    {
+                        "key": item["key"],
+                        "fingerprint": _fingerprint(item["tree"]),
+                        "anchors": item.get("anchors", []),
+                    }
+                    for item in roots
+                ],
             }
         finally:
             await browser.close()

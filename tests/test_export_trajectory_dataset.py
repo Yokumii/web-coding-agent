@@ -4,7 +4,11 @@ import json
 import subprocess
 from pathlib import Path
 
-from scripts.export_trajectory_dataset import apply_patches, export_run
+from scripts.export_trajectory_dataset import (
+    _minimal_path_provenance,
+    apply_patches,
+    export_run,
+)
 
 
 def _git(frontend: Path, *args: str) -> None:
@@ -19,6 +23,59 @@ def _commit(frontend: Path, subject: str, content: str) -> None:
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload))
+
+
+def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    _write_json(
+        harness / "minimal_path_plan_round_2.json",
+        {
+            "schema_version": "minimal-path-plan-v1",
+            "owner": "harness",
+            "source_change_cone": {
+                "local_paths": ["frontend/App.jsx"],
+                "dependency_paths": ["frontend/app.css"],
+            },
+            "dom_change_cone": {"allowed_root_keys": ["main"]},
+        },
+    )
+    (harness / "minimal_path_ledger_round_2.jsonl").write_text(
+        json.dumps(
+            {
+                "decision": "allow",
+                "path": "frontend/App.jsx",
+                "scope_tier": "local",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "decision": "allow",
+                "path": "frontend/app.css",
+                "scope_tier": "dependency",
+                "expansion_reason": "recorded_dependency_edge",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "decision": "deny",
+                "path": "frontend/admin.css",
+                "reason": "outside",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    provenance = _minimal_path_provenance(harness, 2)
+
+    assert provenance["status"] == "enforced"
+    assert provenance["decision_counts"] == {"allow": 2, "deny": 1}
+    assert provenance["touched_paths"] == ["frontend/App.jsx", "frontend/app.css"]
+    assert provenance["dependency_expansions"] == ["frontend/app.css"]
+    assert provenance["plan_artifact"] == ".harness/minimal_path_plan_round_2.json"
 
 
 def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path):

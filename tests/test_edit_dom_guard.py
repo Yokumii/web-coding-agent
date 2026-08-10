@@ -93,6 +93,24 @@ def test_non_forward_repair_scope_uses_failed_source_baseline(tmp_path):
     ) is None
 
 
+def test_harness_owned_scope_can_reference_current_sprint_baseline(tmp_path):
+    (tmp_path / "seed_manifest.json").write_text("{}")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_dom_baseline.json").write_text(
+        '{"roots":[{"key":"seed-main"}]}'
+    )
+    (harness / "edit_dom_source_sprint_2.json").write_text(
+        '{"roots":[{"key":"accepted-search"}]}'
+    )
+    (harness / "edit_scope_round_2.json").write_text(
+        '{"owner":"harness","baseline":".harness/edit_dom_source_sprint_2.json",'
+        '"allowed_root_keys":["accepted-search"],"allow_new_roots":false}'
+    )
+
+    assert _validate_edit_scope(tmp_path, 2) is None
+
+
 @pytest.mark.anyio
 async def test_capture_baseline_uses_non_overlapping_semantic_surfaces(tmp_path):
     async def page(_request):
@@ -124,3 +142,6 @@ async def test_capture_baseline_uses_non_overlapping_semantic_surfaces(tmp_path)
     # The two articles are covered by main rather than becoming separately
     # protected roots, so a legitimate list/filter edit can be scoped to main.
     assert [root["key"] for root in snapshot["roots"]] == ["header:unnamed", "main:unnamed", "footer:unnamed"]
+    assert '#root' not in snapshot["roots"][0]["anchors"]
+    assert 'a[href="/docs"]' in snapshot["roots"][0]["anchors"]
+    assert '[aria-label="first"]' in snapshot["roots"][1]["anchors"]

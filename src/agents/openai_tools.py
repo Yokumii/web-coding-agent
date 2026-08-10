@@ -22,13 +22,14 @@ class ToolResult:
 class OpenAIToolExecutor:
     def __init__(self, *, workdir: Path, allow_bash: bool, allow_playwright: bool = False,
                  bash_profile: str = "full", frontend_port: int = 5173,
-                 command_timeout: float = 120):
+                 command_timeout: float = 120, mutation_policy: Any | None = None):
         self.workdir = workdir.resolve()
         self.allow_bash = allow_bash
         self.allow_playwright = allow_playwright
         self.bash_profile = bash_profile
         self.frontend_port = frontend_port
         self.command_timeout = command_timeout
+        self.mutation_policy = mutation_policy
         self._playwright = None
         self._browser_instance = None
         self._page = None
@@ -75,6 +76,10 @@ class OpenAIToolExecutor:
 
     async def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
         try:
+            if self.mutation_policy is not None:
+                denial = self.mutation_policy.check(name, args)
+                if denial:
+                    return ToolResult(False, str(denial))
             if name == "read_file":
                 content = self._path(args["path"]).read_text(errors="replace")
                 start_line = args.get("start_line")
