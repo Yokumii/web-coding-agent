@@ -34,6 +34,7 @@ def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
             "schema_version": "minimal-path-plan-v1",
             "owner": "harness",
             "source_change_cone": {
+                "initial_paths": ["frontend/App.jsx"],
                 "local_paths": ["frontend/App.jsx"],
                 "dependency_paths": ["frontend/app.css"],
             },
@@ -51,10 +52,31 @@ def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
         + "\n"
         + json.dumps(
             {
+                "decision": "applied",
+                "path": "frontend/App.jsx",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
                 "decision": "allow",
                 "path": "frontend/app.css",
                 "scope_tier": "dependency",
                 "expansion_reason": "recorded_dependency_edge",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "decision": "applied",
+                "path": "frontend/app.css",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "decision": "validation_pass",
+                "path": None,
             }
         )
         + "\n"
@@ -73,6 +95,9 @@ def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
 
     assert provenance["status"] == "enforced"
     assert provenance["decision_counts"] == {"allow": 2, "deny": 1}
+    assert provenance["transition_counts"]["applied"] == 2
+    assert provenance["transition_counts"]["validation_pass"] == 1
+    assert provenance["initial_paths"] == ["frontend/App.jsx"]
     assert provenance["touched_paths"] == ["frontend/App.jsx", "frontend/app.css"]
     assert provenance["dependency_expansions"] == ["frontend/app.css"]
     assert provenance["plan_artifact"] == ".harness/minimal_path_plan_round_2.json"

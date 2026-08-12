@@ -180,10 +180,11 @@ agent candidate C' + exact patches P
 
 - `src/orchestration/minimal_path_guidance.py`
   - 从 action selector、DOM anchor、源码命中和 import/link 边生成 harness-owned change cone；
-  - 先走 local hotspot，只允许沿显式依赖边扩展；protected path 直接拒绝；
-  - 禁止已有源码整文件覆盖、非唯一 exact patch、过宽 patch 与 Bash 旁路修改；
-  - OpenAI 原生工具与 Claude SDK permission callback 共用 policy；
-  - append-only mutation ledger，并在 dataset exporter 中保存引导 provenance。
+  - 根据 typed action/category 对 behavior、markup、style 源码分层排序，只开放一个 initial path；
+  - 以 `inspect → exact patch → validation → recorded-neighbor expansion` 状态机逐级开放路径，import/link 可双向遍历但不能跳边；
+  - 禁止已有源码整文件覆盖、未规划新文件、非唯一 exact patch、过宽 patch 与 Bash 旁路修改；最后一次修改未成功验证时禁止 commit；
+  - OpenAI 原生工具与 Claude SDK pre/post-tool hooks 共用 policy，并以实际工具结果而不是预授权推进状态；
+  - append-only ledger 记录 read/applied/validation/deny，live state 记录 phase、unlocked paths 与 next action，dataset exporter 分别保存引导 provenance。
 - `src/orchestration/minimal_patch_guard.py`
   - exact atomic patch；
   - ddmin + exhaustive one-deletion；
@@ -218,12 +219,12 @@ agent candidate C' + exact patches P
 - `scripts/calibrate_minimal_path_cases.py` / `run_minimal_path_calibration.sh`
   - 从历史真实 source commit 建立隔离 workspace；
   - 启动真实前端与 Chromium，重采 v2 DOM anchor frame；
-  - 把历史真实 patch 逐个送过在线 mutation policy；
-  - plan、ledger、decision 与 status row 全部持久化且可断点跳过。
+  - 按 controller 依赖顺序回放历史真实 patch，每个成功 patch 后重新启动真实页面并采集 semantic DOM validation checkpoint；
+  - plan、state、ledger、decision、validation evidence 与 status row 全部持久化且可断点跳过。
 
 ### 自动测试
 
-完整 suite：`524 passed, 2 skipped`。两个 skip 是既有条件性测试；另有两条第三方 `aiohttp` deprecation warning。测试覆盖：
+完整 suite：`532 passed, 2 skipped`。两个 skip 是既有条件性测试；另有两条第三方 `aiohttp` deprecation warning。测试覆盖：
 
 - exact patches 的顺序与唯一匹配；
 - 冗余 atom 检出；
@@ -253,13 +254,13 @@ agent candidate C' + exact patches P
 
 这组结果说明门禁既不是“全部拒绝”，也不是“全部放过”；它能接受必要的跨 HTML/CSS/JS edit、接受真实单点 repair，并发现旧 evaluator 未发现的冗余修改。
 
-在线引导另有两条真实 source-commit 校准，写入
-`runs/agentic/minimal_path_calibration/20260811_v1/records.jsonl`：
+渐进式在线引导另有两条真实 source-commit 校准，写入
+`runs/agentic/minimal_path_calibration/20260813_v3/records.jsonl`：
 
-| Case | 在线 change cone | 历史真实 patch | 最终反事实结论 |
+| Case | 渐进路径 | 真实检查点 | 最终反事实结论 |
 |---|---|---|---|
-| `air_truthchecked_back_to_top...9431392_4837d9a` | `index.html + main.js + styles.css`，另 1 个源码路径受保护 | 3/3 在写入前获准 | `certified` |
-| `edit_3662_store_tools...933ff09_b5f1242` | 同样收敛到 3 文件，另 1 个源码路径受保护 | 7/7 在正确通道内获准 | `non_minimal`，`p006` 为锥内冗余 |
+| `air_truthchecked_back_to_top...9431392_4837d9a` | `index.html` 单入口；验证后沿真实引用边依次开放 `main.js`、`styles.css` | 3/3 patch 获准且实际成功，3/3 patch 后 Chromium semantic-DOM 验证成功 | `certified` |
+| `edit_3662_store_tools...933ff09_b5f1242` | source 尚无目标 selectors，退化到 `index.html` 单入口；再沿 `<script>/<link>` 边开放 JS/CSS | 7/7 patch 获准且实际成功，7/7 patch 后 Chromium semantic-DOM 验证成功 | `non_minimal`，`p006` 为锥内冗余 |
 
 第二条不是失败，而是重要边界：在线 controller 能阻止路径扩散，却不能仅凭
 source cone 判断同一路径内某条 CSS 是否必要；因此后置 counterfactual certificate

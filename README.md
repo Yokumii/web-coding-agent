@@ -47,7 +47,7 @@ What is implemented:
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
 - Edit/repair DOM contract guard: a verified seed, each sprint's accepted source, and each renderable non-forward repair source are snapshotted before modification; semantic DOM/ARIA surfaces outside the declared (max-two-root) scope must remain unchanged. This is independent of screenshot/pixel scoring.
-- Harness-owned minimal-path guidance: executable UI selectors, semantic DOM anchors, source hotspots, and import/link edges produce a per-round change cone before the model edits. Both native OpenAI tools and Claude SDK mutations enforce that cone; existing source cannot be whole-file overwritten, dependency widening must follow a recorded edge, and every decision is appended to a ledger.
+- Harness-owned progressive minimal-path guidance: executable UI selectors, typed action roles, semantic DOM anchors, source hotspots, and import/link edges select one initial source path before the model edits. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine; existing source cannot be whole-file overwritten, unplanned files remain closed, and actual tool outcomes are appended to a ledger.
 - Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. New-policy exports require `certified` evidence.
 
 ## Requirements
@@ -215,12 +215,17 @@ harness-owned `.harness/edit_scope_round_N.json`, for example:
 {"owner":"harness","allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
 ```
 
-The model cannot edit either policy artifact. Existing frontend source must be changed
-through an exact unique patch; whole-file overwrite, unrelated paths, broad patches, and
-filesystem/package mutations through Bash are rejected before execution. A direct
-dependency may enter the cone only through a recorded import/link edge. All allowed,
-denied, and widened mutations are appended to
-`.harness/minimal_path_ledger_round_N.jsonl` and exported as trajectory provenance.
+The model cannot edit the policy, live-state, or ledger artifacts. The plan initially
+exposes only `source_change_cone.initial_paths` (normally one path). That exact file must
+be successfully read before an exact unique patch is admitted. After each real mutation,
+the controller requires a syntax/diff/build/test checkpoint before an import/link neighbor
+can open; a successful checkpoint after the latest mutation is required before commit.
+Whole-file overwrite, unrelated or unplanned new source paths, broad patches, and
+filesystem/package mutations through Bash are rejected before execution. The live phase,
+unlocked paths, and next action are persisted in
+`.harness/minimal_path_state_round_N.json`; reads, actual mutations, validation outcomes,
+denials, and widening are appended to `.harness/minimal_path_ledger_round_N.jsonl` and
+exported separately from the post-hoc minimality certificate.
 
 The contract permits changes inside at most two named baseline surfaces. Removal or
 semantic change of another surface, or an unapproved new surface, fails the round as

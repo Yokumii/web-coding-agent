@@ -22,17 +22,22 @@ evaluator still owns that oracle.
 
 Before the generator starts, the harness converts the executable action
 contract and semantic anchors into a source change cone. Exact selector/token
-matches define local source hotspots; static import, stylesheet, and script-link
-edges define the only admissible widening tier. The same mutation policy runs in
-the native OpenAI executor and Claude SDK permission callback:
+matches define local source hotspots, while typed action/category fields route
+interaction checks toward behavior source and visual checks toward style source.
+Static import, stylesheet, and script-link relationships are traversable in both
+directions, but only one ranked initial path is open at first. The same progressive
+controller runs in the native OpenAI executor and Claude SDK pre/post-tool hooks:
 
+- the selected existing source must be successfully read before mutation;
 - overwriting an existing frontend source file is denied;
 - an exact edit must identify one unique source occurrence and stay under the
   configured per-patch budget;
-- protected paths and mutating Bash/package commands are denied;
-- dependency widening is allowed only along a recorded edge; and
-- every authorization, denial, and widening is appended to
-  `minimal_path_ledger_round_N.jsonl`.
+- protected paths, unplanned new source files, and mutating Bash/package commands are denied;
+- after a real mutation, a validation attempt is required before a recorded neighbor opens;
+- a successful validation after the latest mutation is required before commit; and
+- successful reads, actual mutation outcomes, validation outcomes, authorization,
+  denial, and widening are appended to `minimal_path_ledger_round_N.jsonl`, while
+  the current phase and next action live in `minimal_path_state_round_N.json`.
 
 This is the online guidance layer. It reduces the search trajectory before and
 during editing; it is not treated as proof of final minimality.

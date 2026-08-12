@@ -612,12 +612,18 @@ def _build_generator_prompt(
         common_lines.extend([
             "\nHarness-owned minimal-path channel:\n",
             f"- FIRST read `{minimal_path_ref}`. The harness already materialized "
-            f"`.harness/edit_scope_round_{round_num}.json`; do not create, copy, or edit either artifact.\n",
-            "- Start with `source_change_cone.local_paths`. A dependency path is admitted only when "
-            "the plan records its dependency edge; protected paths are rejected by the tool layer.\n",
+            f"`.harness/edit_scope_round_{round_num}.json` and a live minimal-path state; do not "
+            "create, copy, or edit those harness-owned artifacts.\n",
+            "- Inspect only `source_change_cone.initial_paths` first. The tool layer requires a "
+            "successful read of that exact file before it accepts an exact patch.\n",
+            "- After every successful source mutation, run the smallest applicable syntax, diff, "
+            "build, or test validation. Only then can a path connected by a recorded dependency "
+            "edge be unlocked; protected and unplanned new source paths remain rejected.\n",
+            "- If the initial path completes the contract, do not widen. A successful validation "
+            "after the latest mutation is required before commit.\n",
             "- Existing source overwrites are rejected. Use exact, unique patches within the plan's "
-            "line and touched-file budgets. Mutation attempts and dependency widening are recorded "
-            "in the minimal-path ledger.\n",
+            "line and touched-file budgets. Reads, applied mutations, validation transitions, denials, "
+            "and dependency widening are recorded in the minimal-path ledger.\n",
             "- This is an execution policy enforced by the harness. The later counterfactual "
             "certificate remains an independent final check.\n",
         ])
@@ -735,13 +741,14 @@ def _build_generator_prompt(
         required_reads_text = "\n".join(f"- {path}" for path in required_reads)
         if minimal_path_owned:
             scope_first_action = (
-                f"FIRST ACTION: read `{minimal_path_ref}` and inspect only its local source "
-                "hotspots. The scope is already computed and immutable.\n"
+                f"FIRST ACTION: read `{minimal_path_ref}` and inspect only its single initial "
+                "source path. The scope is already computed and immutable.\n"
             )
             scope_preservation_guidance = (
-                "Follow the harness-selected local paths and recorded dependency edges. If a "
-                "mutation is denied, use the returned source candidate instead of expanding to "
-                "an unrelated file.\n"
+                "Follow the harness-selected state transition returned by the tools: inspect, make "
+                "one exact patch, validate, and only then follow a recorded dependency edge when "
+                "the contract still requires it. If a mutation is denied, use its returned next "
+                "action instead of expanding to an unrelated file.\n"
             )
         elif is_forward_edit:
             scope_first_action = (

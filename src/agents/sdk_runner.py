@@ -85,6 +85,36 @@ async def _keepalive_hook(_input: Any, _tool_use_id: str | None, _context: Any) 
     return {"continue_": True}
 
 
+def make_mutation_policy_posttool_hook(mutation_policy: Any, *, ok: bool):
+    """Feed actual SDK tool outcomes back into the minimal-path controller."""
+
+    async def _hook(
+        input_data: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(input_data, dict):
+            return {}
+        tool_name = str(input_data.get("tool_name", ""))
+        raw_input = input_data.get("tool_input", {})
+        tool_input = raw_input if isinstance(raw_input, dict) else {}
+        output = (
+            input_data.get("tool_response")
+            if ok
+            else input_data.get("error", "tool failed")
+        )
+        mutation_policy.observe_result(
+            tool_name, tool_input, ok=ok, output=output
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse" if ok else "PostToolUseFailure",
+            }
+        }
+
+    return _hook
+
+
 def make_bash_pretool_hook(*, bash_profile: str = "full"):
     """通过 PreToolUse 校验每一次 Bash 调用，避免 allowedTools 旁路。"""
     if bash_profile not in {"full", "read_only"}:
@@ -531,6 +561,17 @@ def build_agent_options(
             HookMatcher(
                 matcher="Bash",
                 hooks=[make_bash_pretool_hook(bash_profile=bash_profile)],
+            )
+        ]
+    if mutation_policy is not None:
+        hooks["PostToolUse"] = [
+            HookMatcher(
+                hooks=[make_mutation_policy_posttool_hook(mutation_policy, ok=True)]
+            )
+        ]
+        hooks["PostToolUseFailure"] = [
+            HookMatcher(
+                hooks=[make_mutation_policy_posttool_hook(mutation_policy, ok=False)]
             )
         ]
 

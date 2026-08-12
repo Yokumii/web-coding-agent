@@ -75,11 +75,21 @@ class OpenAIToolExecutor:
         return path
 
     async def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
+        if self.mutation_policy is not None:
+            denial = self.mutation_policy.check(name, args)
+            if denial:
+                return ToolResult(False, str(denial))
+        result = await self._execute_unobserved(name, args)
+        if self.mutation_policy is not None:
+            self.mutation_policy.observe_result(
+                name, args, ok=result.ok, output=result.output
+            )
+        return result
+
+    async def _execute_unobserved(
+        self, name: str, args: dict[str, Any]
+    ) -> ToolResult:
         try:
-            if self.mutation_policy is not None:
-                denial = self.mutation_policy.check(name, args)
-                if denial:
-                    return ToolResult(False, str(denial))
             if name == "read_file":
                 content = self._path(args["path"]).read_text(errors="replace")
                 start_line = args.get("start_line")

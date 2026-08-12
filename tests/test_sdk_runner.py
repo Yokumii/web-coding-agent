@@ -448,6 +448,60 @@ def test_build_agent_options_wires_stderr_callback_into_trace(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_build_agent_options_reports_sdk_tool_results_to_controller(tmp_path: Path):
+    class Policy:
+        def __init__(self):
+            self.results = []
+
+        def check(self, tool_name, tool_input):
+            return None
+
+        def observe_result(self, tool_name, tool_input, *, ok, output):
+            self.results.append((tool_name, tool_input, ok, output))
+
+    policy = Policy()
+    options = build_agent_options(
+        config=HarnessConfig(),
+        workdir=tmp_path,
+        model="glm-5.1",
+        system_prompt="system",
+        max_turns=10,
+        allow_bash=True,
+        mutation_policy=policy,
+    )
+
+    post = options.hooks["PostToolUse"][0].hooks[0]
+    failure = options.hooks["PostToolUseFailure"][0].hooks[0]
+    await post(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(tmp_path / "frontend" / "App.jsx")},
+            "tool_response": "source",
+            "tool_use_id": "read-1",
+        },
+        "read-1",
+        {},
+    )
+    await failure(
+        {
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm run build"},
+            "error": "build failed",
+            "tool_use_id": "build-1",
+        },
+        "build-1",
+        {},
+    )
+
+    assert [(item[0], item[2]) for item in policy.results] == [
+        ("Read", True),
+        ("Bash", False),
+    ]
+
+
+@pytest.mark.anyio
 async def test_capture_claude_http_traffic_records_streaming_response(tmp_path: Path):
     async def handle_messages(request: web.Request) -> web.StreamResponse:
         body = await request.json()

@@ -387,20 +387,45 @@ def _minimal_path_provenance(harness: Path, round_num: int) -> dict[str, Any]:
         decision: sum(item.get("decision") == decision for item in ledger)
         for decision in ("allow", "deny")
     }
+    transitions = {
+        decision: sum(item.get("decision") == decision for item in ledger)
+        for decision in (
+            "observe",
+            "applied",
+            "failed",
+            "validation_pass",
+            "validation_fail",
+        )
+    }
+    state_path = harness / f"minimal_path_state_round_{round_num}.json"
+    state = _read_json(state_path, {})
+    has_applied_outcomes = any(
+        item.get("decision") == "applied" for item in ledger
+    )
+    touched_decision = "applied" if has_applied_outcomes else "allow"
     cone = plan.get("source_change_cone") or {}
     dom = plan.get("dom_change_cone") or {}
     return {
         "status": "enforced",
         "plan_artifact": f".harness/{plan_path.name}",
         "ledger_artifact": f".harness/{ledger_path.name}",
+        "state_artifact": (
+            f".harness/{state_path.name}" if state_path.is_file() else None
+        ),
+        "initial_paths": list(cone.get("initial_paths") or []),
         "local_paths": list(cone.get("local_paths") or []),
         "dependency_paths": list(cone.get("dependency_paths") or []),
         "allowed_root_keys": list(dom.get("allowed_root_keys") or []),
         "decision_counts": counts,
+        "transition_counts": transitions,
+        "controller_phase": state.get("phase"),
+        "validation_attempt_revision": state.get("validation_attempt_revision"),
+        "validation_success_revision": state.get("validation_success_revision"),
+        "validation_last_ok": state.get("validation_last_ok"),
         "touched_paths": sorted({
             str(item["path"])
             for item in ledger
-            if item.get("decision") == "allow" and item.get("path")
+            if item.get("decision") == touched_decision and item.get("path")
         }),
         "dependency_expansions": sorted({
             str(item["path"])

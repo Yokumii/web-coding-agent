@@ -50,6 +50,48 @@ async def test_mutation_policy_blocks_native_tool_before_source_change(tmp_path:
 
 
 @pytest.mark.anyio
+async def test_native_tools_report_success_and_failure_to_controller(tmp_path: Path):
+    target = tmp_path / "frontend" / "app.js"
+    target.parent.mkdir()
+    target.write_text("const value = 'old';\n")
+
+    class Policy:
+        def __init__(self):
+            self.results = []
+
+        def check(self, tool_name, tool_input):
+            return None
+
+        def observe_result(self, tool_name, tool_input, *, ok, output):
+            self.results.append((tool_name, tool_input, ok, output))
+
+    policy = Policy()
+    tools = OpenAIToolExecutor(
+        workdir=tmp_path,
+        allow_bash=False,
+        mutation_policy=policy,
+    )
+
+    read = await tools.execute("read_file", {"path": "frontend/app.js"})
+    patch = await tools.execute(
+        "apply_patch",
+        {
+            "path": "frontend/app.js",
+            "old_text": "'old'",
+            "new_text": "'new'",
+        },
+    )
+    failed = await tools.execute("read_file", {"path": "frontend/missing.js"})
+
+    assert read.ok and patch.ok and not failed.ok
+    assert [(item[0], item[2]) for item in policy.results] == [
+        ("read_file", True),
+        ("apply_patch", True),
+        ("read_file", False),
+    ]
+
+
+@pytest.mark.anyio
 async def test_static_forward_seed_rejects_runtime_scaffold(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
