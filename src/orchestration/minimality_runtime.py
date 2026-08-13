@@ -288,7 +288,13 @@ class _RealBrowserPatchOracle:
                     guard: dict[str, Any] | None = None
                     if self.baseline is not None:
                         current = await snapshot_semantic_dom(
-                            stack.frontend_url, headless=True
+                            stack.frontend_url,
+                            headless=True,
+                            routes=(
+                                self.baseline.get("routes")
+                                if isinstance(self.baseline.get("routes"), list)
+                                else None
+                            ),
                         )
                         guard = compare_contract(self.baseline, current, self.scope)
                         preservation = guard.get("passed") is True

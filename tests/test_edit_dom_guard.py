@@ -1,8 +1,14 @@
+import json
+
 import pytest
 from aiohttp import web
 
 from src.config import HarnessConfig
-from src.orchestration.edit_dom_guard import capture_baseline, compare_contract
+from src.orchestration.edit_dom_guard import (
+    capture_baseline,
+    compare_contract,
+    snapshot_semantic_dom,
+)
 from src.orchestration.file_comm import FileComm
 from src.agents.generator import _validate_edit_scope
 
@@ -145,3 +151,122 @@ async def test_capture_baseline_uses_non_overlapping_semantic_surfaces(tmp_path)
     assert '#root' not in snapshot["roots"][0]["anchors"]
     assert 'a[href="/docs"]' in snapshot["roots"][0]["anchors"]
     assert '[aria-label="first"]' in snapshot["roots"][1]["anchors"]
+
+
+@pytest.mark.anyio
+async def test_multi_route_semantic_guard_detects_protected_page_change():
+    state = {"settings": "Settings stable"}
+
+    async def home(_request):
+        return web.Response(text="<main id='home'>Home</main>", content_type="text/html")
+
+    async def catalog(_request):
+        return web.Response(
+            text="<main id='catalog'><input id='catalog-search'></main>",
+            content_type="text/html",
+        )
+
+    async def settings(_request):
+        return web.Response(
+            text=f"<main id='settings'>{state['settings']}</main>",
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/", home)
+    app.router.add_get("/catalog.html", catalog)
+    app.router.add_get("/settings.html", settings)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    routes = ["/", "/catalog.html", "/settings.html"]
+    try:
+        baseline = await snapshot_semantic_dom(
+            f"http://127.0.0.1:{port}", headless=True, routes=routes
+        )
+        state["settings"] = "Settings changed by collateral edit"
+        current = await snapshot_semantic_dom(
+            f"http://127.0.0.1:{port}", headless=True, routes=routes
+        )
+    finally:
+        await runner.cleanup()
+
+    assert baseline["version"] == 3
+    assert baseline["routes"] == routes
+    assert {root["key"] for root in baseline["roots"]} == {
+        "/::home",
+        "/catalog.html::catalog",
+        "/settings.html::settings",
+    }
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_root_keys": ["/catalog.html::catalog"],
+            "allow_new_roots": False,
+            "target_routes": ["/catalog.html"],
+            "protected_routes": ["/", "/settings.html"],
+        },
+    )
+    assert result["passed"] is False
+    assert result["violations"] == [
+        {"root": "/settings.html::settings", "kind": "semantic_changed"}
+    ]
+
+
+def test_multi_route_scope_rejects_allowed_root_from_protected_page():
+    baseline = {
+        "version": 3,
+        "routes": ["/catalog", "/settings"],
+        "roots": [
+            {"key": "/catalog::main", "route": "/catalog", "fingerprint": "a"},
+            {"key": "/settings::main", "route": "/settings", "fingerprint": "b"},
+        ],
+    }
+    result = compare_contract(
+        baseline,
+        baseline,
+        {
+            "allowed_root_keys": ["/settings::main"],
+            "allow_new_roots": False,
+            "target_routes": ["/catalog"],
+            "protected_routes": ["/settings"],
+        },
+    )
+    assert result["passed"] is False
+    assert "outside target routes" in result["reason"]
+
+
+def test_generator_accepts_two_roots_for_each_target_route(tmp_path):
+    (tmp_path / "seed_manifest.json").write_text("{}")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    roots = [
+        {"key": f"{route}::{name}", "route": route, "fingerprint": name}
+        for route in ("/catalog", "/search")
+        for name in ("main", "dialog")
+    ]
+    (harness / "edit_dom_baseline.json").write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "routes": ["/catalog", "/search", "/settings"],
+                "roots": roots,
+            }
+        )
+    )
+    (harness / "edit_scope_round_1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "edit-scope-v3",
+                "allowed_root_keys": [root["key"] for root in roots],
+                "allow_new_roots": False,
+                "target_routes": ["/catalog", "/search"],
+                "protected_routes": ["/settings"],
+            }
+        )
+    )
+
+    assert _validate_edit_scope(tmp_path, 1) is None

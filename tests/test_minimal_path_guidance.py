@@ -112,13 +112,15 @@ def test_harness_builds_change_cone_from_action_contract_and_dom(tmp_path: Path)
         (workdir / ".harness" / "edit_scope_round_1.json").read_text(encoding="utf-8")
     )
     assert scope == {
-        "schema_version": "edit-scope-v2",
+            "schema_version": "edit-scope-v3",
         "owner": "harness",
         "plan": ".harness/minimal_path_plan_round_1.json",
         "baseline": ".harness/edit_dom_source_sprint_1.json",
-        "allowed_root_keys": ["main:catalog"],
-        "allow_new_roots": False,
-    }
+            "allowed_root_keys": ["main:catalog"],
+            "allow_new_roots": False,
+            "target_routes": ["/"],
+            "protected_routes": [],
+        }
 
 
 def test_visual_contract_routes_initial_path_to_style_source(tmp_path: Path):
@@ -247,6 +249,314 @@ def test_change_cone_can_widen_to_file_that_references_initial_source(tmp_path: 
     assert "frontend/index.html" in state["unlocked_paths"]
     assert state["validation_last_ok"] is True
     assert state["phase"] == "validated"
+
+
+def test_multi_page_edit_scopes_dependencies_to_target_route(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    (frontend / "pages").mkdir(parents=True)
+    (frontend / "shared").mkdir()
+    (frontend / "index.html").write_text(
+        '<a href="/catalog.html">Catalog</a><a href="/settings.html">Settings</a>\n'
+    )
+    (frontend / "catalog.html").write_text(
+        '<link rel="stylesheet" href="./shared/site.css">\n'
+        '<link rel="stylesheet" href="./pages/catalog.css">\n'
+        '<input id="catalog-filter"><script src="./pages/catalog.js"></script>\n'
+    )
+    (frontend / "settings.html").write_text(
+        '<link rel="stylesheet" href="./shared/site.css">\n'
+        '<input id="profile-name"><script src="./pages/settings.js"></script>\n'
+    )
+    (frontend / "pages" / "catalog.js").write_text(
+        "document.querySelector('#catalog-filter').addEventListener('input', () => {});\n"
+    )
+    (frontend / "pages" / "catalog.css").write_text(
+        "#catalog-filter { inline-size: 20rem; }\n"
+    )
+    (frontend / "pages" / "settings.js").write_text(
+        "document.querySelector('#profile-name').addEventListener('input', () => {});\n"
+    )
+    (frontend / "shared" / "site.css").write_text("body { color: #222; }\n")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-CATALOG",
+                                "route": "/catalog.html",
+                                "category": "interaction",
+                                "actions": [
+                                    {
+                                        "action": "fill",
+                                        "selector": "#catalog-filter",
+                                        "value": "camera",
+                                    },
+                                    {
+                                        "action": "evaluate",
+                                        "expression": "document.querySelector('#catalog-filter').value === 'camera'",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=30,
+        max_touched_files=3,
+    )
+
+    route_scope = plan["route_scope"]
+    assert route_scope["status"] == "multi_page_scoped"
+    assert route_scope["target_routes"] == ["/catalog.html"]
+    assert route_scope["target_page_entries"] == ["frontend/catalog.html"]
+    assert route_scope["route_local_paths"] == [
+        "frontend/catalog.html",
+        "frontend/pages/catalog.css",
+        "frontend/pages/catalog.js",
+    ]
+    assert route_scope["cross_route_shared_paths"] == ["frontend/shared/site.css"]
+    assert "frontend/pages/settings.js" in route_scope["off_target_paths"]
+    assert plan["source_change_cone"]["initial_paths"] == ["frontend/pages/catalog.js"]
+    assert "frontend/shared/site.css" not in plan["source_change_cone"]["local_paths"]
+    assert {
+        "from": "frontend/index.html",
+        "to": "frontend/catalog.html",
+    } not in plan["source_change_cone"]["dependency_edges"]
+
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    policy.observe_result(
+        "read_file",
+        {"path": "frontend/shared/site.css"},
+        ok=True,
+        output="shared",
+    )
+    denial = policy.check(
+        "apply_patch",
+        {
+            "path": "frontend/shared/site.css",
+            "old_text": "#222",
+            "new_text": "#111",
+        },
+    )
+    assert denial is not None and "non-target routes" in denial
+
+
+def test_shared_file_is_admissible_when_every_owner_route_is_targeted(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    (frontend / "shared").mkdir(parents=True)
+    for page in ("catalog", "settings"):
+        (frontend / f"{page}.html").write_text(
+            '<script src="./shared/navigation.js"></script>\n'
+            '<button class="global-nav">Open</button>\n'
+        )
+    (frontend / "shared" / "navigation.js").write_text(
+        "document.querySelectorAll('.global-nav').forEach(button => "
+        "button.addEventListener('click', () => {}));\n"
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    checks = []
+    for index, page in enumerate(("catalog", "settings"), start=1):
+        checks.append(
+            {
+                "id": f"UI-{index}",
+                "route": f"/{page}.html",
+                "category": "interaction",
+                "actions": [
+                    {"action": "click", "selector": ".global-nav"},
+                    {"action": "evaluate", "expression": "true"},
+                ],
+            }
+        )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps({"sprints": [{"sprint": 1, "checks": checks}]})
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=30,
+        max_touched_files=3,
+    )
+
+    assert plan["route_scope"]["target_routes"] == [
+        "/catalog.html",
+        "/settings.html",
+    ]
+    assert plan["route_scope"]["target_shared_paths"] == [
+        "frontend/shared/navigation.js"
+    ]
+    assert plan["route_scope"]["cross_route_shared_paths"] == []
+    assert plan["source_change_cone"]["initial_paths"] == [
+        "frontend/shared/navigation.js"
+    ]
+
+
+def test_react_router_edit_protects_component_shared_with_other_route(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    (frontend / "src" / "pages").mkdir(parents=True)
+    (frontend / "src" / "components").mkdir()
+    (frontend / "index.html").write_text(
+        '<div id="root"></div><script type="module" src="/src/main.jsx"></script>\n'
+    )
+    (frontend / "src" / "main.jsx").write_text("import './App.jsx';\n")
+    (frontend / "src" / "App.jsx").write_text(
+        "import Catalog from './pages/Catalog.jsx';\n"
+        "import Settings from './pages/Settings.jsx';\n"
+        '<Route path="/catalog" element={<Catalog />} />;\n'
+        '<Route path="/settings" element={<Settings />} />;\n'
+    )
+    (frontend / "src" / "pages" / "Catalog.jsx").write_text(
+        "import Shell from '../components/Shell.jsx';\n"
+        "import './catalog.css';\n"
+        'export default () => <Shell><input id="catalog-search" /></Shell>;\n'
+    )
+    (frontend / "src" / "pages" / "catalog.css").write_text(
+        "#catalog-search { width: 20rem; }\n"
+    )
+    (frontend / "src" / "pages" / "Settings.jsx").write_text(
+        "import Shell from '../components/Shell.jsx';\n"
+        'export default () => <Shell><input id="profile-name" /></Shell>;\n'
+    )
+    (frontend / "src" / "components" / "Shell.jsx").write_text(
+        "export default ({children}) => <main>{children}</main>;\n"
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-CATALOG",
+                                "route": "/catalog",
+                                "category": "interaction",
+                                "actions": [
+                                    {
+                                        "action": "fill",
+                                        "selector": "#catalog-search",
+                                        "value": "camera",
+                                    },
+                                    {"action": "evaluate", "expression": "true"},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=30,
+        max_touched_files=3,
+    )
+
+    assert plan["route_scope"]["discovered_routes"] == ["/catalog", "/settings"]
+    assert plan["route_scope"]["route_local_paths"] == [
+        "frontend/src/pages/Catalog.jsx",
+        "frontend/src/pages/catalog.css",
+    ]
+    assert plan["route_scope"]["cross_route_shared_paths"] == [
+        "frontend/src/components/Shell.jsx"
+    ]
+    assert "frontend/src/pages/Settings.jsx" in plan["route_scope"]["off_target_paths"]
+    assert plan["source_change_cone"]["initial_paths"] == [
+        "frontend/src/pages/Catalog.jsx"
+    ]
+
+
+def test_next_layout_and_global_css_are_cross_route_shared(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    (frontend / "src" / "app" / "catalog").mkdir(parents=True)
+    (frontend / "src" / "app" / "settings").mkdir(parents=True)
+    (frontend / "src" / "app" / "page.tsx").write_text(
+        "export default () => <main id='home'>Home</main>;\n"
+    )
+    (frontend / "src" / "app" / "catalog" / "page.tsx").write_text(
+        "import './catalog.css';\nexport default () => <input id='catalog-search' />;\n"
+    )
+    (frontend / "src" / "app" / "catalog" / "catalog.css").write_text(
+        "#catalog-search { width: 20rem; }\n"
+    )
+    (frontend / "src" / "app" / "settings" / "page.tsx").write_text(
+        "export default () => <main id='settings'>Settings</main>;\n"
+    )
+    (frontend / "src" / "app" / "layout.tsx").write_text(
+        "import './globals.css';\nexport default ({children}) => <body>{children}</body>;\n"
+    )
+    (frontend / "src" / "app" / "globals.css").write_text("body { margin: 0; }\n")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-CATALOG",
+                                "route": "/catalog",
+                                "category": "interaction",
+                                "actions": [
+                                    {"action": "fill", "selector": "#catalog-search", "value": "x"},
+                                    {"action": "evaluate", "expression": "true"},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=30,
+        max_touched_files=3,
+    )
+
+    route_scope = plan["route_scope"]
+    assert route_scope["discovered_routes"] == ["/", "/catalog", "/settings"]
+    assert route_scope["route_local_paths"] == [
+        "frontend/src/app/catalog/catalog.css",
+        "frontend/src/app/catalog/page.tsx",
+    ]
+    assert route_scope["cross_route_shared_paths"] == [
+        "frontend/src/app/globals.css",
+        "frontend/src/app/layout.tsx",
+    ]
+    assert "frontend/src/app/settings/page.tsx" in route_scope["off_target_paths"]
 
 
 def test_policy_guides_local_patch_and_rejects_collateral_source(tmp_path: Path):

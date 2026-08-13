@@ -9,8 +9,8 @@ and a separate immutable source frame for each sprint:
 1. semantic DOM and ARIA trees for top-level landmarks / `data-testid` surfaces;
 2. control role, accessible name, destination/type, tab index and actual keyboard
    focus reachability; and
-3. a harness-derived edit scope with at most two baseline surfaces and stable
-   action-selector evidence.
+3. a route-qualified harness edit scope with at most two baseline surfaces per
+   target route and stable action-selector evidence.
 
 The per-sprint frame prevents an earlier accepted edit from being mistaken for
 collateral damage in a later sprint. The guard fails edits that change, remove,
@@ -27,6 +27,15 @@ interaction checks toward behavior source and visual checks toward style source.
 Static import, stylesheet, and script-link relationships are traversable in both
 directions, but only one ranked initial path is open at first. The same progressive
 controller runs in the native OpenAI executor and Claude SDK pre/post-tool hooks:
+
+For multi-page/multi-file projects, navigation links do not count as source imports.
+The controller first assigns each route an entry and transitive source ownership, then
+classifies paths as route-local, shared only among target routes, shared with a protected
+route, or fully off-target. Only the first two classes can enter the change cone. Current
+mechanical ownership supports static HTML entries, concrete conventional
+`app/**/page.*` and `pages/**` routes, and explicit literal React Router component
+mappings. Parameterized filesystem routes stay closed until a concrete ownership
+mapping is available; the harness does not baseline a synthetic `:id` URL.
 
 - the selected existing source must be successfully read before mutation;
 - overwriting an existing frontend source file is denied;

@@ -16,6 +16,7 @@ from typing import Any
 from playwright.async_api import async_playwright
 
 from src.config import HarnessConfig
+from src.orchestration.browser_evidence import _same_origin_route_url
 from src.orchestration.file_comm import FileComm
 from src.utils.playwright_browser import launch_chromium
 
@@ -48,7 +49,33 @@ def compare_contract(
     allowed = scope.get("allowed_root_keys", [])
     if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
         return {"passed": False, "reason": "invalid edit scope: allowed_root_keys must be a string list"}
-    if len(allowed) > 2 or len(set(allowed)) != len(allowed):
+    multi_route = baseline.get("version") == 3
+    if len(set(allowed)) != len(allowed):
+        return {"passed": False, "reason": "invalid edit scope: allowed roots must be distinct"}
+    roots_by_key = {
+        str(item.get("key")): item
+        for item in baseline.get("roots", [])
+        if isinstance(item, dict) and item.get("key")
+    }
+    if multi_route:
+        target_routes = set(scope.get("target_routes") or [])
+        protected_routes = set(scope.get("protected_routes") or [])
+        allowed_route_counts: dict[str, int] = {}
+        for key in allowed:
+            route = str((roots_by_key.get(key) or {}).get("route", ""))
+            if not route or route not in target_routes or route in protected_routes:
+                return {
+                    "passed": False,
+                    "reason": "invalid edit scope: allowed root is outside target routes",
+                    "root": key,
+                }
+            allowed_route_counts[route] = allowed_route_counts.get(route, 0) + 1
+        if any(count > 2 for count in allowed_route_counts.values()):
+            return {
+                "passed": False,
+                "reason": "invalid edit scope: at most two roots per target route may be changed",
+            }
+    elif len(allowed) > 2:
         return {"passed": False, "reason": "invalid edit scope: at most two distinct roots may be changed"}
 
     before = {item["key"]: item["fingerprint"] for item in baseline.get("roots", [])}
@@ -67,8 +94,21 @@ def compare_contract(
     violations: list[dict[str, str]] = []
     violations += [{"root": key, "kind": "removed"} for key in removed]
     violations += [{"root": key, "kind": "semantic_changed"} for key in changed]
-    if added and not allow_new:
-        violations += [{"root": key, "kind": "unexpected_added"} for key in added]
+    if added:
+        target_routes = set(scope.get("target_routes") or [])
+        for key in added:
+            route = str(
+                next(
+                    (
+                        item.get("route", "")
+                        for item in current.get("roots", [])
+                        if isinstance(item, dict) and item.get("key") == key
+                    ),
+                    "",
+                )
+            )
+            if not allow_new or (multi_route and route not in target_routes):
+                violations.append({"root": key, "kind": "unexpected_added"})
     return {
         "passed": not violations,
         "mode": "semantic_dom_contract",
@@ -80,13 +120,14 @@ def compare_contract(
     }
 
 
-async def snapshot_semantic_dom(app_url: str, *, headless: bool) -> dict[str, Any]:
+async def snapshot_semantic_dom(
+    app_url: str, *, headless: bool, routes: list[str] | None = None
+) -> dict[str, Any]:
     async with async_playwright() as playwright:
         browser = await launch_chromium(playwright, headless=headless)
         try:
             page = await browser.new_page(viewport={"width": 1440, "height": 1000})
-            await page.goto(app_url, wait_until="networkidle", timeout=30_000)
-            roots = await page.evaluate("""
+            snapshot_script = """
             () => {
               const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
               const relevant = el => {
@@ -173,32 +214,56 @@ async def snapshot_semantic_dom(app_url: str, *, headless: bool) -> dict[str, An
                 };
               });
             }
-            """)
-            return {
-                "version": 2,
-                "url": app_url,
-                "roots": [
-                    {
-                        "key": item["key"],
+            """
+            requested_routes = list(dict.fromkeys(routes or ["/"]))
+            collected: list[dict[str, Any]] = []
+            for route in requested_routes:
+                route_url = (
+                    _same_origin_route_url(app_url, route)
+                    if routes is not None
+                    else app_url
+                )
+                await page.goto(route_url, wait_until="networkidle", timeout=30_000)
+                roots = await page.evaluate(snapshot_script)
+                for item in roots:
+                    local_key = str(item["key"])
+                    root = {
+                        "key": (
+                            f"{route}::{local_key}"
+                            if routes is not None
+                            else local_key
+                        ),
                         "fingerprint": _fingerprint(item["tree"]),
                         "anchors": item.get("anchors", []),
                     }
-                    for item in roots
-                ],
+                    if routes is not None:
+                        root.update({"local_key": local_key, "route": route})
+                    collected.append(root)
+            return {
+                "version": 3 if routes is not None else 2,
+                "url": app_url,
+                **({"routes": requested_routes} if routes is not None else {}),
+                "roots": collected,
             }
         finally:
             await browser.close()
 
 
-async def capture_baseline(*, workdir: Path, file_comm: FileComm, config: HarnessConfig, app_url: str) -> dict[str, Any]:
-    snapshot = await snapshot_semantic_dom(app_url, headless=config.playwright_headless)
+async def capture_baseline(
+    *, workdir: Path, file_comm: FileComm, config: HarnessConfig, app_url: str,
+    routes: list[str] | None = None,
+) -> dict[str, Any]:
+    snapshot = await snapshot_semantic_dom(
+        app_url, headless=config.playwright_headless, routes=routes
+    )
     path = file_comm.dir / BASELINE_NAME
     path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return snapshot
 
 
 async def capture_sprint_source_baseline(
-    *, file_comm: FileComm, config: HarnessConfig, app_url: str, sprint_num: int
+    *, file_comm: FileComm, config: HarnessConfig, app_url: str, sprint_num: int,
+    routes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Freeze the accepted source state for one edit sprint.
 
@@ -209,7 +274,9 @@ async def capture_sprint_source_baseline(
     path = file_comm.dir / sprint_baseline_name(sprint_num)
     if path.is_file():
         return json.loads(path.read_text(encoding="utf-8"))
-    snapshot = await snapshot_semantic_dom(app_url, headless=config.playwright_headless)
+    snapshot = await snapshot_semantic_dom(
+        app_url, headless=config.playwright_headless, routes=routes
+    )
     path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return snapshot
 
@@ -230,7 +297,12 @@ async def evaluate_guard(*, workdir: Path, file_comm: FileComm, config: HarnessC
     baseline = json.loads(path.read_text(encoding="utf-8"))
     scope_path = file_comm.dir / f"edit_scope_round_{round_num}.json"
     scope = json.loads(scope_path.read_text(encoding="utf-8")) if scope_path.is_file() else None
-    current = await snapshot_semantic_dom(app_url, headless=config.playwright_headless)
+    baseline_routes = baseline.get("routes")
+    current = await snapshot_semantic_dom(
+        app_url,
+        headless=config.playwright_headless,
+        routes=baseline_routes if isinstance(baseline_routes, list) else None,
+    )
     result = compare_contract(baseline, current, scope)
     result["baseline_file"] = f".harness/{path.name}"
     result["scope_file"] = f".harness/{scope_path.name}" if scope_path.is_file() else None

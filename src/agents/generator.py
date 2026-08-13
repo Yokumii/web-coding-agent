@@ -387,8 +387,8 @@ def _validate_edit_scope(
     roots = payload.get("allowed_root_keys") if isinstance(payload, dict) else None
     if not isinstance(roots, list) or not all(isinstance(item, str) for item in roots):
         return "Forward edit scope must contain a string list `allowed_root_keys`."
-    if len(roots) > 2 or len(set(roots)) != len(roots):
-        return "Forward edit scope may declare at most two distinct root keys."
+    if len(set(roots)) != len(roots):
+        return "Forward edit scope root keys must be distinct."
     harness_baseline = payload.get("baseline") if isinstance(payload, dict) else None
     if baseline_filename is None and isinstance(harness_baseline, str):
         candidate = Path(harness_baseline)
@@ -410,6 +410,36 @@ def _validate_edit_scope(
     unknown = sorted(set(roots) - valid_roots)
     if unknown:
         return "Forward edit scope contains unknown baseline roots: " + ", ".join(unknown)
+    if baseline.get("version") == 3:
+        target_routes = payload.get("target_routes")
+        protected_routes = payload.get("protected_routes")
+        if (
+            not isinstance(target_routes, list)
+            or not target_routes
+            or not all(isinstance(item, str) for item in target_routes)
+            or not isinstance(protected_routes, list)
+            or not all(isinstance(item, str) for item in protected_routes)
+        ):
+            return "Multi-route edit scope requires string lists `target_routes` and `protected_routes`."
+        target_set = set(target_routes)
+        protected_set = set(protected_routes)
+        if target_set & protected_set:
+            return "Multi-route edit scope target and protected routes must be disjoint."
+        root_routes = {
+            str(item.get("key")): str(item.get("route", ""))
+            for item in baseline.get("roots", [])
+            if isinstance(item, dict) and item.get("key")
+        }
+        counts: dict[str, int] = {}
+        for root in roots:
+            route = root_routes.get(root, "")
+            if not route or route not in target_set or route in protected_set:
+                return "Multi-route edit scope may only allow roots owned by target routes."
+            counts[route] = counts.get(route, 0) + 1
+        if any(count > 2 for count in counts.values()):
+            return "Multi-route edit scope may declare at most two roots per target route."
+    elif len(roots) > 2:
+        return "Forward edit scope may declare at most two distinct root keys."
     if not isinstance(payload.get("allow_new_roots", False), bool):
         return "Forward edit scope field `allow_new_roots` must be boolean."
     return None
@@ -616,6 +646,10 @@ def _build_generator_prompt(
             "create, copy, or edit those harness-owned artifacts.\n",
             "- Inspect only `source_change_cone.initial_paths` first. The tool layer requires a "
             "successful read of that exact file before it accepts an exact patch.\n",
+            "- Treat `route_scope.target_routes` as the only page owners in scope. "
+            "`cross_route_shared_paths` are closed because they also affect non-target pages; "
+            "`off_target_paths` are closed outright. A shared file opens only when every owning "
+            "route is targeted by this sprint.\n",
             "- After every successful source mutation, run the smallest applicable syntax, diff, "
             "build, or test validation. Only then can a path connected by a recorded dependency "
             "edge be unlocked; protected and unplanned new source paths remain rejected.\n",
@@ -747,7 +781,8 @@ def _build_generator_prompt(
             scope_preservation_guidance = (
                 "Follow the harness-selected state transition returned by the tools: inspect, make "
                 "one exact patch, validate, and only then follow a recorded dependency edge when "
-                "the contract still requires it. If a mutation is denied, use its returned next "
+                "the contract still requires it. Do not cross from a target route into shared or "
+                "off-target page source. If a mutation is denied, use its returned next "
                 "action instead of expanding to an unrelated file.\n"
             )
         elif is_forward_edit:

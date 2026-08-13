@@ -45,8 +45,8 @@ prompt 和 exporter 由父仓库统一版本控制，运行产物则与源码分
 - 为基于 SDK 的 agent 调用生成 Claude HTTP trace 配套文件：`*.http.jsonl` 保持为源 trace，旁边生成 `*.http.html` 供浏览器查看
 - 前端运行时失败的本地日志
 - 按阶段记录成本，并设有总预算硬上限
-- forward edit 的 DOM 契约保护：编辑前对已验收 seed 建立语义 DOM/ARIA surface 基线；除显式声明的最多两个 root 外，其他 surface 不得变化。该检查独立于截图/像素评分。
-- harness 主导的最小路径引导：模型编辑前依据可执行 UI selector、DOM anchor、源码热点和 import/link 边生成 change cone；OpenAI 原生工具与 Claude SDK 都会在执行前拦截越界修改，并把放行、拒绝和依赖扩展写入 append-only ledger。
+- forward edit 的 DOM 契约保护：编辑前对已验收 seed 建立逐路由语义 DOM/ARIA surface 基线；每个目标路由最多允许两个 root 变化，所有非目标路由都受保护。该检查独立于截图/像素评分。
+- harness 主导的最小路径引导：每条 UI check 必须声明站内 route。harness 根据静态 HTML 页面、具体的文件系统路由、显式 React Router 映射、源码热点和 import/link 边建立页面归属及 change cone；只开放目标路由本地文件和仅由目标路由共享的文件，跨目标/非目标页共享文件与非目标文件会在工具执行前被拒绝，并记录到 append-only ledger。
 
 ### Forward edit 回归保护
 

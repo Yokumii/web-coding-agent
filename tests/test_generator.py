@@ -836,6 +836,8 @@ def test_forward_prompt_consumes_harness_owned_minimal_path_plan(tmp_path: Path)
     assert ".harness/minimal_path_plan_round_1.json" in prompt
     assert "harness already materialized" in prompt
     assert "Existing source overwrites are rejected" in prompt
+    assert "route_scope.target_routes" in prompt
+    assert "cross_route_shared_paths" in prompt
     assert "write `.harness/edit_scope_round_1.json`" not in prompt
 
 

@@ -43,6 +43,8 @@ def test_planner_requires_valid_form_precondition_for_submit_contracts():
     assert "including required select and textarea controls" in PLANNER_SYSTEM_PROMPT
     assert "select_option" in PLANNER_SYSTEM_PROMPT
     assert "do not infer a select value from ArrowDown/Enter" in PLANNER_SYSTEM_PROMPT
+    assert "exact same-origin browser pathname" in PLANNER_SYSTEM_PROMPT
+    assert "Consecutive checks on the same" in PLANNER_SYSTEM_PROMPT
 
 
 def _write_valid_planning_bundle(file_comm: FileComm) -> None:
@@ -161,6 +163,19 @@ def test_planner_rejects_malformed_browser_action_contract(tmp_path: Path):
     }]}]})
 
     with pytest.raises(PlannerValidationError, match="scroll action requires integer y"):
+        _validate_planning_bundle(file_comm)
+
+
+@pytest.mark.parametrize("route", ["https://example.com/catalog", "//example.com", "../catalog", "/a/../catalog", "/catalog?q=x", "/#/catalog"])
+def test_planner_rejects_unsafe_browser_route(tmp_path: Path, route: str):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    plan = file_comm.read_ui_verification_plan()
+    assert plan is not None
+    plan["sprints"][0]["checks"][0]["route"] = route
+    file_comm.write_ui_verification_plan(plan)
+
+    with pytest.raises(PlannerValidationError, match="safe same-origin path"):
         _validate_planning_bundle(file_comm)
 
 

@@ -46,8 +46,8 @@ What is implemented:
 - Claude HTTP trace pairs for SDK-backed agent runs: `*.http.jsonl` remains the source trace, and `*.http.html` is generated beside it for browser inspection
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with a hard total-budget cap
-- Edit/repair DOM contract guard: a verified seed, each sprint's accepted source, and each renderable non-forward repair source are snapshotted before modification; semantic DOM/ARIA surfaces outside the declared (max-two-root) scope must remain unchanged. This is independent of screenshot/pixel scoring.
-- Harness-owned progressive minimal-path guidance: executable UI selectors, typed action roles, semantic DOM anchors, source hotspots, and import/link edges select one initial source path before the model edits. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine; existing source cannot be whole-file overwritten, unplanned files remain closed, and actual tool outcomes are appended to a ledger.
+- Edit/repair DOM contract guard: a verified seed, each sprint's accepted source, and each renderable non-forward repair source are snapshotted before modification; semantic DOM/ARIA surfaces outside the declared scope must remain unchanged. Multi-page seeds are snapshotted route by route, with at most two mutable roots per target route and every non-target route protected. This is independent of screenshot/pixel scoring.
+- Harness-owned progressive minimal-path guidance: each executable UI check names an exact same-origin route. Static HTML pages, concrete filesystem routes, and explicit literal React Router mappings are converted into page ownership and import/link dependency cones. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine; route-local files are preferred, files shared with non-target routes and off-target files remain closed, existing source cannot be whole-file overwritten, and actual tool outcomes are appended to a ledger.
 - Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. New-policy exports require `certified` evidence.
 
 ## Requirements
@@ -207,12 +207,12 @@ writes `.harness/edit_dom_baseline.json`: a hash-only snapshot of meaningful
 DOM/ARIA surfaces (landmarks, roles, `data-testid` roots and semantic controls),
 including whether each normally focusable control can actually receive keyboard focus
 and stable descendant anchors; it is not a screenshot. Before the generator runs, the
-harness combines those anchors with executable UI action selectors and source dependency
-edges to write `.harness/minimal_path_plan_round_N.json` and the corresponding
+harness combines route-qualified checks and anchors with executable UI action selectors
+and source dependency edges to write `.harness/minimal_path_plan_round_N.json` and the corresponding
 harness-owned `.harness/edit_scope_round_N.json`, for example:
 
 ```json
-{"owner":"harness","allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
+{"owner":"harness","target_routes":["/catalog"],"protected_routes":["/settings"],"allowed_root_keys":["/catalog::main:unnamed"],"allow_new_roots":false}
 ```
 
 The model cannot edit the policy, live-state, or ledger artifacts. The plan initially
@@ -227,8 +227,9 @@ unlocked paths, and next action are persisted in
 denials, and widening are appended to `.harness/minimal_path_ledger_round_N.jsonl` and
 exported separately from the post-hoc minimality certificate.
 
-The contract permits changes inside at most two named baseline surfaces. Removal or
-semantic change of another surface, or an unapproved new surface, fails the round as
+The contract permits changes inside at most two named baseline surfaces per target route.
+Each multi-page snapshot prefixes roots with their route; removal or semantic change of
+another surface or protected route, or an unapproved new surface, fails the round as
 a regression and is recorded in `grade_round_N.json::edit_guard`. Use this to keep
 an edit task narrow; do not use it as proof that the requested behavior works—the
 normal browser evaluator remains responsible for that.

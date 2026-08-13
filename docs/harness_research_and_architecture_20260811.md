@@ -180,6 +180,8 @@ agent candidate C' + exact patches P
 
 - `src/orchestration/minimal_path_guidance.py`
   - 从 action selector、DOM anchor、源码命中和 import/link 边生成 harness-owned change cone；
+  - 每条 check 的同源 route 先解析为页面入口与传递依赖所有权；静态 HTML、具体的 Next/filesystem route 和显式 React Router literal mapping 可机械识别；`<a href>` 仅作为导航，不再错误合并为源码依赖；
+  - 路径分为 target-route local、仅目标路由共享、跨目标/保护路由共享、完全 off-target 四类；只有前两类可进入 change cone，Next layout/global CSS 等隐式 shell 归属于其包裹的全部路由；
   - 根据 typed action/category 对 behavior、markup、style 源码分层排序，只开放一个 initial path；
   - 以 `inspect → exact patch → validation → recorded-neighbor expansion` 状态机逐级开放路径，import/link 可双向遍历但不能跳边；
   - 禁止已有源码整文件覆盖、未规划新文件、非唯一 exact patch、过宽 patch 与 Bash 旁路修改；最后一次修改未成功验证时禁止 commit；
@@ -202,7 +204,7 @@ agent candidate C' + exact patches P
   - 原 seed baseline 保留；
   - 新增 per-sprint source baseline，repair 重用；
   - 非 forward repair 额外冻结该轮真实 failed-source frame；若源根本无法渲染，则显式退化为 target-only 最小性而不伪造 DOM 证据；
-  - top-level semantic surfaces、ARIA、focusability 检查。
+  - 多页 seed 复用同一个真实 Chromium context 逐 route 建立 v3 baseline，root key 带 route 前缀；每个目标 route 最多开放两个 surface，所有 protected route 的 semantic surfaces、ARIA 与 focusability 均保持冻结。
 - `src/orchestration/phases.py`
   - build 前记录 source；build 后记录 destination；
   - evaluator 通过后运行证书；
@@ -224,7 +226,7 @@ agent candidate C' + exact patches P
 
 ### 自动测试
 
-完整 suite：`532 passed, 2 skipped`。两个 skip 是既有条件性测试；另有两条第三方 `aiohttp` deprecation warning。测试覆盖：
+完整 suite：`547 passed, 2 skipped`。两个 skip 是既有条件性测试；另有两条第三方 `aiohttp` deprecation warning。测试覆盖：
 
 - exact patches 的顺序与唯一匹配；
 - 冗余 atom 检出；
@@ -233,6 +235,13 @@ agent candidate C' + exact patches P
 - infra error 不冒充必要性；
 - build source map 恢复；
 - action contract 必须含断言；
+- 静态多 HTML 页、React Router 和 Next layout/global CSS 的 route ownership；
+- 真实 Chromium 跨 route action contract 与逐 route semantic-DOM collateral regression。
+
+多页新增验证是确定性真实浏览器 integration fixture，不是 mock browser；它验证
+机制而不是声称已有多页训练语料校准。现有两条历史真实 source-commit calibration
+仍是单页三文件样本，因此不能被表述成多页 corpus 证据。带参数的 filesystem route
+在没有具体 URL/所有权映射时保持关闭，避免把 `/items/:id` 错当可访问页面建立假基线。
 - DOM action selector → source hotspot/change cone；
 - OpenAI 与 Claude SDK 双运行时 mutation policy；
 - whole-file overwrite、越界路径、过宽 patch 和 Bash 旁路拒绝；

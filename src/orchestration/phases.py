@@ -42,7 +42,10 @@ from src.orchestration.minimality_runtime import (
     record_round_build_destination,
     record_round_build_source,
 )
-from src.orchestration.minimal_path_guidance import ensure_minimal_path_plan
+from src.orchestration.minimal_path_guidance import (
+    discover_page_routes,
+    ensure_minimal_path_plan,
+)
 from src.orchestration.runtime import start_app_stack
 from src.orchestration.sprint_state import SprintState
 from src.prompts.grading import evaluation_is_inconclusive
@@ -205,6 +208,7 @@ async def run_build_phase(
     sprint_num = ctx.sprint_state.current_target
     mode = _select_generator_mode(ctx, round_num, sprint_num, resume_state)
     frontend_dir = ctx.workdir / "frontend"
+    semantic_routes = discover_page_routes(ctx.workdir) or None
     baseline_path = ctx.file_comm.dir / "edit_dom_baseline.json"
     sprint_baseline_path = ctx.file_comm.dir / sprint_baseline_name(sprint_num)
     if is_forward_edit(ctx.workdir) and (
@@ -219,6 +223,7 @@ async def run_build_phase(
                 snapshot = await capture_baseline(
                     workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
                     app_url=app_stack.frontend_url,
+                    routes=semantic_routes,
                 )
                 if not sprint_baseline_path.exists():
                     sprint_baseline_path.write_text(
@@ -229,6 +234,7 @@ async def run_build_phase(
                 await capture_sprint_source_baseline(
                     file_comm=ctx.file_comm, config=ctx.config,
                     app_url=app_stack.frontend_url, sprint_num=sprint_num,
+                    routes=semantic_routes,
                 )
         finally:
             await app_stack.close()
@@ -245,7 +251,9 @@ async def run_build_phase(
             )
             try:
                 snapshot = await snapshot_semantic_dom(
-                    app_stack.frontend_url, headless=ctx.config.playwright_headless
+                    app_stack.frontend_url,
+                    headless=ctx.config.playwright_headless,
+                    routes=semantic_routes,
                 )
                 repair_baseline_path.write_text(
                     json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",

@@ -175,6 +175,9 @@ Each check must include:
 - `expected_result`
 - `critical`
 - `category`
+- `route`: the exact same-origin browser pathname where this check starts,
+  such as `/`, `/catalog`, or `/settings.html`. Never write a full URL,
+  protocol-relative URL, query string, fragment, or parent-directory segment.
 - `actions`: an ordered, executable browser contract for this check. Each item
   is an object with `action` (`set_viewport`, `click`, `fill`, `select_option`, `key_press`, `scroll`,
   or `evaluate`) plus only the fields that action needs: `selector`, `key`,
@@ -201,8 +204,10 @@ with the form selector immediately before the submit click. This precondition
 is not a product assertion: it prevents a missing test input from becoming a
 fake repair task. `assert_form_valid` must evaluate true before submission.
 
-Checks are executed once in listed order on the same browser page, so later
-checks may deliberately continue the user journey established by earlier ones.
+Checks are executed once in listed order. Consecutive checks on the same
+`route` keep browser state, so a later check may continue that journey. A route
+change performs an explicit navigation before the next check; never rely on
+state leaking across pages.
 Make that dependency explicit in each check's `task`; do not assume a reload
 between checks.
 

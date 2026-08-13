@@ -405,6 +405,7 @@ def _minimal_path_provenance(harness: Path, round_num: int) -> dict[str, Any]:
     touched_decision = "applied" if has_applied_outcomes else "allow"
     cone = plan.get("source_change_cone") or {}
     dom = plan.get("dom_change_cone") or {}
+    route_scope = plan.get("route_scope") or {}
     return {
         "status": "enforced",
         "plan_artifact": f".harness/{plan_path.name}",
@@ -416,6 +417,12 @@ def _minimal_path_provenance(harness: Path, round_num: int) -> dict[str, Any]:
         "local_paths": list(cone.get("local_paths") or []),
         "dependency_paths": list(cone.get("dependency_paths") or []),
         "allowed_root_keys": list(dom.get("allowed_root_keys") or []),
+        "target_routes": list(route_scope.get("target_routes") or []),
+        "protected_routes": list(route_scope.get("protected_routes") or []),
+        "cross_route_shared_paths": list(
+            route_scope.get("cross_route_shared_paths") or []
+        ),
+        "off_target_paths": list(route_scope.get("off_target_paths") or []),
         "decision_counts": counts,
         "transition_counts": transitions,
         "controller_phase": state.get("phase"),

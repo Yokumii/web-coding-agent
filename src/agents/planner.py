@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -140,10 +141,30 @@ def _check_action_contracts(verification_plan: dict[str, Any]) -> None:
     """Reject planner-authored tests that would fabricate a product failure."""
     for sprint in verification_plan.get("sprints") or []:
         for check in sprint.get("checks") or []:
+            check_id = str(check.get("id", "unknown"))
+            route = check.get("route", "/")
+            if not isinstance(route, str) or not route:
+                raise PlannerValidationError(
+                    f"Planner action contract {check_id} route must be a non-empty same-origin path."
+                )
+            parsed_route = urlsplit(route)
+            route_segments = parsed_route.path.replace("\\", "/").split("/")
+            if (
+                not route.startswith("/")
+                or route.startswith("//")
+                or "\\" in route
+                or parsed_route.scheme
+                or parsed_route.netloc
+                or parsed_route.query
+                or parsed_route.fragment
+                or any(segment in {".", ".."} for segment in route_segments)
+            ):
+                raise PlannerValidationError(
+                    f"Planner action contract {check_id} route must be a safe same-origin path; got {route!r}."
+                )
             actions = check.get("actions") or []
             if not actions:  # Backwards compatibility for legacy plans.
                 continue
-            check_id = str(check.get("id", "unknown"))
             if str(actions[-1].get("action")) != "evaluate":
                 raise PlannerValidationError(
                     f"Planner action contract {check_id} must end with evaluate "

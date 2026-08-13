@@ -39,6 +39,12 @@ def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
                 "dependency_paths": ["frontend/app.css"],
             },
             "dom_change_cone": {"allowed_root_keys": ["main"]},
+            "route_scope": {
+                "target_routes": ["/catalog"],
+                "protected_routes": ["/settings"],
+                "cross_route_shared_paths": ["frontend/src/Shell.jsx"],
+                "off_target_paths": ["frontend/src/Settings.jsx"],
+            },
         },
     )
     (harness / "minimal_path_ledger_round_2.jsonl").write_text(
@@ -101,6 +107,9 @@ def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
     assert provenance["touched_paths"] == ["frontend/App.jsx", "frontend/app.css"]
     assert provenance["dependency_expansions"] == ["frontend/app.css"]
     assert provenance["plan_artifact"] == ".harness/minimal_path_plan_round_2.json"
+    assert provenance["target_routes"] == ["/catalog"]
+    assert provenance["protected_routes"] == ["/settings"]
+    assert provenance["cross_route_shared_paths"] == ["frontend/src/Shell.jsx"]
 
 
 def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path):

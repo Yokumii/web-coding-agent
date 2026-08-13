@@ -118,6 +118,9 @@ class UIVerificationCheck(BaseModel):
     expected_result: str
     critical: bool
     category: str
+    # Exact same-origin browser route for this check. Optional only so older
+    # single-page plans continue to load as the root route.
+    route: str = "/"
     # Planner-authored, declarative browser steps.  Optional for backwards
     # compatibility with existing runs; new plans are asked to provide them.
     actions: list[dict[str, Any]] = Field(default_factory=list)

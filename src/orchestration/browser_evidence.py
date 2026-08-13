@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 def _is_invalid_test_contract_error(action: str, exc: Exception) -> bool:
@@ -24,6 +25,27 @@ def _action_settle_ms(step: dict[str, Any], action: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 5_000:
         raise ValueError("settle_ms must be an integer from 0 to 5000")
     return value
+
+
+def _same_origin_route_url(app_url: str, route: str) -> str:
+    """Resolve a planner route without allowing navigation off the app origin."""
+    base = urlsplit(app_url)
+    target = urlsplit(route)
+    segments = target.path.replace("\\", "/").split("/")
+    if (
+        base.scheme not in {"http", "https"}
+        or not base.netloc
+        or not route.startswith("/")
+        or route.startswith("//")
+        or "\\" in route
+        or target.scheme
+        or target.netloc
+        or target.query
+        or target.fragment
+        or any(segment in {".", ".."} for segment in segments)
+    ):
+        raise ValueError(f"unsafe browser route: {route!r}")
+    return urlunsplit((base.scheme, base.netloc, target.path or "/", "", target.fragment))
 
 
 async def collect_browser_evidence(
@@ -52,16 +74,39 @@ async def collect_browser_evidence(
             # to burn the whole evaluation budget waiting on Playwright's 30s
             # default for every absent selector.
             page.set_default_timeout(action_timeout_ms)
-            # The planner writes a single ordered user journey for a sprint.
-            # In particular, a form-submission check may intentionally follow
-            # the preceding "open dialog" check.  Reloading between checks
-            # discards that state and turns a valid interaction into a false
-            # repair signal.  Start once and execute the contracts in order.
-            await page.goto(app_url, wait_until="domcontentloaded", timeout=15_000)
-            await page.wait_for_timeout(150)
+            # Preserve state between adjacent checks on one route, but perform
+            # a deliberate navigation when a multi-page contract changes route.
+            active_route: str | None = None
             for check in checks:
                 steps = check.get("actions") if isinstance(check, dict) else []
-                item: dict[str, Any] = {"check_id": check.get("id"), "steps": []}
+                route = str(check.get("route", "/"))
+                item: dict[str, Any] = {
+                    "check_id": check.get("id"),
+                    "route": route,
+                    "steps": [],
+                }
+                try:
+                    route_url = _same_origin_route_url(app_url, route)
+                    if route != active_route:
+                        await page.goto(
+                            route_url,
+                            wait_until="domcontentloaded",
+                            timeout=15_000,
+                        )
+                        await page.wait_for_timeout(150)
+                        active_route = route
+                    item["url"] = page.url
+                except Exception as exc:
+                    item.update(
+                        {
+                            "status": "invalid_test_contract",
+                            "navigation_error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    records.append(item)
+                    if fail_fast:
+                        break
+                    continue
                 if not isinstance(steps, list) or not steps:
                     item["status"] = "no_action_contract"
                     records.append(item)

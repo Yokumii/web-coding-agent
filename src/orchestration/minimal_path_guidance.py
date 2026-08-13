@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-PLAN_VERSION = "minimal-path-plan-v1"
+PLAN_VERSION = "minimal-path-plan-v2"
+SUPPORTED_PLAN_VERSIONS = {"minimal-path-plan-v1", PLAN_VERSION}
 CODE_EXTENSIONS = {
     ".css",
     ".ets",
@@ -85,8 +86,17 @@ _GET_BY_ID_RE = re.compile(r"getElementById\(\s*['\"]([^'\"]+)['\"]")
 _IMPORT_RE = re.compile(
     r"(?:import\s+(?:[^'\"]+?\s+from\s+)?|require\(\s*)['\"]([^'\"]+)['\"]"
 )
-_HTML_REF_RE = re.compile(r"(?:src|href)\s*=\s*['\"]([^'\"]+)['\"]", re.I)
+_HTML_SRC_RE = re.compile(r"\bsrc\s*=\s*['\"]([^'\"]+)['\"]", re.I)
+_HTML_LINK_RE = re.compile(r"<link\b[^>]*\bhref\s*=\s*['\"]([^'\"]+)['\"]", re.I)
 _CSS_IMPORT_RE = re.compile(r"@import\s+(?:url\()?\s*['\"]([^'\"]+)['\"]", re.I)
+_ROUTE_COMPONENT_RE = re.compile(
+    r"<Route\b[^>]*\bpath\s*=\s*['\"]([^'\"]+)['\"][^>]*"
+    r"\belement\s*=\s*\{\s*<([A-Za-z_$][\w$]*)\b",
+    re.I | re.S,
+)
+_DEFAULT_IMPORT_RE = re.compile(
+    r"import\s+([A-Za-z_$][\w$]*)\s+from\s+['\"]([^'\"]+)['\"]"
+)
 _MUTATING_SHELL_RE = re.compile(
     r"(?:^|(?:&&|\|\||;)\s*|\s)(?:cp|install|mkdir|mv|patch|rm|tee|touch|truncate)\s|"
     r"(?:^|\s)(?:npm|pnpm|yarn)\s+(?:add|install|create)\b|"
@@ -326,7 +336,10 @@ def _dependency_graph(
         except OSError:
             continue
         references = [match.group(1) for match in _IMPORT_RE.finditer(content)]
-        references += [match.group(1) for match in _HTML_REF_RE.finditer(content)]
+        # Navigation anchors connect browser pages, not source modules. Treating
+        # <a href> as an import collapses a multi-page site into one giant cone.
+        references += [match.group(1) for match in _HTML_SRC_RE.finditer(content)]
+        references += [match.group(1) for match in _HTML_LINK_RE.finditer(content)]
         references += [match.group(1) for match in _CSS_IMPORT_RE.finditer(content)]
         source_rel = _relative_to_workdir(source, workdir)
         for reference in references:
@@ -344,6 +357,255 @@ def _dependency_neighbors(graph: dict[str, set[str]], path: str) -> set[str]:
     neighbors = set(graph.get(path, set()))
     neighbors.update(source for source, targets in graph.items() if path in targets)
     return neighbors
+
+
+def _normalize_route(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    route = value.strip()
+    if not route or "://" in route or route.startswith("//"):
+        return None
+    route = route.split("?", 1)[0].split("#", 1)[0] or "/"
+    if not route.startswith("/"):
+        route = "/" + route
+    parts = [part for part in route.split("/") if part]
+    if any(part in {".", ".."} for part in parts):
+        return None
+    normalized = "/" + "/".join(parts)
+    return "/" if normalized == "/" else normalized
+
+
+def _static_html_route(path: Path, frontend: Path) -> str:
+    relative = path.relative_to(frontend).as_posix()
+    if relative == "index.html":
+        return "/"
+    if relative.endswith("/index.html"):
+        return "/" + relative.removesuffix("index.html").rstrip("/")
+    return "/" + relative
+
+
+def _file_route(path: Path, frontend: Path) -> str | None:
+    """Infer conventional filesystem routes without executing project code."""
+    relative = path.relative_to(frontend).as_posix()
+    patterns = (
+        (re.compile(r"^(?:src/)?app/(.+/)?page\.(?:js|jsx|ts|tsx)$"), "app"),
+        (re.compile(r"^(?:src/)?pages/(.+)\.(?:js|jsx|ts|tsx|vue|svelte)$"), "pages"),
+    )
+    for pattern, kind in patterns:
+        match = pattern.match(relative)
+        if not match:
+            continue
+        raw = (match.group(1) or "").strip("/")
+        if kind == "app":
+            segments = [
+                item for item in raw.split("/") if item and not item.startswith("(")
+            ]
+        else:
+            segments = [item for item in raw.split("/") if item]
+            if segments and segments[-1].startswith("_"):
+                return None
+            if segments and segments[-1] == "index":
+                segments.pop()
+        # A source pattern is not a browser URL. Without a concrete parameter
+        # value from a validated check, navigating `/items/:id` would baseline
+        # an error page and create false preservation evidence.
+        if any(item.startswith("[") and item.endswith("]") for item in segments):
+            return None
+        route_segments = [
+            item for item in segments
+        ]
+        return "/" + "/".join(route_segments) if route_segments else "/"
+    return None
+
+
+def _route_entries(
+    files: list[Path], frontend: Path, workdir: Path
+) -> dict[str, set[str]]:
+    entries: dict[str, set[str]] = {}
+    html_files = [path for path in files if path.suffix.lower() in {".htm", ".html"}]
+    static_multi_page = len(html_files) > 1
+    for path in files:
+        route = (
+            _static_html_route(path, frontend)
+            if path.suffix.lower() in {".htm", ".html"}
+            else None
+            if static_multi_page
+            else _file_route(path, frontend)
+        )
+        if route:
+            entries.setdefault(route, set()).add(_relative_to_workdir(path, workdir))
+
+    # React Router commonly centralizes route declarations in App/router files.
+    # Resolve only explicit literal routes and statically imported components.
+    router_entries: dict[str, set[str]] = {}
+    if not static_multi_page:
+        for router in files:
+            try:
+                content = router.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            imports: dict[str, str] = {}
+            for symbol, reference in _DEFAULT_IMPORT_RE.findall(content):
+                target = _resolve_reference(frontend, router, reference)
+                if target is not None:
+                    imports[symbol] = _relative_to_workdir(target, workdir)
+            for route_raw, symbol in _ROUTE_COMPONENT_RE.findall(content):
+                route = _normalize_route(route_raw)
+                target = imports.get(symbol)
+                if route and target:
+                    router_entries.setdefault(route, set()).add(target)
+    if router_entries:
+        # Explicit router declarations are more authoritative than a Vite
+        # index.html shell or filename convention, which otherwise makes every
+        # page component look owned by the root route as well.
+        entries = router_entries
+    return entries
+
+
+def _dependency_closure(seed_paths: set[str], graph: dict[str, set[str]]) -> set[str]:
+    visited: set[str] = set()
+    pending = list(seed_paths)
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(sorted(graph.get(current, set()) - visited))
+    return visited
+
+
+def _resolve_target_route(route: str, entries: dict[str, set[str]]) -> str | None:
+    if route in entries:
+        return route
+    candidates = []
+    if route != "/":
+        candidates.extend((route.rstrip("/") + ".html", route.rstrip("/")))
+    return next((candidate for candidate in candidates if candidate in entries), None)
+
+
+def _route_scope(
+    *,
+    files: list[Path],
+    frontend: Path,
+    workdir: Path,
+    graph: dict[str, set[str]],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    entries = _route_entries(files, frontend, workdir)
+    if not entries:
+        fallback_entries = _entrypoints(files, frontend, workdir)
+        if fallback_entries:
+            entries["/"] = set(fallback_entries[:1])
+    requested = sorted(
+        {
+            route
+            for route in (_normalize_route(check.get("route", "/")) for check in checks)
+            if route
+        }
+        or {"/"}
+    )
+    resolved = {
+        requested_route: _resolve_target_route(requested_route, entries)
+        for requested_route in requested
+    }
+    unresolved = sorted(route for route, match in resolved.items() if match is None)
+    target_routes = sorted({match for match in resolved.values() if match is not None})
+    closures = {
+        route: _dependency_closure(paths, graph) for route, paths in entries.items()
+    }
+    all_paths = {_relative_to_workdir(path, workdir) for path in files}
+    # Framework shells are implicit runtime dependencies rather than normal
+    # page imports. Assign them to every page they wrap so a layout/global CSS
+    # edit is correctly classified as cross-route shared, not merely unknown.
+    for route, entry_paths in entries.items():
+        implicit: set[str] = set()
+        for entry_path in entry_paths:
+            try:
+                frontend_rel = Path(entry_path).relative_to("frontend")
+            except ValueError:
+                continue
+            parts = frontend_rel.parts
+            normalized_parts = parts[1:] if parts and parts[0] == "src" else parts
+            prefix = "frontend/src" if parts and parts[0] == "src" else "frontend"
+            if normalized_parts and normalized_parts[0] == "app" and normalized_parts[-1].startswith("page."):
+                parent_parts = normalized_parts[:-1]
+                for depth in range(1, len(parent_parts) + 1):
+                    directory = "/".join(parent_parts[:depth])
+                    for extension in ("js", "jsx", "ts", "tsx"):
+                        candidate = f"{prefix}/{directory}/layout.{extension}"
+                        if candidate in all_paths:
+                            implicit.add(candidate)
+            if normalized_parts and normalized_parts[0] == "pages":
+                for special in ("_app", "_document"):
+                    for extension in ("js", "jsx", "ts", "tsx"):
+                        candidate = f"{prefix}/pages/{special}.{extension}"
+                        if candidate in all_paths:
+                            implicit.add(candidate)
+        closures[route].update(_dependency_closure(implicit, graph))
+    if len(entries) == 1:
+        # With no competing page, unreferenced source remains part of that
+        # page's editable project surface for backward compatibility.
+        only_route = next(iter(entries))
+        closures[only_route].update(
+            _relative_to_workdir(path, workdir) for path in files
+        )
+    owners: dict[str, set[str]] = {}
+    for route, paths in closures.items():
+        for path in paths:
+            owners.setdefault(path, set()).add(route)
+    target_set = set(target_routes)
+    route_local: set[str] = set()
+    target_shared: set[str] = set()
+    cross_shared: set[str] = set()
+    for path, path_owners in owners.items():
+        target_owners = path_owners & target_set
+        if not target_owners:
+            continue
+        if path_owners - target_set:
+            cross_shared.add(path)
+        elif len(path_owners) > 1:
+            target_shared.add(path)
+        else:
+            route_local.add(path)
+    off_target = all_paths - route_local - target_shared - cross_shared
+    status = (
+        "unresolved_target_route"
+        if unresolved
+        else "multi_page_scoped"
+        if len(entries) > 1
+        else "single_page"
+    )
+    return {
+        "status": status,
+        "requested_routes": requested,
+        "target_routes": target_routes,
+        "protected_routes": sorted(set(entries) - set(target_routes)),
+        "unresolved_routes": unresolved,
+        "discovered_routes": sorted(entries),
+        "route_entries": {
+            route: sorted(paths) for route, paths in sorted(entries.items())
+        },
+        "target_page_entries": sorted(
+            {path for route in target_routes for path in entries.get(route, set())}
+        ),
+        "route_local_paths": sorted(route_local),
+        "target_shared_paths": sorted(target_shared),
+        "cross_route_shared_paths": sorted(cross_shared),
+        "off_target_paths": sorted(off_target),
+        "path_owners": {
+            path: sorted(path_owners) for path, path_owners in sorted(owners.items())
+        },
+    }
+
+
+def discover_page_routes(workdir: Path) -> list[str]:
+    """Return statically owned browser routes when a project has many pages."""
+    frontend = workdir / "frontend"
+    files = _code_files(frontend)
+    if not files:
+        return []
+    entries = _route_entries(files, frontend, workdir)
+    return sorted(entries) if len(entries) > 1 else []
 
 
 def _entrypoints(files: list[Path], frontend: Path, workdir: Path) -> list[str]:
@@ -368,11 +630,17 @@ def _entrypoints(files: list[Path], frontend: Path, workdir: Path) -> list[str]:
 
 
 def _dom_scope(
-    baseline: dict[str, Any], selectors: list[str], tokens: list[str]
+    baseline: dict[str, Any],
+    selectors: list[str],
+    tokens: list[str],
+    target_routes: list[str] | None = None,
 ) -> tuple[list[str], bool, list[dict[str, Any]]]:
     matches: list[dict[str, Any]] = []
+    target_route_set = set(target_routes or [])
     for root in baseline.get("roots", []):
         if not isinstance(root, dict) or not isinstance(root.get("key"), str):
+            continue
+        if baseline.get("version") == 3 and root.get("route") not in target_route_set:
             continue
         key = str(root["key"])
         anchors = {
@@ -390,7 +658,22 @@ def _dom_scope(
         )
         if evidence:
             matches.append({"root": key, "evidence": evidence})
-    allowed = [item["root"] for item in matches[:2]]
+    if baseline.get("version") == 3:
+        allowed = []
+        route_counts: dict[str, int] = {}
+        roots_by_key = {
+            str(root.get("key")): root
+            for root in baseline.get("roots", [])
+            if isinstance(root, dict) and root.get("key")
+        }
+        for item in matches:
+            route = str((roots_by_key.get(item["root"]) or {}).get("route", ""))
+            if route_counts.get(route, 0) >= 2:
+                continue
+            route_counts[route] = route_counts.get(route, 0) + 1
+            allowed.append(item["root"])
+    else:
+        allowed = [item["root"] for item in matches[:2]]
     baseline_has_anchors = any(
         isinstance(root, dict) and bool(root.get("anchors"))
         for root in baseline.get("roots", [])
@@ -416,12 +699,14 @@ def _dom_scope(
 def _scope_payload(plan: dict[str, Any]) -> dict[str, Any]:
     dom = plan["dom_change_cone"]
     return {
-        "schema_version": "edit-scope-v2",
+        "schema_version": "edit-scope-v3",
         "owner": "harness",
         "plan": f".harness/{plan_name(int(plan['round']))}",
         "baseline": dom.get("baseline"),
         "allowed_root_keys": list(dom.get("allowed_root_keys", [])),
         "allow_new_roots": bool(dom.get("allow_new_roots", False)),
+        "target_routes": list((plan.get("route_scope") or {}).get("target_routes", [])),
+        "protected_routes": list((plan.get("route_scope") or {}).get("protected_routes", [])),
     }
 
 
@@ -438,7 +723,10 @@ def ensure_minimal_path_plan(
     """Create one immutable harness-owned plan for an edit/repair round."""
     path = harness_dir / plan_name(round_num)
     existing = _read_json(path, None)
-    if isinstance(existing, dict) and existing.get("schema_version") == PLAN_VERSION:
+    if (
+        isinstance(existing, dict)
+        and existing.get("schema_version") in SUPPORTED_PLAN_VERSIONS
+    ):
         scope_path = harness_dir / f"edit_scope_round_{round_num}.json"
         if not scope_path.exists():
             _write_json(scope_path, _scope_payload(existing))
@@ -456,30 +744,53 @@ def ensure_minimal_path_plan(
     )
     baseline_path = next((item for item in baseline_candidates if item.is_file()), None)
     baseline = _read_json(baseline_path, {}) if baseline_path else {}
-    allowed_roots, allow_new_roots, root_evidence = _dom_scope(
-        baseline, selectors, tokens
-    )
-
     frontend = workdir / "frontend"
     files = _code_files(frontend)
-    hotspots, scores = _source_hotspots(
+    all_hotspots, all_scores = _source_hotspots(
         files, selectors, tokens, requested_roles, workdir
     )
     graph, edges = _dependency_graph(files, frontend, workdir)
     entries = _entrypoints(files, frontend, workdir)
+    route_scope = _route_scope(
+        files=files,
+        frontend=frontend,
+        workdir=workdir,
+        graph=graph,
+        checks=checks,
+    )
+    allowed_roots, allow_new_roots, root_evidence = _dom_scope(
+        baseline,
+        selectors,
+        tokens,
+        list(route_scope.get("target_routes") or []),
+    )
+    admissible_paths = set(route_scope["route_local_paths"]) | set(
+        route_scope["target_shared_paths"]
+    )
+    hotspots = [
+        item for item in all_hotspots if str(item.get("path")) in admissible_paths
+    ]
+    scores = {
+        path: score for path, score in all_scores.items() if path in admissible_paths
+    }
 
     ranked = [str(item["path"]) for item in hotspots]
-    initial = ranked[:1] if ranked else entries[:1]
+    target_entries = list(route_scope["target_page_entries"])
+    initial = ranked[:1] if ranked else target_entries[:1]
     seeds = ranked[:max_touched_files]
     if not seeds:
-        seeds = entries[:1]
+        seeds = target_entries[:1]
     local: list[str] = list(dict.fromkeys(seeds))
     # A fallback entry point is useful only together with its direct imports;
     # that is the smallest executable source unit for common static/SPA seeds.
     if not ranked:
         for seed in list(local):
             for dependency in sorted(_dependency_neighbors(graph, seed)):
-                if dependency not in local and len(local) < max_touched_files:
+                if (
+                    dependency in admissible_paths
+                    and dependency not in local
+                    and len(local) < max_touched_files
+                ):
                     local.append(dependency)
     # The hotspot table retains rank/score evidence.  The executable allowlist
     # is sorted so repeated runs expose a stable path order to models/tools.
@@ -488,11 +799,26 @@ def ensure_minimal_path_plan(
     dependencies: list[str] = []
     for seed in local:
         for dependency in sorted(_dependency_neighbors(graph, seed)):
-            if dependency not in local and dependency not in dependencies:
+            if (
+                dependency in admissible_paths
+                and dependency not in local
+                and dependency not in dependencies
+            ):
                 dependencies.append(dependency)
     all_paths = [_relative_to_workdir(item, workdir) for item in files]
     protected = sorted(set(all_paths) - set(local) - set(dependencies))
-    status = "ready" if local and checks else "advisory"
+    executable_edges = [
+        edge
+        for edge in edges
+        if edge["from"] in admissible_paths and edge["to"] in admissible_paths
+    ]
+    status = (
+        "blocked"
+        if route_scope["unresolved_routes"]
+        else "ready"
+        if local and checks
+        else "advisory"
+    )
     plan = {
         "schema_version": PLAN_VERSION,
         "owner": "harness",
@@ -500,6 +826,7 @@ def ensure_minimal_path_plan(
         "sprint": sprint_num,
         "mode": mode,
         "status": status,
+        "route_scope": route_scope,
         "target_contract": {
             "check_ids": [str(item.get("id", "")) for item in checks],
             "selectors": selectors,
@@ -519,7 +846,7 @@ def ensure_minimal_path_plan(
             "initial_paths": initial,
             "dependency_paths": dependencies,
             "protected_paths": protected,
-            "dependency_edges": edges,
+            "dependency_edges": executable_edges,
             "hotspots": hotspots,
             "entrypoints": entries,
             "path_scores": scores,
@@ -565,6 +892,11 @@ class MinimalPathPolicy:
         self.initial_paths = configured_initial or set(fallback_initial)
         self.dependency_paths = set(cone.get("dependency_paths") or [])
         self.protected_paths = set(cone.get("protected_paths") or [])
+        route_scope = plan.get("route_scope") or {}
+        self.cross_route_shared_paths = set(
+            route_scope.get("cross_route_shared_paths") or []
+        )
+        self.off_target_paths = set(route_scope.get("off_target_paths") or [])
         self.dependency_edges = {
             (str(item.get("from")), str(item.get("to")))
             for item in cone.get("dependency_edges") or []
@@ -595,7 +927,10 @@ class MinimalPathPolicy:
     @classmethod
     def load(cls, workdir: Path, round_num: int) -> "MinimalPathPolicy | None":
         plan = _read_json(workdir / ".harness" / plan_name(round_num), None)
-        if not isinstance(plan, dict) or plan.get("schema_version") != PLAN_VERSION:
+        if (
+            not isinstance(plan, dict)
+            or plan.get("schema_version") not in SUPPORTED_PLAN_VERSIONS
+        ):
             return None
         return cls(workdir, plan)
 
@@ -920,6 +1255,26 @@ class MinimalPathPolicy:
             return None
         if absolute.suffix.lower() not in CODE_EXTENSIONS:
             return None
+
+        if relative in self.cross_route_shared_paths:
+            owners = (
+                (self.plan.get("route_scope") or {})
+                .get("path_owners", {})
+                .get(relative, [])
+            )
+            return self._deny(
+                tool,
+                relative,
+                "This source is shared with non-target routes and is closed for this Edit: "
+                + ", ".join(str(item) for item in owners),
+            )
+        if relative in self.off_target_paths:
+            return self._deny(
+                tool,
+                relative,
+                "This source belongs outside the target page route and is protected by the "
+                "multi-page Edit scope.",
+            )
 
         if normalized in {"write", "write_file"} and absolute.exists():
             return self._deny(
