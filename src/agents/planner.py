@@ -9,6 +9,10 @@ from pydantic import ValidationError
 from src.agents.sdk_runner import AgentRunStats, build_agent_run_stats, run_sdk_agent
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.ui_action_contracts import (
+    ActionContractError,
+    validate_ui_action,
+)
 from src.orchestration.target_profile import target_profile_guidance
 from src.prompts.planner import planner_system_prompt
 from src.utils.logger import get_logger
@@ -207,6 +211,12 @@ def _check_action_contracts(verification_plan: dict[str, Any]) -> None:
                             f"Planner action contract {check_id} contains a top-level return; "
                             "write a directly evaluable boolean expression instead."
                         )
+                try:
+                    validate_ui_action(action)
+                except ActionContractError as exc:
+                    raise PlannerValidationError(
+                        f"Planner action contract {check_id} {exc}."
+                    ) from exc
 
 
 def _check_cross_references(

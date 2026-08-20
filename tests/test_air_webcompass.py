@@ -5,8 +5,10 @@ import json
 import pytest
 
 from src.task_generation.air_webcompass import (
+    WEBCOMPASS_EDIT_ACTION_PROFILES,
     WEBCOMPASS_EDIT_TYPES,
     WEBCOMPASS_REPAIR_TYPES,
+    SeedContextBudgetError,
     append_jsonl_record,
     build_repair_training_input,
     load_seed_code,
@@ -14,6 +16,7 @@ from src.task_generation.air_webcompass import (
     validate_initial_candidate,
     validate_refinement,
 )
+from src.orchestration.ui_action_contracts import SUPPORTED_UI_ACTIONS
 
 
 def test_webcompass_taxonomies_are_closed_and_complete():
@@ -23,6 +26,17 @@ def test_webcompass_taxonomies_are_closed_and_complete():
     assert len(WEBCOMPASS_REPAIR_TYPES) == 11
     assert len(set(WEBCOMPASS_REPAIR_TYPES)) == 11
     assert "Loss of Interactivity" in WEBCOMPASS_REPAIR_TYPES
+
+
+def test_every_0805_edit_type_has_supported_typed_browser_actions():
+    assert set(WEBCOMPASS_EDIT_ACTION_PROFILES) == set(WEBCOMPASS_EDIT_TYPES)
+    assert all(
+        set(actions) <= SUPPORTED_UI_ACTIONS
+        for actions in WEBCOMPASS_EDIT_ACTION_PROFILES.values()
+    )
+    assert "drag_and_drop" in WEBCOMPASS_EDIT_ACTION_PROFILES["Drag & Drop Interface"]
+    assert "set_input_files" in WEBCOMPASS_EDIT_ACTION_PROFILES["File Upload with Progress"]
+    assert "emulate_media" in WEBCOMPASS_EDIT_ACTION_PROFILES["Print Stylesheet"]
 
 
 def test_initial_candidate_requires_exact_requested_types():
@@ -89,6 +103,20 @@ def test_seed_loader_is_deterministic_and_ignores_hidden_files(tmp_path):
     files = load_seed_code(tmp_path)
 
     assert [item["path"] for item in files] == ["index.html", "styles.css"]
+
+
+def test_seed_loader_never_silently_truncates_multi_file_context(tmp_path):
+    for index in range(3):
+        (tmp_path / f"page-{index}.js").write_text("x" * 20, encoding="utf-8")
+
+    with pytest.raises(SeedContextBudgetError, match="3 supported files"):
+        load_seed_code(tmp_path, max_files=2, max_chars=1_000)
+    with pytest.raises(SeedContextBudgetError, match="60 source characters"):
+        load_seed_code(tmp_path, max_files=10, max_chars=50)
+
+    files = load_seed_code(tmp_path, max_files=3, max_chars=60)
+    assert len(files) == 3
+    assert sum(len(item["code"]) for item in files) == 60
 
 
 def test_jsonl_results_are_appended(tmp_path):

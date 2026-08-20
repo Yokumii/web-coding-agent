@@ -179,9 +179,10 @@ Each check must include:
   such as `/`, `/catalog`, or `/settings.html`. Never write a full URL,
   protocol-relative URL, query string, fragment, or parent-directory segment.
 - `actions`: an ordered, executable browser contract for this check. Each item
-  is an object with `action` (`set_viewport`, `click`, `fill`, `select_option`, `key_press`, `scroll`,
-  or `evaluate`) plus only the fields that action needs: `selector`, `key`,
-  `count`, `value`, `width`, `height`, `expression`, or optional `settle_ms`. Use `fill` (not
+  is an object with `action` (`set_viewport`, `click`, `hover`, `drag_and_drop`,
+  `fill`, `select_option`, `set_input_files`, `key_press`, `scroll`, `wait_for`,
+  `emulate_media`, `assert_form_valid`, or `evaluate`) plus only the fields that
+  action needs. Use `fill` (not
   `key_press`) for normal text/email input; `key_press` is only for keyboard
   keys such as Tab, Enter, Escape, or ArrowRight. Use stable existing IDs,
   data attributes, or classes; if the feature introduces a new control, give it
@@ -193,6 +194,15 @@ Each check must include:
   When a `key_press` action has a selector, the harness focuses that exact
   element before pressing the key; include it whenever the key activates a
   specific control.
+  Use `click` with `button: "right"` for context-menu behavior. Use
+  `drag_and_drop` with `source_selector` and `target_selector`, and `hover` for
+  hover-only surfaces such as tooltips. Use `wait_for` with a stable selector,
+  one of `visible`/`hidden`/`attached`/`detached`, and `timeout_ms` no greater
+  than 5000 for asynchronous UI state.
+  For upload behavior use `set_input_files` with `selector` and 1-3 in-memory
+  `files`; each file has only `name`, `mime_type`, and short text `content`.
+  Never provide a filesystem path. Use `emulate_media` with `media` (`screen`
+  or `print`) and/or `color_scheme` for print and theme contracts.
   If the next action depends on debounced, animated, or delayed DOM state created by the
   current action, set `settle_ms` on the state-producing action (normally 100-500ms). For
   example, a `fill` followed by Escape to close an opened autocomplete must wait until the

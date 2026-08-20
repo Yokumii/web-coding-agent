@@ -89,3 +89,81 @@ async def test_browser_evidence_navigates_multi_page_checks_and_preserves_same_r
     assert [item["status"] for item in result["checks"]] == ["ok", "ok"]
     assert all(item["route"] == "/catalog.html" for item in result["checks"])
     assert result["checks"][0]["url"].endswith("/catalog.html")
+
+
+@pytest.mark.anyio
+async def test_browser_evidence_executes_0805_advanced_interaction_primitives(
+    tmp_path: Path,
+):
+    async def advanced(_request):
+        return web.Response(
+            text="""
+            <style>
+              #source, #target { width: 80px; height: 40px; margin: 8px; border: 1px solid; }
+              #ready { display: none; }
+              #print-state { display: none; }
+              @media print { #print-state { display: block; } }
+            </style>
+            <button id="tip">Hover</button>
+            <button id="menu">Context</button>
+            <div id="source" draggable="true">source</div><div id="target">target</div>
+            <input id="upload" type="file"><output id="ready">ready</output>
+            <div id="print-state">print</div>
+            <script>
+              const state = document.body.dataset;
+              tip.addEventListener('mouseenter', () => state.hovered = 'yes');
+              menu.addEventListener('contextmenu', event => {
+                event.preventDefault(); state.context = 'yes';
+              });
+              source.addEventListener('dragstart', event => event.dataTransfer.setData('text/plain', 'source'));
+              target.addEventListener('dragover', event => event.preventDefault());
+              target.addEventListener('drop', event => {
+                event.preventDefault(); state.dropped = event.dataTransfer.getData('text/plain');
+              });
+              upload.addEventListener('change', async () => {
+                state.upload = await upload.files[0].text();
+                setTimeout(() => { ready.style.display = 'block'; }, 40);
+              });
+            </script>
+            """,
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/", advanced)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        result = await collect_browser_evidence(
+            app_url=f"http://127.0.0.1:{port}",
+            checks=[{
+                "id": "UI-ADVANCED",
+                "route": "/",
+                "actions": [
+                    {"action": "hover", "selector": "#tip"},
+                    {"action": "click", "selector": "#menu", "button": "right"},
+                    {"action": "drag_and_drop", "source_selector": "#source", "target_selector": "#target"},
+                    {
+                        "action": "set_input_files",
+                        "selector": "#upload",
+                        "files": [{"name": "sample.txt", "mime_type": "text/plain", "content": "0805"}],
+                    },
+                    {"action": "wait_for", "selector": "#ready", "state": "visible", "timeout_ms": 1000},
+                    {"action": "emulate_media", "media": "print"},
+                    {
+                        "action": "evaluate",
+                        "expression": "document.body.dataset.hovered === 'yes' && document.body.dataset.context === 'yes' && document.body.dataset.dropped === 'source' && document.body.dataset.upload === '0805' && getComputedStyle(document.querySelector('#print-state')).display === 'block'",
+                    },
+                ],
+            }],
+            output_path=tmp_path / "advanced.json",
+            headless=True,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert result["checks"][0]["status"] == "ok"
+    assert all(step["ok"] for step in result["checks"][0]["steps"])

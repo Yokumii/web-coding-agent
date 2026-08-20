@@ -57,6 +57,8 @@ INTERACTION_ACTIONS = {
     "click",
     "dblclick",
     "drag",
+    "drag_and_drop",
+    "emulate_media",
     "fill",
     "focus",
     "hover",
@@ -65,9 +67,11 @@ INTERACTION_ACTIONS = {
     "scroll",
     "select",
     "select_option",
+    "set_input_files",
     "tap",
     "type",
     "uncheck",
+    "wait_for",
 }
 IGNORED_PARTS = {
     ".git",

@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+from src.orchestration.ui_action_contracts import SUPPORTED_UI_ACTIONS
+from src.task_generation.air_webcompass import (
+    WEBCOMPASS_EDIT_ACTION_PROFILES,
+    WEBCOMPASS_EDIT_TYPES,
+    WEBCOMPASS_REPAIR_TYPES,
+)
 
 
 # Measured from the authoritative 20260806 WebCompass v2 release, not a
@@ -55,7 +63,11 @@ def _deficits(observed: dict[int, int], reference: dict[int, int], sample_size: 
 def _rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    opener = gzip.open if path.suffix == ".gz" else path.open
+    with opener(path, "rt", encoding="utf-8") if path.suffix == ".gz" else opener(
+        "r", encoding="utf-8"
+    ) as handle:
+        return [json.loads(line) for line in handle if line.strip()]
 
 
 def _code(record: dict[str, Any]) -> list[dict[str, str]]:
@@ -71,6 +83,15 @@ def _summary(rows: list[dict[str, Any]], task: str) -> dict[str, Any]:
     file_counts = [len({patch.get("path") for patch in group}) for group in patches]
     patch_counts = [len(group) for group in patches]
     code_sizes = [sum(len(item.get("code", "")) for item in _code(row)) for row in records]
+    atomic_task_types = sorted(
+        {
+            str(task_type)
+            for row in records
+            for task_type in (row.get("task_type") or [])
+            if str(task_type).strip()
+        }
+    )
+    page_types = [str(row.get("page_type") or "<missing>") for row in records]
     contract_errors = []
     for row in records:
         if task == "text-repair" and not isinstance(row.get("instruction"), list):
@@ -88,6 +109,8 @@ def _summary(rows: list[dict[str, Any]], task: str) -> dict[str, Any]:
         "patch_count_distribution": dict(Counter(patch_counts)),
         "changed_file_distribution": dict(Counter(file_counts)),
         "code_chars": {"min": min(code_sizes, default=0), "max": max(code_sizes, default=0)},
+        "atomic_task_types": atomic_task_types,
+        "page_type_distribution": dict(Counter(page_types)),
         "reverse_shape_eligible": sum(1 for tc in task_counts if 1 <= tc <= 7),
         "contract_errors": contract_errors,
     }
@@ -106,6 +129,31 @@ def audit(forward_dir: Path, reference_edit: Path | None = None,
             "image_edit_count": len(_rows(forward_dir / "image-edit.v2.jsonl")),
             "image_repair_count": len(_rows(forward_dir / "image-repair.v2.jsonl")),
         },
+        "harness_action_capabilities": {
+            "status": (
+                "covered"
+                if set(WEBCOMPASS_EDIT_ACTION_PROFILES) == set(WEBCOMPASS_EDIT_TYPES)
+                and all(
+                    set(actions) <= SUPPORTED_UI_ACTIONS
+                    for actions in WEBCOMPASS_EDIT_ACTION_PROFILES.values()
+                )
+                else "gap"
+            ),
+            "taxonomy_size": len(WEBCOMPASS_EDIT_TYPES),
+            "profile_count": len(WEBCOMPASS_EDIT_ACTION_PROFILES),
+            "supported_actions": sorted(SUPPORTED_UI_ACTIONS),
+            "unmapped_task_types": sorted(
+                set(WEBCOMPASS_EDIT_TYPES) - set(WEBCOMPASS_EDIT_ACTION_PROFILES)
+            ),
+            "unsupported_profile_actions": sorted(
+                {
+                    action
+                    for actions in WEBCOMPASS_EDIT_ACTION_PROFILES.values()
+                    for action in actions
+                    if action not in SUPPORTED_UI_ACTIONS
+                }
+            ),
+        },
     }
     if reference_edit or reference_repair:
         reference = []
@@ -123,11 +171,20 @@ def audit(forward_dir: Path, reference_edit: Path | None = None,
     for task in ("text-editing", "text-repair"):
         observed = result["forward"][task]
         reference = result["reverse_reference"][task]
+        expected_types = (
+            set(WEBCOMPASS_EDIT_TYPES)
+            if task == "text-editing"
+            else set(WEBCOMPASS_REPAIR_TYPES)
+        )
+        observed_types = set(observed.get("atomic_task_types") or [])
         alignment[task] = {
             "sample_size_sufficient_for_distribution_claim": observed["count"] >= 100,
             "task_count_tv_distance": _tv_distance(observed["task_count_distribution"], reference["task_count_distribution"]),
             "patch_count_tv_distance": _tv_distance(observed["patch_count_distribution"], reference["patch_count_distribution"]),
             "changed_file_tv_distance": _tv_distance(observed["changed_file_distribution"], reference["changed_file_distribution"]),
+            "observed_atomic_task_types": sorted(observed_types),
+            "missing_atomic_task_types": sorted(expected_types - observed_types),
+            "unexpected_atomic_task_types": sorted(observed_types - expected_types),
             "calibration_deficits_to_target_size": {
                 "target_sample_size": target_sample_size,
                 "task_count": _deficits(observed["task_count_distribution"], reference["task_count_distribution"], target_sample_size),

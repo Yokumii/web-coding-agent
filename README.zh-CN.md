@@ -47,6 +47,8 @@ prompt 和 exporter 由父仓库统一版本控制，运行产物则与源码分
 - 按阶段记录成本，并设有总预算硬上限
 - forward edit 的 DOM 契约保护：编辑前对已验收 seed 建立逐路由语义 DOM/ARIA surface 基线；每个目标路由最多允许两个 root 变化，所有非目标路由都受保护。该检查独立于截图/像素评分。
 - harness 主导的最小路径引导：每条 UI check 必须声明站内 route。harness 根据静态 HTML 页面、具体的文件系统路由、显式 React Router 映射、源码热点和 import/link 边建立页面归属及 change cone；只开放目标路由本地文件和仅由目标路由共享的文件，跨目标/非目标页共享文件与非目标文件会在工具执行前被拒绝，并记录到 append-only ledger。
+- 0805 全 40 类 Edit 的 typed browser contract：除基础点击/输入/键盘/滚动外，真实 Chromium 还执行 hover、右键、拖拽、内存文件上传、异步 selector 等待和 print/color-scheme 媒体模拟。planner 与执行器共用 fail-closed 校验，坏测试不会伪装成代码 repair。
+- AIR 单次任务生成完整读取最多 48 个源码文件/140K 字符且不静默截断；更大项目明确拒绝并转入工具读取路径，不会把部分上下文伪称为 `all_files_included`。
 
 ### Forward edit 回归保护
 

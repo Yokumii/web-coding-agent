@@ -51,6 +51,11 @@ def main() -> None:
     record: dict[str, object] = {"case_id": args.case_id, "mode": args.mode}
     try:
         files = load_seed_code(args.seed_dir)
+        record["input_contract"] = {
+            "all_files_included": True,
+            "source_file_count": len(files),
+            "source_characters": sum(len(item["code"]) for item in files),
+        }
         client = OpenAICompatibleJSONClient.from_env()
         if args.mode == "initial":
             task_types = tuple(args.task_type)
@@ -85,4 +90,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

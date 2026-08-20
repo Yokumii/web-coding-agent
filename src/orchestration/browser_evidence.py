@@ -11,10 +11,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from src.orchestration.ui_action_contracts import (
+    ActionContractError,
+    validate_ui_action,
+)
+
 
 def _is_invalid_test_contract_error(action: str, exc: Exception) -> bool:
     message = f"{type(exc).__name__}: {exc}"
-    return action == "evaluate" and "SyntaxError" in message
+    return isinstance(exc, ActionContractError) or (
+        action == "evaluate" and "SyntaxError" in message
+    )
 
 
 def _action_settle_ms(step: dict[str, Any], action: str) -> int:
@@ -115,13 +122,26 @@ async def collect_browser_evidence(
                     for step in steps:
                         result: dict[str, Any] = {"action": step.get("action")}
                         try:
+                            validate_ui_action(step)
                             action = str(step.get("action"))
                             if action == "set_viewport":
                                 await page.set_viewport_size({"width": int(step["width"]), "height": int(step["height"])})
                                 result["output"] = {"width": int(step["width"]), "height": int(step["height"])}
                             elif action == "click":
-                                await page.click(str(step["selector"]))
+                                await page.click(
+                                    str(step["selector"]),
+                                    button=str(step.get("button", "left")),
+                                )
                                 result["output"] = "clicked"
+                            elif action == "hover":
+                                await page.hover(str(step["selector"]))
+                                result["output"] = "hovered"
+                            elif action == "drag_and_drop":
+                                await page.drag_and_drop(
+                                    str(step["source_selector"]),
+                                    str(step["target_selector"]),
+                                )
+                                result["output"] = "dragged"
                             elif action == "key_press":
                                 selector = step.get("selector")
                                 if selector:
@@ -141,6 +161,33 @@ async def collect_browser_evidence(
                             elif action == "select_option":
                                 await page.select_option(str(step["selector"]), str(step["value"]))
                                 result["output"] = "selected"
+                            elif action == "set_input_files":
+                                payloads = [
+                                    {
+                                        "name": str(fixture["name"]),
+                                        "mimeType": str(fixture["mime_type"]),
+                                        "buffer": str(fixture["content"]).encode("utf-8"),
+                                    }
+                                    for fixture in step["files"]
+                                ]
+                                await page.set_input_files(str(step["selector"]), payloads)
+                                result["output"] = {
+                                    "uploaded": [str(item["name"]) for item in step["files"]]
+                                }
+                            elif action == "wait_for":
+                                await page.locator(str(step["selector"])).wait_for(
+                                    state=str(step.get("state", "visible")),
+                                    timeout=int(step.get("timeout_ms", action_timeout_ms)),
+                                )
+                                result["output"] = str(step.get("state", "visible"))
+                            elif action == "emulate_media":
+                                options: dict[str, Any] = {}
+                                if "media" in step:
+                                    options["media"] = str(step["media"])
+                                if "color_scheme" in step:
+                                    options["color_scheme"] = str(step["color_scheme"])
+                                await page.emulate_media(**options)
+                                result["output"] = options
                             elif action == "assert_form_valid":
                                 result["output"] = await page.locator(str(step["selector"])).evaluate(
                                     "form => form.checkValidity()"

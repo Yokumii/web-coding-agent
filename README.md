@@ -48,6 +48,8 @@ What is implemented:
 - Per-phase cost tracking with a hard total-budget cap
 - Edit/repair DOM contract guard: a verified seed, each sprint's accepted source, and each renderable non-forward repair source are snapshotted before modification; semantic DOM/ARIA surfaces outside the declared scope must remain unchanged. Multi-page seeds are snapshotted route by route, with at most two mutable roots per target route and every non-target route protected. This is independent of screenshot/pixel scoring.
 - Harness-owned progressive minimal-path guidance: each executable UI check names an exact same-origin route. Static HTML pages, concrete filesystem routes, and explicit literal React Router mappings are converted into page ownership and import/link dependency cones. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine; route-local files are preferred, files shared with non-target routes and off-target files remain closed, existing source cannot be whole-file overwritten, and actual tool outcomes are appended to a ledger.
+- Typed WebCompass browser contracts: the full 40-type 0805 Edit taxonomy has an explicit action-capability profile. Real Chromium execution supports bounded hover, right-click, drag-and-drop, in-memory file upload, asynchronous locator waits, and print/color-scheme media emulation in addition to basic form/keyboard/scroll actions. Planner and executor share one fail-closed validator, so malformed tests are not mislabeled as product repairs.
+- Complete seed context for one-shot AIR task generation: up to 48 source files / 140K characters are included without truncation. Larger projects fail closed and must use the tool-reading harness path; partial context is never advertised as `all_files_included`.
 - Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. New-policy exports require `certified` evidence.
 
 ## Requirements
@@ -243,6 +245,9 @@ subsets. `non_minimal` becomes a repair signal; `invalid_contract` and
 `inconclusive` are evaluation problems and must not be mislabeled as product bugs.
 The full design rationale, 52-paper review, and calibration results are in
 [`docs/harness_research_and_architecture_20260811.md`](docs/harness_research_and_architecture_20260811.md).
+The read-only physical-machine audit of the six-task 0805 release, its 40 Edit
+types / 11 Repair types, observed cost distribution, and remaining parity gaps is in
+[`docs/0805_harness_capability_audit_20260813.md`](docs/0805_harness_capability_audit_20260813.md).
 
 For final-website generation, set `FINAL_PROJECT_MODE=1` or pass
 `--final-project-mode`. The planner chooses a natural Sprint count and the harness

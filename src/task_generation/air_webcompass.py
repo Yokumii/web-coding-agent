@@ -29,6 +29,58 @@ WEBCOMPASS_REPAIR_TYPES = (
     "Missing Attributes",
 )
 
+# Minimum deterministic browser vocabulary needed to verify each edit family
+# observed in the authoritative 0805 release. These are capability profiles,
+# not keyword classifiers and not claims that one action proves full quality.
+WEBCOMPASS_EDIT_ACTION_PROFILES: dict[str, tuple[str, ...]] = {
+    "Accordion": ("click", "key_press", "evaluate"),
+    "Async Form Validation": ("fill", "wait_for", "evaluate"),
+    "Back to Top": ("scroll", "click", "evaluate"),
+    "Breadcrumb Navigation": ("click", "wait_for", "evaluate"),
+    "Carousel": ("click", "key_press", "evaluate"),
+    "Color Picker": ("fill", "evaluate"),
+    "Context Menu": ("click", "evaluate"),
+    "Cookie Consent": ("click", "evaluate"),
+    "Copy to Clipboard": ("click", "evaluate"),
+    "Countdown Timer": ("wait_for", "evaluate"),
+    "Dark Mode Toggle": ("click", "evaluate"),
+    "Data Table": ("fill", "select_option", "click", "evaluate"),
+    "Date Picker": ("fill", "evaluate"),
+    "Drag & Drop Interface": ("drag_and_drop", "evaluate"),
+    "File Upload with Progress": ("set_input_files", "wait_for", "evaluate"),
+    "Image Lightbox": ("click", "key_press", "evaluate"),
+    "Infinite Scroll": ("scroll", "wait_for", "evaluate"),
+    "Keyboard Shortcuts": ("key_press", "evaluate"),
+    "Lazy Loading Images": ("scroll", "wait_for", "evaluate"),
+    "Modal Dialog": ("click", "key_press", "evaluate"),
+    "Multi-step Wizard": ("fill", "select_option", "click", "evaluate"),
+    "Notification Center": ("click", "wait_for", "evaluate"),
+    "Page Transitions": ("click", "wait_for", "evaluate"),
+    "Parallax Scrolling": ("scroll", "evaluate"),
+    "Particle Effects": ("wait_for", "evaluate"),
+    "Print Stylesheet": ("emulate_media", "evaluate"),
+    "Real-time Dashboard": ("wait_for", "evaluate"),
+    "Responsive Navigation": ("set_viewport", "click", "evaluate"),
+    "Rich Text Editor": ("click", "fill", "key_press", "evaluate"),
+    "Search Autocomplete": ("fill", "wait_for", "key_press", "evaluate"),
+    "Shopping Cart": ("click", "evaluate"),
+    "Skeleton Loading": ("wait_for", "evaluate"),
+    "Star Rating": ("click", "key_press", "evaluate"),
+    "Sticky Header": ("scroll", "evaluate"),
+    "Tabs": ("click", "key_press", "evaluate"),
+    "Toast Notifications": ("click", "wait_for", "evaluate"),
+    "Tooltip": ("hover", "evaluate"),
+    "Tree View": ("click", "key_press", "evaluate"),
+    "Undo Redo": ("click", "key_press", "evaluate"),
+    "User Authentication": (
+        "fill",
+        "assert_form_valid",
+        "click",
+        "wait_for",
+        "evaluate",
+    ),
+}
+
 AIR_CONSTRAINT_TYPES = (
     "Inclusion", "Exclusion", "Prior Condition", "Interaction Sequence",
     "Responsive State", "Accessibility", "Preservation", "Visual Integration",
@@ -38,12 +90,17 @@ _SOURCE_SUFFIXES = {".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".vue"}
 _IGNORED_PARTS = {"node_modules", ".git", ".harness", "dist", "build"}
 
 
-def load_seed_code(root: Path, *, max_files: int = 12, max_chars: int = 24_000) -> list[dict[str, str]]:
+class SeedContextBudgetError(ValueError):
+    """A complete seed cannot fit; partial context must never be sent silently."""
+
+
+def load_seed_code(
+    root: Path, *, max_files: int = 48, max_chars: int = 140_000
+) -> list[dict[str, str]]:
     root = root.resolve()
     if not root.is_dir():
         raise ValueError(f"seed directory does not exist: {root}")
     selected: list[dict[str, str]] = []
-    used = 0
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if not path.is_file() or path.suffix.lower() not in _SOURCE_SUFFIXES:
@@ -51,14 +108,17 @@ def load_seed_code(root: Path, *, max_files: int = 12, max_chars: int = 24_000) 
         if any(part.startswith(".") or part in _IGNORED_PARTS for part in relative.parts):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        remaining = max_chars - used
-        if remaining <= 0 or len(selected) >= max_files:
-            break
-        text = text[:remaining]
         selected.append({"path": relative.as_posix(), "code": text})
-        used += len(text)
     if not selected:
         raise ValueError(f"no supported frontend source files under {root}")
+    total_chars = sum(len(item["code"]) for item in selected)
+    if len(selected) > max_files or total_chars > max_chars:
+        raise SeedContextBudgetError(
+            "complete seed exceeds the one-shot context budget: "
+            f"{len(selected)} supported files and {total_chars} source characters; "
+            f"limits are {max_files} files and {max_chars} characters. "
+            "Use the tool-reading harness path instead of constructing a partial sample."
+        )
     return selected
 
 

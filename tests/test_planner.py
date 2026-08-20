@@ -225,6 +225,42 @@ def test_planner_rejects_invalid_action_settle_time(tmp_path: Path):
         _validate_planning_bundle(file_comm)
 
 
+def test_planner_rejects_unsupported_browser_action_before_evaluation(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Use unsupported action.",
+        "expected_result": "State changes.", "critical": True, "category": "interaction",
+        "actions": [
+            {"action": "teleport", "selector": "#control"},
+            {"action": "evaluate", "expression": "true"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="unsupported action 'teleport'"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_unsafe_upload_fixture_contract(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Upload fixture.",
+        "expected_result": "File is accepted.", "critical": True, "category": "interaction",
+        "actions": [
+            {
+                "action": "set_input_files",
+                "selector": "#upload",
+                "files": [{"name": "../secret.txt", "mime_type": "text/plain", "content": "x"}],
+            },
+            {"action": "evaluate", "expression": "true"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="safe base name"):
+        _validate_planning_bundle(file_comm)
+
+
 @pytest.mark.anyio
 async def test_planner_initializes_accepted_sprints_after_successful_run(
     monkeypatch, tmp_path: Path
