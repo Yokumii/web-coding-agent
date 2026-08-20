@@ -21,7 +21,7 @@ export NO_PROXY="idealab.alibaba-inc.com,alibaba-inc.com,api.deepseek.com,localh
 export SSL_NO_VERIFY="${SSL_NO_VERIFY:-1}"
 
 agent_root="$(cd "$(dirname "$0")/.." && pwd)"
-data_root="${WEB_CODING_DATA_ROOT:-$(cd "$agent_root/.." && pwd)}"
+data_root="${WEB_CODING_DATA_ROOT:-$agent_root}"
 run_id="$(date +%Y%m%dT%H%M%S)"
 log_dir="$data_root/logs/agentic/air_task_generation/$case_id/$run_id"
 mkdir -p "$log_dir"

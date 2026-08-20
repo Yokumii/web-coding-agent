@@ -66,7 +66,7 @@ export EVALUATOR_VISION_MAX_RETRIES=0
 case_id="$(basename "$workdir")"
 run_id="$(date +%Y%m%dT%H%M%S)"
 agent_root="$(cd "$(dirname "$0")/.." && pwd)"
-data_root="${WEB_CODING_DATA_ROOT:-$(cd "$agent_root/.." && pwd)}"
+data_root="${WEB_CODING_DATA_ROOT:-$agent_root}"
 log_dir="$data_root/logs/agentic/forward_harness_deepseek/$case_id/$run_id"
 mkdir -p "$log_dir"
 printf 'status=started\nphase=%s\nworkdir=%s\nprompt_file=%s\nmodel=%s\n' \

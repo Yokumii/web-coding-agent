@@ -14,16 +14,17 @@
 
 当前 harness **不包含后端生成与后端运行时**。
 
-## 在 Monorepo 中的职责
+## 项目职责
 
-在 `WebCoding_Data` 内，本子项目是**正向 agentic 数据 producer**。源码、测试、
-prompt 和 exporter 由父仓库统一版本控制，运行产物则与源码分离：
+本仓库是独立的**正向 agentic 数据 producer**。源码、测试、prompt 与 exporter
+在这里单独版本化，运行产物默认留在 Git 之外：
 
-- `../runs/agentic/`：任务 workdir、checkpoint、trace、截图和导出轨迹
-- `../logs/agentic/`：launcher、API probe 与 seed 同步的持久化日志
+- `./runs/agentic/`：任务 workdir、checkpoint、trace、截图和导出轨迹
+- `./logs/agentic/`：launcher、API probe 与 seed 同步的持久化日志
 
-同级 `construct/` 保持为逆向/受控 producer。两条路线共享发布级审计与 schema，
-但必须保留不同的 provenance 标签。
+需要把大规模产物放到外部数据盘时，设置 `WEB_CODING_DATA_ROOT`。数据抓取、
+逆向/受控构造与 release 组装可以保留在其他仓库；双方通过显式路径和 schema
+衔接，不再依赖固定的父子或同级目录布局。
 
 ## 状态
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATA_DIR="$(cd "$AGENT_DIR/.." && pwd)"
+DATA_DIR="${WEB_CODING_DATA_ROOT:-$AGENT_DIR}"
 RUN_ID="20260813_v3"
 CASE_FROM="${CASE_FROM:-1}"
 CASE_TO="${CASE_TO:-2}"

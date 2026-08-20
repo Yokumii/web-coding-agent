@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATA_DIR="$(cd "$AGENT_DIR/.." && pwd)"
+DATA_DIR="${WEB_CODING_DATA_ROOT:-$AGENT_DIR}"
 OUTPUT="$DATA_DIR/runs/agentic/minimality_calibration/20260811_v1/records.jsonl"
 LOG_DIR="$DATA_DIR/logs/minimality_calibration/20260811_v1"
 mkdir -p "$LOG_DIR"

@@ -14,17 +14,19 @@ The current implementation is intentionally **frontend-only**:
 
 There is **no backend generation or backend runtime** in the current harness.
 
-## Monorepo role
+## Project role
 
-Inside `WebCoding_Data`, this package is the **agentic/forward data producer**.
-Its source, tests, prompts, and exporter are versioned with the parent monorepo, while
-runtime artifacts live outside this source directory:
+This standalone repository is the **agentic/forward data producer**. Source, tests,
+prompts, and exporters are versioned here, while generated runtime artifacts are kept
+out of Git by default:
 
-- `../runs/agentic/`: task workdirs, checkpoints, traces, screenshots, and exported trajectories
-- `../logs/agentic/`: persistent launcher, API probe, and seed-sync logs
+- `./runs/agentic/`: task workdirs, checkpoints, traces, screenshots, and exported trajectories
+- `./logs/agentic/`: persistent launcher, API probe, and seed-sync logs
 
-The sibling `construct/` pipeline remains the reverse/controlled producer. Both routes
-share release-level audits and schemas but retain distinct provenance labels.
+Set `WEB_CODING_DATA_ROOT` when those artifacts should live on an external data disk.
+Dataset acquisition, reverse/controlled construction, and release assembly can remain
+in separate repositories; integrations use explicit paths and schemas rather than a
+required sibling-directory layout.
 
 ## Status
 

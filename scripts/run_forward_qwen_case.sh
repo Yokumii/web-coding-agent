@@ -55,7 +55,7 @@ fi
 case_id="$(basename "$workdir")"
 run_id="$(date +%Y%m%dT%H%M%S)"
 agent_root="$(cd "$(dirname "$0")/.." && pwd)"
-data_root="${WEB_CODING_DATA_ROOT:-$(cd "$agent_root/.." && pwd)}"
+data_root="${WEB_CODING_DATA_ROOT:-$agent_root}"
 log_root="${WEB_CODING_AGENT_LOG_ROOT:-$data_root/logs/agentic}"
 log_dir="$log_root/forward_harness/${case_id}/${run_id}"
 mkdir -p "$log_dir"
