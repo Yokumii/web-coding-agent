@@ -19,7 +19,12 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     monkeypatch.setenv("DESIGN_IMAGE_SIZE", "1536x1024")
     monkeypatch.setenv("DESIGN_IMAGE_TIMEOUT_SECONDS", "222")
     monkeypatch.setenv("MAX_BUDGET_USD", "42.5")
+    monkeypatch.setenv("PLANNER_BUDGET_USD", "1.5")
+    monkeypatch.setenv("GENERATOR_BUDGET_USD", "9.5")
+    monkeypatch.setenv("EVALUATOR_BUDGET_USD", "2.5")
     monkeypatch.setenv("MAX_ROUNDS", "7")
+    monkeypatch.setenv("EDIT_MAX_ROUNDS", "12")
+    monkeypatch.setenv("PLANNER_MAX_TURNS", "23")
     monkeypatch.setenv("FRONTEND_PORT", "4321")
     monkeypatch.setenv("PLAYWRIGHT_HEADLESS", "true")
     monkeypatch.setenv("FINAL_PROJECT_MODE", "true")
@@ -45,7 +50,12 @@ def test_harness_config_uses_model_environment_variables(monkeypatch):
     assert config.design_image_size == "1536x1024"
     assert config.design_image_timeout_seconds == 222
     assert config.max_budget_usd == 42.5
+    assert config.planner_budget_usd == 1.5
+    assert config.generator_budget_usd == 9.5
+    assert config.evaluator_budget_usd == 2.5
     assert config.max_rounds == 7
+    assert config.edit_max_rounds == 12
+    assert config.planner_max_turns == 23
     assert config.frontend_port == 4321
     assert config.playwright_headless is True
     assert config.final_project_mode is True
@@ -70,3 +80,9 @@ def test_harness_config_playwright_headless_accepts_falsey_env(monkeypatch):
     config = HarnessConfig()
 
     assert config.playwright_headless is False
+
+
+def test_edit_round_budget_defaults_to_ten(monkeypatch):
+    monkeypatch.delenv("EDIT_MAX_ROUNDS", raising=False)
+
+    assert HarnessConfig().edit_max_rounds == 10

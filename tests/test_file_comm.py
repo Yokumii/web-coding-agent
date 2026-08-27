@@ -311,10 +311,22 @@ def test_reset_keeps_accepted_edit_baseline_but_removes_stale_edit_scope():
         comm = FileComm(Path(tmp) / ".harness")
         baseline = comm.dir / "edit_dom_baseline.json"
         stale_scope = comm.dir / "edit_scope_round_1.json"
+        stale_plan = comm.dir / "minimal_path_plan_round_1.json"
+        stale_ledger = comm.dir / "minimal_path_ledger_round_1.jsonl"
+        stale_policy = comm.dir / "minimality_policy.json"
+        stale_build_map = comm.dir / "round_build_map.json"
         baseline.write_text('{"roots": []}')
         stale_scope.write_text('{"allowed_root_keys": ["main"]}')
+        stale_plan.write_text('{"status": "ready"}')
+        stale_ledger.write_text('{"decision": "allow"}\n')
+        stale_policy.write_text('{"enabled": true}')
+        stale_build_map.write_text('{"1": {}}')
 
         comm.reset_run_artifacts()
 
         assert baseline.exists()
         assert not stale_scope.exists()
+        assert not stale_plan.exists()
+        assert not stale_ledger.exists()
+        assert not stale_policy.exists()
+        assert not stale_build_map.exists()

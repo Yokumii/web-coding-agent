@@ -5,6 +5,7 @@ import asyncio
 from pathlib import Path
 
 from src.config import (
+    DEFAULT_EDIT_MAX_ROUNDS,
     DEFAULT_FRONTEND_PORT,
     DEFAULT_MAX_BUDGET_USD,
     DEFAULT_MAX_ROUNDS,
@@ -34,6 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Max build-evaluate cycles (default: MAX_ROUNDS env or "
             f"{DEFAULT_MAX_ROUNDS})"
+        ),
+    )
+    parser.add_argument(
+        "--edit-max-rounds",
+        type=int,
+        default=None,
+        help=(
+            "Maximum build-evaluate cycles for one Edit transaction. Passing stops "
+            "immediately; the default is EDIT_MAX_ROUNDS or "
+            f"{DEFAULT_EDIT_MAX_ROUNDS}."
         ),
     )
     parser.add_argument(
@@ -124,6 +135,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--task-mode",
+        choices=("auto", "generate", "edit"),
+        default="auto",
+        help=(
+            "Execution contract. edit preserves an existing frontend, freezes its Git "
+            "baseline, and enables route/file/DOM protection; auto recognizes prepared seeds."
+        ),
+    )
+    parser.add_argument(
+        "--input",
+        dest="input_paths",
+        action="append",
+        type=Path,
+        default=[],
+        help="User-provided reference input (repeatable; images and bounded text/source files).",
+    )
+    parser.add_argument(
+        "--target-route",
+        dest="target_routes",
+        action="append",
+        default=[],
+        help="Exact route allowed to change in Edit mode (repeatable).",
+    )
+    parser.add_argument(
         "--final-project-mode",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -154,6 +189,7 @@ def build_config(args: argparse.Namespace) -> HarnessConfig:
     arg_to_config = {
         "max_budget": "max_budget_usd",
         "max_rounds": "max_rounds",
+        "edit_max_rounds": "edit_max_rounds",
         "planner_model": "planner_model",
         "generator_model": "generator_model",
         "evaluator_model": "evaluator_model",
@@ -182,6 +218,9 @@ def cli() -> None:
         plan_only=args.plan_only,
         resume=args.resume,
         keep_frontend=args.keep_frontend,
+        task_mode=args.task_mode,
+        input_paths=args.input_paths,
+        target_routes=args.target_routes,
     ))
 
 

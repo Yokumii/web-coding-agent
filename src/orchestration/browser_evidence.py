@@ -1,19 +1,23 @@
 """Execute planner-authored browser contracts before LLM evaluation.
 
-This layer does no semantic grading: it faithfully records whether the planned
-actions ran in a real Playwright page.  The evaluator remains responsible for
-interpreting the observed result and describing a repair.
+This layer performs bounded deterministic grading over real Playwright evidence.
+Reproduced failures can enter Repair directly without a paid semantic judge.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from src.orchestration.ui_action_contracts import (
+    ASSERTION_UI_ACTIONS,
     ActionContractError,
+    TYPED_ASSERTION_ACTIONS,
     validate_ui_action,
+    validate_ui_action_sequence,
 )
 
 
@@ -32,6 +36,108 @@ def _action_settle_ms(step: dict[str, Any], action: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 5_000:
         raise ValueError("settle_ms must be an integer from 0 to 5000")
     return value
+
+
+def _matches(actual: Any, expected: Any, mode: str = "exact") -> bool:
+    actual_text = "" if actual is None else str(actual)
+    expected_text = "" if expected is None else str(expected)
+    return expected_text in actual_text if mode == "contains" else actual_text == expected_text
+
+
+def _evidence_route(actions: list[dict[str, Any]]) -> list[str]:
+    routes: list[str] = ["real_browser"]
+    kinds = {str(item.get("action", "")) for item in actions if isinstance(item, dict)}
+    if kinds & {"assert_aria", "assert_focus"}:
+        routes.append("ax_semantics")
+    if kinds & {"assert_property", "assert_storage_value", "assert_url", "assert_value"}:
+        routes.append("internal_state")
+    if kinds & TYPED_ASSERTION_ACTIONS:
+        routes.append("dom")
+    return routes
+
+
+def _aria_snapshot_root(snapshot: str) -> tuple[str | None, str | None]:
+    """Parse the root role/name from Playwright's harness-owned ARIA snapshot."""
+    first = next((line.strip() for line in snapshot.splitlines() if line.strip()), "")
+    match = re.match(r'^-\s+([^\s:"]+)(?:\s+("(?:\\.|[^"])*"))?', first)
+    if not match:
+        return None, None
+    name: str | None = None
+    if match.group(2):
+        try:
+            name = str(json.loads(match.group(2)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            name = match.group(2).strip('"')
+    return match.group(1), name
+
+
+async def _execute_typed_assertion(
+    *, page: Any, step: dict[str, Any], console_errors: list[str]
+) -> tuple[bool, dict[str, Any]]:
+    """Execute one bounded assertion without running planner-authored JavaScript."""
+    action = str(step["action"])
+    selector = str(step.get("selector", ""))
+    locator = page.locator(selector) if selector else None
+    expected = step.get("value")
+    actual: Any
+    aria_snapshot: str | None = None
+
+    if action == "assert_visible":
+        actual = await locator.is_visible()
+        ok = actual is True
+    elif action == "assert_hidden":
+        actual = await locator.is_hidden()
+        ok = actual is True
+    elif action == "assert_text":
+        actual = await locator.text_content()
+        ok = _matches(actual, expected, str(step.get("match", "exact")))
+    elif action == "assert_value":
+        actual = await locator.input_value()
+        ok = _matches(actual, expected)
+    elif action == "assert_count":
+        actual = await locator.count()
+        expected = int(step["count"])
+        ok = actual == expected
+    elif action == "assert_property":
+        name = str(step["name"])
+        actual = await locator.evaluate("(element, key) => element[key]", name)
+        ok = actual == expected
+    elif action == "assert_url":
+        actual = urlsplit(page.url).path if str(expected).startswith("/") else page.url
+        ok = _matches(actual, expected, str(step.get("match", "exact")))
+    elif action == "assert_attribute":
+        actual = await locator.get_attribute(str(step["name"]))
+        ok = _matches(actual, expected)
+    elif action == "assert_aria":
+        attribute = str(step["attribute"])
+        if attribute in {"accessible_name", "role"}:
+            aria_snapshot = await locator.aria_snapshot()
+            role, accessible_name = _aria_snapshot_root(aria_snapshot)
+            actual = accessible_name if attribute == "accessible_name" else role
+        else:
+            actual = await locator.get_attribute(attribute)
+        ok = _matches(actual, str(expected).lower() if isinstance(expected, bool) else expected)
+    elif action == "assert_focus":
+        actual = await locator.evaluate("element => element === document.activeElement")
+        ok = actual is True
+    elif action == "assert_storage_value":
+        storage = str(step["storage"])
+        actual = await page.evaluate(
+            "([kind, key]) => (kind === 'local' ? localStorage : sessionStorage).getItem(key)",
+            [storage, str(step["key"])],
+        )
+        ok = _matches(actual, expected, str(step.get("match", "exact")))
+    elif action == "assert_no_console_errors":
+        actual = list(console_errors)
+        expected = []
+        ok = not actual
+    else:  # pragma: no cover - caller and validator keep this unreachable
+        raise ActionContractError(f"unsupported typed assertion {action!r}")
+
+    output = {"actual": actual, "expected": expected}
+    if aria_snapshot is not None:
+        output["aria_snapshot"] = aria_snapshot
+    return ok, output
 
 
 def _same_origin_route_url(app_url: str, route: str) -> str:
@@ -67,7 +173,7 @@ async def collect_browser_evidence(
     # actions.  There is nothing to observe, so do not open a real browser (or
     # accidentally turn an intentionally stubbed app stack into a connection
     # failure).  New planner output is validated separately and must contain
-    # one final assertion per check.
+    # a bounded set of related assertions ending in a typed assertion.
     if not checks:
         payload = {"app_url": app_url, "checks": records}
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,8 +181,17 @@ async def collect_browser_evidence(
         return payload
     async with async_playwright() as playwright:
         browser = await launch_chromium(playwright, headless=headless)
+        page = None
         try:
             page = await browser.new_page(viewport={"width": 1280, "height": 812})
+            console_errors: list[str] = []
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
             # A contract miss is evidence about this one UI check, not a reason
             # to burn the whole evaluation budget waiting on Playwright's 30s
             # default for every absent selector.
@@ -85,16 +200,26 @@ async def collect_browser_evidence(
             # a deliberate navigation when a multi-page contract changes route.
             active_route: str | None = None
             for check in checks:
+                console_error_start = len(console_errors)
                 steps = check.get("actions") if isinstance(check, dict) else []
                 route = str(check.get("route", "/"))
                 item: dict[str, Any] = {
                     "check_id": check.get("id"),
                     "route": route,
                     "steps": [],
+                    "evidence_route": _evidence_route(steps if isinstance(steps, list) else []),
                 }
                 try:
                     route_url = _same_origin_route_url(app_url, route)
-                    if route != active_route:
+                    current_location = urlsplit(page.url) if page.url else None
+                    target_location = urlsplit(route_url)
+                    location_drifted = (
+                        current_location is None
+                        or current_location.path != target_location.path
+                        or current_location.query != target_location.query
+                        or current_location.fragment != target_location.fragment
+                    )
+                    if route != active_route or location_drifted:
                         await page.goto(
                             route_url,
                             wait_until="domcontentloaded",
@@ -117,6 +242,17 @@ async def collect_browser_evidence(
                 if not isinstance(steps, list) or not steps:
                     item["status"] = "no_action_contract"
                     records.append(item)
+                    continue
+                try:
+                    validate_ui_action_sequence(steps)
+                except ActionContractError as exc:
+                    item.update({
+                        "status": "invalid_test_contract",
+                        "contract_error": f"{type(exc).__name__}: {exc}",
+                    })
+                    records.append(item)
+                    if fail_fast:
+                        break
                     continue
                 try:
                     for step in steps:
@@ -155,6 +291,12 @@ async def collect_browser_evidence(
                                     for _ in range(int(step.get("count", 1))):
                                         await page.keyboard.press(key)
                                     result["output"] = f"pressed {key} x{int(step.get('count', 1))}"
+                            elif action == "reload":
+                                await page.reload(
+                                    wait_until="domcontentloaded",
+                                    timeout=15_000,
+                                )
+                                result["output"] = "reloaded"
                             elif action == "fill":
                                 await page.fill(str(step["selector"]), str(step["value"]))
                                 result["output"] = "filled"
@@ -193,6 +335,14 @@ async def collect_browser_evidence(
                                     "form => form.checkValidity()"
                                 )
                                 result["test_precondition"] = True
+                            elif action in TYPED_ASSERTION_ACTIONS:
+                                assertion_ok, assertion_output = await _execute_typed_assertion(
+                                    page=page,
+                                    step=step,
+                                    console_errors=console_errors[console_error_start:],
+                                )
+                                result["output"] = assertion_output
+                                result["ok"] = assertion_ok
                             elif action == "scroll":
                                 requested_y = int(step.get("y", 0))
                                 await page.evaluate("y => window.scrollTo(0, y)", requested_y)
@@ -220,11 +370,12 @@ async def collect_browser_evidence(
                                 await page.wait_for_timeout(settle_ms)
                             # `evaluate` is the assertion operation in a browser
                             # contract. A false expression is a reproduced UI failure.
-                            result["ok"] = (
-                                False if action == "scroll" and result.get("test_precondition")
-                                else bool(result["output"]) if action in {"evaluate", "assert_form_valid"}
-                                else True
-                            )
+                            if "ok" not in result:
+                                result["ok"] = (
+                                    False if action == "scroll" and result.get("test_precondition")
+                                    else bool(result["output"]) if action in ASSERTION_UI_ACTIONS | {"assert_form_valid"}
+                                    else True
+                                )
                         except Exception as exc:
                             result.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
                             if _is_invalid_test_contract_error(action, exc):
@@ -245,8 +396,15 @@ async def collect_browser_evidence(
                 if fail_fast and item["status"] != "ok":
                     break
         finally:
-            await page.close()
-            await browser.close()
+            if page is not None:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            try:
+                await asyncio.wait_for(browser.close(), timeout=3)
+            except (asyncio.TimeoutError, Exception):
+                pass
     payload = {"app_url": app_url, "checks": records}
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return payload

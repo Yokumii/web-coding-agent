@@ -12,6 +12,7 @@ from src.agents.openai_tools import OpenAIToolExecutor, openai_tool_schemas
 from src.config import HarnessConfig
 from src.prompts.final_chance import FINAL_CHANCE_TURNS, final_chance_prompt
 from src.orchestration.pricing import estimate_cost_usd
+from src.orchestration.task_inputs import openai_user_content
 
 
 @dataclass
@@ -140,6 +141,52 @@ def _is_finalization_command(command: str) -> bool:
     ))
 
 
+def _historical_trace_usage(trace_path: Path | None) -> dict[str, int]:
+    """Sum billable attempts already present in an append-only phase trace.
+
+    Older traces stored only a per-attempt ``cumulative_usage`` field. Newer
+    traces also store ``attempt_usage`` so a resumed run can expose an overall
+    cumulative total without making a future resume count that total twice.
+    """
+    total = {"input_tokens": 0, "output_tokens": 0}
+    if trace_path is None or not trace_path.is_file():
+        return total
+    current: dict[str, int] | None = None
+
+    def add_current() -> None:
+        nonlocal current
+        if current is None:
+            return
+        total["input_tokens"] += current["input_tokens"]
+        total["output_tokens"] += current["output_tokens"]
+        current = None
+
+    try:
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            kind = event.get("event")
+            if kind == "run_start":
+                add_current()
+                current = {"input_tokens": 0, "output_tokens": 0}
+                continue
+            if kind not in {"usage", "run_error"} or current is None:
+                continue
+            raw = event.get("attempt_usage") or event.get("cumulative_usage")
+            if isinstance(raw, dict):
+                current = {
+                    "input_tokens": int(raw.get("input_tokens") or 0),
+                    "output_tokens": int(raw.get("output_tokens") or 0),
+                }
+            if kind == "run_error":
+                add_current()
+        add_current()
+    except (OSError, ValueError, TypeError, AttributeError):
+        # A malformed historical trace is evidence failure, not permission to
+        # silently reset spend. Refuse to begin the next billable request.
+        return {"input_tokens": 10**18, "output_tokens": 10**18}
+    return total
+
+
 class OpenAIHTTPClient:
     def __init__(self, config: HarnessConfig, timeout: float): self.config, self.timeout = config, timeout
     async def complete(self, **payload):
@@ -207,7 +254,8 @@ class OpenAIHTTPClient:
 async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path, model: str,
     system_prompt: str, max_turns: int, allow_bash: bool, allow_playwright: bool = False,
     bash_profile: str = "full", stop_hooks=None, trace_path: Path | None = None,
-    client=None, limits: OpenAIRunLimits | None = None, mutation_policy=None):
+    client=None, limits: OpenAIRunLimits | None = None, mutation_policy=None,
+    image_paths: list[Path] | None = None):
     limits = limits or OpenAIRunLimits(phase_timeout=config.agent_phase_timeout_seconds,
         request_timeout=config.agent_request_timeout_seconds, max_tool_calls=config.agent_max_tool_calls)
     client = client or OpenAIHTTPClient(config, limits.request_timeout)
@@ -218,10 +266,21 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
         exploration_limit=limits.evaluation_exploration_limit,
         browser_evaluate_limit=limits.evaluation_browser_evaluate_limit,
     ) if allow_playwright else None
+    if allow_playwright:
+        phase_name = "evaluator"
+        phase_budget_usd = config.evaluator_budget_usd
+    elif allow_bash:
+        phase_name = "generator"
+        phase_budget_usd = config.generator_budget_usd
+    else:
+        phase_name = "planner"
+        phase_budget_usd = config.planner_budget_usd
 
     async def loop():
         started = time.monotonic(); api_ms = 0; calls = 0; no_progress = 0
-        usage = {"input_tokens": 0, "output_tokens": 0}; last_text = ""
+        prior_usage = _historical_trace_usage(trace_path)
+        usage = dict(prior_usage)
+        attempt_usage = {"input_tokens": 0, "output_tokens": 0}; last_text = ""
         last_signature = None; consecutive_calls = 0; last_error = None; consecutive_errors = 0
         native_guidance = (
             "\n\nNative harness tools: use write_file to create or overwrite files and apply_patch "
@@ -238,17 +297,57 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                 "Browser exploration and deep browser_evaluate diagnostics have hard budgets. When the harness "
                 "announces finalization mode, stop investigating immediately and write the required artifacts."
             )
-        messages = [{"role": "system", "content": system_prompt + native_guidance}, {"role": "user", "content": prompt}]
+        initial_content: str | list[dict[str, Any]] = prompt
+        if image_paths:
+            initial_content = openai_user_content(prompt, image_paths)
+        messages = [
+            {"role": "system", "content": system_prompt + native_guidance},
+            {"role": "user", "content": initial_content},
+        ]
         validation_retries = 0
         if trace_path:
             trace_path.parent.mkdir(parents=True, exist_ok=True)
         trace = trace_path.open("a") if trace_path else None
+        if trace:
+            trace.write(json.dumps({
+                "event": "run_start",
+                "model": model,
+                "prompt": prompt,
+                "image_paths": [str(path) for path in (image_paths or [])],
+                "allow_bash": allow_bash,
+                "allow_playwright": allow_playwright,
+                "prior_usage": prior_usage,
+            }, ensure_ascii=False) + "\n")
+            trace.flush()
         try:
             total_turn_limit = min(
                 max_turns + FINAL_CHANCE_TURNS,
                 limits.max_tool_calls + 20,
             )
             for _ in range(total_turn_limit):
+                current_cost_usd = estimate_cost_usd(model, usage)
+                if current_cost_usd >= phase_budget_usd:
+                    blocked_reason = None
+                    for hook in stop_hooks or []:
+                        verdict = await hook({}, None, {})
+                        if verdict.get("decision") == "block":
+                            blocked_reason = verdict.get("reason") or verdict.get("stopReason")
+                            break
+                        if verdict.get("decision") == "complete":
+                            completed = OpenAIResult(
+                                last_text,
+                                [{"type": "text", "text": last_text}],
+                                usage,
+                                {"estimated_cost_usd": current_cost_usd},
+                                int((time.monotonic() - started) * 1000),
+                                api_ms,
+                            )
+                            return completed, current_cost_usd, last_text, []
+                    detail = f": {blocked_reason}" if blocked_reason else ""
+                    raise RuntimeError(
+                        f"{phase_name} cost budget exhausted at ${current_cost_usd:.6f} "
+                        f"(limit ${phase_budget_usd:.6f}){detail}"
+                    )
                 messages = _compact_messages(messages, config.openai_recent_messages)
                 turns_used = _ + 1
                 final_chance = turns_used > max_turns
@@ -273,7 +372,28 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                 response = await asyncio.wait_for(client.complete(model=model, messages=messages,
                     tools=openai_tool_schemas(allow_bash=allow_bash, allow_playwright=allow_playwright), tool_choice="auto"), limits.request_timeout)
                 api_ms += int((time.monotonic()-t)*1000)
-                raw_usage = response.get("usage", {}); usage["input_tokens"] += raw_usage.get("prompt_tokens", 0); usage["output_tokens"] += raw_usage.get("completion_tokens", 0)
+                raw_usage = response.get("usage", {})
+                request_input_tokens = raw_usage.get(
+                    "prompt_tokens", raw_usage.get("input_tokens", 0)
+                )
+                request_output_tokens = raw_usage.get(
+                    "completion_tokens", raw_usage.get("output_tokens", 0)
+                )
+                attempt_usage["input_tokens"] += request_input_tokens
+                attempt_usage["output_tokens"] += request_output_tokens
+                usage["input_tokens"] += request_input_tokens
+                usage["output_tokens"] += request_output_tokens
+                if trace:
+                    trace.write(json.dumps({
+                        "event": "usage",
+                        "request_usage": raw_usage,
+                        "attempt_usage": attempt_usage,
+                        "cumulative_usage": usage,
+                        "estimated_cost_usd": estimate_cost_usd(model, usage),
+                        "phase": phase_name,
+                        "phase_budget_usd": phase_budget_usd,
+                    }, ensure_ascii=False) + "\n")
+                    trace.flush()
                 msg = response["choices"][0]["message"]
                 last_text = msg.get("content") or last_text
                 messages.append(msg)
@@ -287,10 +407,29 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                             blocked_reason = verdict.get("reason") or verdict.get("stopReason")
                             break
                     if blocked_reason:
+                        if trace:
+                            trace.write(json.dumps({
+                                "event": "completion_validation",
+                                "decision": "block",
+                                "reason": blocked_reason,
+                                "validation_retry": validation_retries + 1,
+                            }, ensure_ascii=False) + "\n")
+                            trace.flush()
                         validation_retries += 1
                         if validation_retries > 3:
                             raise RuntimeError("completion validation failed after 3 corrections: " + blocked_reason)
-                        messages.append({"role":"user", "content":"Harness completion validation failed. Fix the files, then finish again:\n" + blocked_reason})
+                        correction = (
+                            "Harness completion validation failed. Fix only the stated gap, then finish again. "
+                            "Preserve already-written source and do not restart or redesign the implementation.\n"
+                            + blocked_reason
+                        )
+                        if "commit" in blocked_reason.lower():
+                            correction += (
+                                "\nThe source implementation already exists. Do not rewrite it. Run one "
+                                "focused validation, update required harness logs if needed, create the "
+                                "required atomic commit, and stop."
+                            )
+                        messages.append({"role":"user", "content":correction})
                         continue
                     result = OpenAIResult(last_text, [{"type":"text","text":last_text}], usage, {}, int((time.monotonic()-started)*1000), api_ms)
                     return result, estimate_cost_usd(model, usage), last_text, []
@@ -400,6 +539,38 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                             if verdict.get("decision") == "complete":
                                 completed = OpenAIResult(last_text, [{"type":"text","text":last_text}], usage, {}, int((time.monotonic()-started)*1000), api_ms)
                                 return completed, estimate_cost_usd(model, usage), last_text, []
+                            # Planner bundles conventionally finish with
+                            # progress.md. Feed aggregate validation back at
+                            # that boundary instead of withholding it until all
+                            # model turns have been consumed by blind rewrites.
+                            if (
+                                verdict.get("decision") == "block"
+                                and phase_name == "planner"
+                                and fn["name"] in {"write_file", "apply_patch"}
+                                and (
+                                    str(args.get("path", "")).endswith(".harness/progress.md")
+                                    or final_chance
+                                )
+                            ):
+                                reason = verdict.get("reason") or verdict.get("stopReason")
+                                if reason:
+                                    if trace:
+                                        trace.write(json.dumps({
+                                            "event": "completion_validation",
+                                            "decision": "block",
+                                            "reason": reason,
+                                            "feedback_boundary": "planner_progress",
+                                        }, ensure_ascii=False) + "\n")
+                                        trace.flush()
+                                    messages.append({
+                                        "role": "user",
+                                        "content": (
+                                            "Harness validated the completed planning bundle and found "
+                                            "the following exact gaps. Edit only the named invalid artifacts; "
+                                            "do not rewrite already-valid planning files.\n" + str(reason)
+                                        ),
+                                    })
+                                break
             # A tool-using model sometimes completes the filesystem work and
             # commit but never emits a final text turn. Preserve that valid
             # trajectory when the same completion hooks approve it.
@@ -412,7 +583,28 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
             if blocked_reason is None:
                 result = OpenAIResult(last_text, [{"type":"text","text":last_text}], usage, {}, int((time.monotonic()-started)*1000), api_ms)
                 return result, estimate_cost_usd(model, usage), last_text, []
+            if trace:
+                trace.write(json.dumps({
+                    "event": "completion_validation",
+                    "decision": "block",
+                    "reason": blocked_reason,
+                    "feedback_boundary": "turn_limit",
+                }, ensure_ascii=False) + "\n")
+                trace.flush()
             raise RuntimeError("maximum agent turns exceeded: " + blocked_reason)
+        except BaseException as exc:
+            if trace:
+                trace.write(json.dumps({
+                    "event": "run_error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "attempt_usage": attempt_usage,
+                    "cumulative_usage": usage,
+                    "estimated_cost_usd": estimate_cost_usd(model, usage),
+                    "phase": phase_name,
+                }, ensure_ascii=False) + "\n")
+                trace.flush()
+            raise
         finally:
             if trace: trace.close()
             try:

@@ -37,8 +37,8 @@ You are a senior product planner. Your job is to take a short user prompt \
    should normally use 1 sprint; use 2-4 only when the original request contains genuinely
    separable user-visible milestones. Do not create extra sprints merely to make the plan look
    ambitious. Each sprint MUST be a single demoable user-visible behavior path (a "vertical slice").
-   Hard caps: at most 5 deliverables and at most \
-   5 exit_criteria per sprint. If a milestone is naturally larger, split it — e.g., \
+   Hard caps: at most 10 concise deliverables and at most \
+   10 concise exit_criteria per sprint. If a milestone is naturally larger, split it — e.g., \
    "chart rendering" and "chart interactions" become two sprints, not one. Distinct \
    interaction primitives (pan, scroll-zoom, pinch-zoom) are independent items: split \
    across sprints when they don't share implementation, or list each as its own \
@@ -156,6 +156,15 @@ Each sprint entry must include:
 - `deliverables`
 - `exit_criteria`
 
+For an explicit Edit, the single Sprint must also include:
+
+- `requirement_changes`: each item has `requirement_id`, `relation`
+  (`add`, `refine`, `replace`, or `withdraw`), `prior_requirement_ids`, and `rationale`
+- `impact_tags`: concise component/state/route responsibility labels used to select regressions
+- `unresolved_conflicts`: conflicts that require upstream resolution; do not silently discard an old requirement
+- `visual_evidence`: `required`, `conditional`, or `not_required`
+- `visual_evidence_reason`: why DOM/AX/state evidence is sufficient or why visual review is needed
+
 Sprints must be dependency-ordered and each sprint should represent one coherent user-visible milestone.
 
 ## `ui_verification_plan.json`
@@ -175,13 +184,23 @@ Each check must include:
 - `expected_result`
 - `critical`
 - `category`
+- For an explicit Edit, `requirement_id` and non-empty `impact_tags` linking the
+  check to the requirement and affected component/state responsibility.
 - `route`: the exact same-origin browser pathname where this check starts,
   such as `/`, `/catalog`, or `/settings.html`. Never write a full URL,
   protocol-relative URL, query string, fragment, or parent-directory segment.
+- `fixtures`: normally omitted or an empty array. For a filter/search over
+  pre-existing static content, list every exact title/label literal used by the
+  actions. These literals become generator obligations. Never invent a filter
+  literal without declaring it here, and do not use fixtures for content that
+  the same check creates through a form submission.
 - `actions`: an ordered, executable browser contract for this check. Each item
   is an object with `action` (`set_viewport`, `click`, `hover`, `drag_and_drop`,
-  `fill`, `select_option`, `set_input_files`, `key_press`, `scroll`, `wait_for`,
-  `emulate_media`, `assert_form_valid`, or `evaluate`) plus only the fields that
+  `fill`, `select_option`, `set_input_files`, `key_press`, `reload`, `scroll`, `wait_for`,
+  `emulate_media`, `assert_form_valid`, `assert_visible`, `assert_hidden`,
+  `assert_text`, `assert_value`, `assert_count`, `assert_url`, `assert_attribute`,
+  `assert_aria`, `assert_property`, `assert_focus`, `assert_storage_value`, or
+  `assert_no_console_errors`) plus only the fields that
   action needs. Use `fill` (not
   `key_press`) for normal text/email input; `key_press` is only for keyboard
   keys such as Tab, Enter, Escape, or ArrowRight. Use stable existing IDs,
@@ -193,7 +212,9 @@ Each check must include:
   keys for a separately asserted keyboard-accessibility check.
   When a `key_press` action has a selector, the harness focuses that exact
   element before pressing the key; include it whenever the key activates a
-  specific control.
+  specific control. `Tab` always requires a starting selector so its focus
+  destination is deterministic. The start must itself be a focusable control;
+  `body`, `html`, `main`, or another global container is not a valid Tab anchor.
   Use `click` with `button: "right"` for context-menu behavior. Use
   `drag_and_drop` with `source_selector` and `target_selector`, and `hover` for
   hover-only surfaces such as tooltips. Use `wait_for` with a stable selector,
@@ -216,24 +237,79 @@ fake repair task. `assert_form_valid` must evaluate true before submission.
 
 Checks are executed once in listed order. Consecutive checks on the same
 `route` keep browser state, so a later check may continue that journey. A route
-change performs an explicit navigation before the next check; never rely on
-state leaking across pages.
+change performs an explicit navigation before the next check. Same-origin
+storage persists, but page-local DOM state does not. Each Sprint's target
+checks start in a fresh browser context: accepted checks from earlier Sprints
+are replayed independently for regression evidence and NEVER seed the current
+Sprint's localStorage or item counts.
 Make that dependency explicit in each check's `task`; do not assume a reload
 between checks.
+For a persistence check that begins with `reload`, every asserted selector/count
+must already be established by an earlier check in this same Sprint. A prior
+`assert_visible` proves only one matching node; it cannot justify
+`assert_count: 2`. Prefer a self-contained journey that creates the state,
+reloads, and asserts exactly the state that journey created.
+An initial empty-state check that begins with `reload` must appear before any
+state-producing functionality or persistence check on the same route. A
+filter-induced empty-state check is self-contained and must perform its filter
+action in the same check.
 
-Every authored check MUST contain exactly one `evaluate` action, as its final action, whose expression directly
-returns a truthy/falsey observable assertion. Do not put `return` statements,
-`window.scrollTo`, timers, or interaction setup inside an evaluate expression.
-Use the dedicated action first (for example `scroll` with an integer `y`, or
-`click` with a selector), then finish with a side-effect-free expression such as
-`document.querySelector('#control').classList.contains('visible')`. The harness
-waits briefly before evaluate, so do not create Promise-based delays. A click
-without a final state assertion is not a complete test.
+Every explicit user-requested interaction or persistence behavior must have its
+own critical executable check in the owning Sprint. Do not omit a completion,
+toggle, filter, empty-state, or persistence behavior merely because another
+check shares its feature ID. For persistence, perform the state-producing
+action, use `reload`, then finish with a typed DOM/ARIA/storage assertion. Do
+not bundle several requested outcomes behind one vague assertion.
+
+Every authored check MUST contain 1 to 4 related typed assertions and MUST end
+with a typed assertion. Model-authored JavaScript (`evaluate`) is forbidden. Use the dedicated
+interaction action first, then finish with the narrowest observable assertion:
+`assert_visible`/`assert_hidden` for presence, `assert_text` with `match` set to
+`exact` or `contains`, `assert_value`, `assert_count`, `assert_url`,
+`assert_attribute`, `assert_aria` (only `role`, `accessible_name`, or an
+`aria-*` attribute), `assert_focus`, `assert_storage_value`, or
+`assert_no_console_errors`. A click without a final typed state assertion is
+not a complete test. Split unrelated outcomes into separate checks instead of
+combining them in arbitrary code.
+
+Typed assertion fields are exact and closed:
+
+- `assert_visible`, `assert_hidden`, `assert_focus`: `selector`
+- `assert_text`: `selector`, `value`, optional `match` (`exact` or `contains`)
+- `assert_value`: `selector`, `value`
+- `assert_count`: `selector`, integer `count`
+- `assert_url`: `value`, optional `match` (`exact` or `contains`)
+- `assert_attribute`: `selector`, `name`, `value` (exact comparison only)
+- `assert_property`: `selector`, `name`, `value`; `name` is limited to bounded
+  form/dialog state such as `checked`, `disabled`, `selected`, `selectedIndex`, or `value`
+- `assert_aria`: `selector`, `attribute`, `value`; `attribute` is `role`,
+  `accessible_name`, or an `aria-*` name
+- `assert_storage_value`: `storage` (`local` or `session`), `key`, `value`, and
+  explicit `match` (`exact` or `contains`). Use `contains` when storage holds a
+  JSON array/object and the contract verifies one literal inside it.
+- `assert_no_console_errors`: no additional fields
+
+For new contracts, `assert_url` values must describe owned pathnames and cannot
+contain `#` fragments or hash-router state. When `key_press` uses `Tab`, its
+starting selector is required and the following
+`assert_focus` must name the destination selector; Tab cannot leave focus on
+the same starting element.
+
+Do not add `text`, `url`, `attribute`, or `match` aliases. For a class/state
+transition, prefer a final `assert_visible` with the stable state selector
+instead of comparing the entire `class` attribute. Keep multiple assertions in
+one check only when they verify the same user journey; split independent focus
+outcomes into separate checks. CSS/color/style quality belongs to the
+visual review and must not be encoded as a brittle DOM attribute assertion.
+Exact `class` or inline `style` attribute assertions are rejected. `assert_focus` proves keyboard
+focus; do not require a synthetic `focused` class. An observational page-load
+check must not invent an exact `assert_count`: use `assert_visible`, or declare
+the exact planned content literals in `fixtures` when cardinality is genuinely
+part of the deterministic fixture contract.
 
 Do not invent fixture names, counts, addresses, labels, or other existing page data in
 acceptance criteria or browser checks. Unless an exact literal is present in the user request,
-prefer relational assertions such as "at least one suggestion contains the typed fragment" and
-combine them in the final boolean expression. New selectors for controls introduced by the requested
+prefer bounded assertions against stable control state or text already specified by the task. New selectors for controls introduced by the requested
 feature are allowed; guessed existing content is not.
 
 Checks should be executable browser tasks that validate the current sprint's key functionality.

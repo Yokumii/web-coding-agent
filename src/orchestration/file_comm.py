@@ -26,6 +26,18 @@ _TEXT_ARTIFACTS = ("spec.md", "progress.md", "build_log.md")
 _ROUND_TEXT_PATTERNS = ("feedback_round_*.md",)
 _ROUND_IMAGE_PATTERNS = ("visual_round_*.png",)
 _EDIT_SCOPE_PATTERNS = ("edit_scope_round_*.json",)
+_RUN_CONTROL_PATTERNS = (
+    "minimal_path_plan_round_*.json",
+    "minimal_path_state_round_*.json",
+    "minimal_path_ledger_round_*.jsonl",
+    "minimality_round_*.json",
+    "browser_evidence_round_*.json",
+    "accepted_tape_replay_round_*.json",
+    "recovery_commit_round_*.json",
+    "repair_dom_source_round_*.json",
+    "repair_packet_round_*.json",
+    "regression_selection_round_*.json",
+)
 _PLANNING_TEXT_SCAFFOLDS = {
     "spec.md": (
         "# Draft Product - Working Title\n\n"
@@ -164,11 +176,16 @@ class FileComm:
         return model.model_dump() if model else None
 
     def write_sprint_plan(self, sprint_plan: dict[str, Any]) -> Path:
-        return self._write(SprintPlan.model_validate(sprint_plan))
+        model = SprintPlan.model_validate(sprint_plan)
+        path = self._path(model.filename())
+        path.write_text(
+            model.model_dump_json(indent=2, exclude_unset=True), encoding="utf-8"
+        )
+        return path
 
     def read_sprint_plan(self) -> dict[str, Any] | None:
         model = self._read(SprintPlan)
-        return model.model_dump() if model else None
+        return model.model_dump(exclude_unset=True) if model else None
 
     def write_ui_verification_plan(self, verification_plan: dict[str, Any]) -> Path:
         model = UIVerificationPlan.model_validate(verification_plan)
@@ -246,9 +263,16 @@ class FileComm:
         for name in _TEXT_ARTIFACTS:
             self._path(name).unlink(missing_ok=True)
         self._path("target_profile.json").unlink(missing_ok=True)
+        self._path("edit_task_contract.json").unlink(missing_ok=True)
+        self._path("edit_card.json").unlink(missing_ok=True)
         self._unlink_matching(
-            *_ROUND_TEXT_PATTERNS, *_ROUND_IMAGE_PATTERNS, *_EDIT_SCOPE_PATTERNS
+            *_ROUND_TEXT_PATTERNS,
+            *_ROUND_IMAGE_PATTERNS,
+            *_EDIT_SCOPE_PATTERNS,
+            *_RUN_CONTROL_PATTERNS,
         )
+        for name in ("accepted_tapes.jsonl", "minimality_policy.json", "round_build_map.json"):
+            self._path(name).unlink(missing_ok=True)
 
         # 通过 schema 注册表删除 JSON 产物。
         for model in ALL_ARTIFACT_MODELS:

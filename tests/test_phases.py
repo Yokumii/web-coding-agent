@@ -14,10 +14,16 @@ from src.orchestration.phases import (
     HarnessContext,
     Verdict,
     _apply_browser_click_evidence_gate,
+    _checks_are_tape_eligible,
+    _contract_functionality_recheck_allowed,
     _reconcile_action_contract_evidence,
     _action_contract_grade_conflicts,
     _edit_guard_requires_repair,
     _merge_visual_evidence_manifest,
+    _visual_routes_for_checks,
+    _visual_style_recheck_allowed,
+    _dedicated_visual_recheck_allowed,
+    _non_visual_gates_passed,
     run_build_phase,
     run_evaluate_phase,
     run_planner_phase,
@@ -39,6 +45,96 @@ def _stats(cost_usd: float) -> AgentRunStats:
         usage={"input_tokens": 100, "output_tokens": 20},
         model_usage={},
     )
+
+
+def test_tape_eligibility_matches_one_to_four_assertion_contract():
+    check = {
+        "id": "UI-001",
+        "actions": [
+            {"action": "assert_visible", "selector": "main"},
+            {"action": "assert_count", "selector": "main", "count": 1},
+        ],
+    }
+    assert _checks_are_tape_eligible([check]) is True
+
+    check["actions"].extend(
+        {"action": "assert_visible", "selector": f"#item-{index}"}
+        for index in range(3)
+    )
+    assert _checks_are_tape_eligible([check]) is False
+    assert _checks_are_tape_eligible(["not-a-check"]) is False
+
+
+def test_visual_capture_targets_current_sprint_routes_in_order():
+    assert _visual_routes_for_checks(
+        [
+            {"route": "/library.html"},
+            {"route": "/library.html"},
+            {"route": "/details.html"},
+        ]
+    ) == ["/library.html", "/details.html"]
+
+
+def test_style_only_counterfactual_failure_allows_zero_mutation_recheck():
+    grade = {
+        "overall_passed": False,
+        "bugs_found": [],
+        "ui_checks": [{"check_id": "UI-1", "status": "pass"}],
+        "edit_guard": {"passed": True},
+    }
+    certificate = {
+        "status": "non_minimal",
+        "redundant_change_ids": ["p001"],
+        "atomic_patches": [
+            {"change_id": "p001", "path": "catalog.css", "search": "", "replace": ".x{}"}
+        ],
+    }
+    checks = [{"id": "UI-1", "category": "visual", "actions": []}]
+
+    assert _visual_style_recheck_allowed(grade, certificate, checks) is True
+    certificate["atomic_patches"][0]["path"] = "catalog.js"
+    assert _visual_style_recheck_allowed(grade, certificate, checks) is False
+
+
+def test_non_visual_pass_can_reach_dedicated_visual_review():
+    grade = {
+        "overall_passed": False,
+        "phase_results": {
+            "render_gate": "pass",
+            "ui_functionality": "pass",
+            "appearance": "skipped",
+            "source_inspection": "pass",
+        },
+        "bugs_found": [],
+        "regressions_found": [],
+        "repair_instructions": [],
+        "edit_guard": {"passed": True},
+        "ui_checks": [{"check_id": "UI-1", "status": "pass"}],
+    }
+    evidence = {"checks": [{"check_id": "UI-1", "status": "ok"}]}
+
+    assert _dedicated_visual_recheck_allowed(grade) is True
+    assert _non_visual_gates_passed(
+        grade, evidence, {"checks": []}, {"passed": True}
+    ) is True
+    grade["bugs_found"] = ["real bug"]
+    assert _dedicated_visual_recheck_allowed(grade) is False
+
+
+def test_legacy_positive_grade_without_phase_block_can_reach_visual_review():
+    grade = {
+        "overall_passed": True,
+        "bugs_found": [],
+        "regressions_found": [],
+    }
+
+    assert _non_visual_gates_passed(
+        grade, {"checks": []}, None, None
+    ) is True
+    grade["overall_passed"] = False
+    assert _non_visual_gates_passed(
+        grade, {"checks": []}, None, None
+    ) is False
 
 
 def test_edit_guard_requires_both_machine_contract_and_independent_scope_audit():
@@ -146,6 +242,88 @@ def test_action_contract_evidence_overrides_conflicting_llm_ui_check(tmp_path: P
     assert [item["status"] for item in reconciled["ui_checks"]] == ["pass", "fail"]
     assert [item["passed"] for item in reconciled["target_exit_criteria_results"]] == [True, False]
     assert reconciled["browser_action_contract_reconciliation"]["changed_check_ids"] == ["UI-001", "UI-002"]
+
+
+def test_complete_passing_action_contracts_calibrate_functionality_to_threshold(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.dir.mkdir(parents=True, exist_ok=True)
+    (file_comm.dir / "browser_evidence_round_1.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"ok"},'
+        '{"check_id":"UI-002","status":"ok"}]}\n'
+    )
+    grades = {
+        "criteria": {
+            "functionality": {
+                "score": 5.0,
+                "passed": True,
+                "notes": "Exploratory evaluator did not exercise every path.",
+            }
+        },
+        "ui_checks": [
+            {"check_id": "UI-001", "feature_id": "F001", "critical": True,
+             "status": "pass", "notes": "already agreed"},
+            {"check_id": "UI-002", "feature_id": "F001", "critical": True,
+             "status": "pass", "notes": "already agreed"},
+        ],
+        "target_exit_criteria_results": [],
+    }
+
+    reconciled = _reconcile_action_contract_evidence(file_comm, 1, grades)
+
+    assert reconciled["criteria"]["functionality"]["score"] == 6.0
+    assert reconciled["criteria"]["functionality"]["passed"] is True
+    assert "typed browser action contracts" in reconciled["criteria"]["functionality"]["notes"]
+    assert reconciled["browser_action_contract_reconciliation"]["functionality_calibrated"] is True
+
+
+def test_incomplete_action_contracts_do_not_calibrate_functionality(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.dir.mkdir(parents=True, exist_ok=True)
+    (file_comm.dir / "browser_evidence_round_1.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"ok"}]}\n'
+    )
+    grades = {
+        "criteria": {"functionality": {"score": 5.0, "passed": False, "notes": "low"}},
+        "ui_checks": [
+            {"check_id": "UI-001", "critical": True, "status": "pass"},
+            {"check_id": "UI-002", "critical": True, "status": "partial"},
+        ],
+        "target_exit_criteria_results": [],
+    }
+
+    reconciled = _reconcile_action_contract_evidence(file_comm, 1, grades)
+
+    assert reconciled["criteria"]["functionality"]["score"] == 5.0
+    assert "browser_action_contract_reconciliation" not in reconciled
+
+
+def test_contract_functionality_policy_change_allows_zero_mutation_recheck(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.dir.mkdir(parents=True, exist_ok=True)
+    (file_comm.dir / "browser_evidence_round_8.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"ok"},'
+        '{"check_id":"UI-002","status":"ok"}]}\n'
+    )
+    grade = {
+        "overall_passed": False,
+        "bugs_found": [],
+        "regressions_found": [],
+        "repair_instructions": [],
+        "phase_results": {
+            "render_gate": "pass",
+            "ui_functionality": "pass",
+            "appearance": "pass",
+            "source_inspection": "pass",
+        },
+        "edit_guard": {"passed": True},
+        "criteria": {"functionality": {"score": 5.0, "passed": True}},
+        "ui_checks": [
+            {"check_id": "UI-001", "status": "pass"},
+            {"check_id": "UI-002", "status": "pass"},
+        ],
+    }
+
+    assert _contract_functionality_recheck_allowed(file_comm, 8, grade) is True
 
 
 def test_action_contract_conflict_gate_only_checks_complete_contracts(tmp_path: Path):
@@ -368,6 +546,80 @@ async def test_run_build_phase_materializes_harness_owned_minimal_path(monkeypat
     assert plan["source_change_cone"]["local_paths"] == ["frontend/index.html"]
     assert scope["owner"] == "harness"
     assert scope["allowed_root_keys"] == ["main:unnamed"]
+
+
+@pytest.mark.anyio
+async def test_later_generate_sprint_is_a_scoped_incremental_edit(monkeypatch, tmp_path: Path):
+    ctx = _make_ctx(tmp_path)
+    ctx.config.minimality_guard_enabled = False
+    ctx.file_comm.write_sprint_plan({
+        "total_sprints": 2,
+        "sprints": [_stub_sprint(1), _stub_sprint(2)],
+    })
+    ctx.file_comm.write_accepted_sprints({
+        "accepted": [1], "current_target": 2, "last_evaluated_round": 1,
+    })
+    _write_feature_list(ctx.file_comm, total=2)
+    ctx.sprint_state = SprintState.load(ctx.file_comm)
+    ctx.file_comm.write_ui_verification_plan({
+        "sprints": [{
+            "sprint": 2,
+            "checks": [{
+                "id": "UI-002", "feature_id": "F002", "task": "Use search",
+                "expected_result": "Results update", "critical": True,
+                "category": "interaction", "route": "/",
+                "actions": [
+                    {"action": "click", "selector": "#search"},
+                    {"action": "evaluate", "expression": "true"},
+                ],
+            }],
+        }],
+    })
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main><button id="search">Search</button></main>', encoding="utf-8"
+    )
+    stack = _DummyAppStack()
+
+    async def fake_start_app_stack(*args, **kwargs):
+        del args, kwargs
+        return stack
+
+    async def fake_capture_sprint_source_baseline(**kwargs):
+        baseline = {
+            "version": 3, "routes": ["/"],
+            "roots": [{
+                "key": "/::main:unnamed", "local_key": "main:unnamed",
+                "route": "/", "fingerprint": "before", "anchors": ["#search"],
+            }],
+        }
+        path = kwargs["file_comm"].dir / "edit_dom_source_sprint_2.json"
+        path.write_text(json.dumps(baseline), encoding="utf-8")
+        return baseline
+
+    async def fake_run_generator(*args, **kwargs):
+        del args, kwargs
+        assert (ctx.file_comm.dir / "edit_dom_source_sprint_2.json").is_file()
+        assert (ctx.file_comm.dir / "minimal_path_plan_round_2.json").is_file()
+        return _stats(0.0)
+
+    monkeypatch.setattr("src.orchestration.phases.start_app_stack", fake_start_app_stack)
+    monkeypatch.setattr(
+        "src.orchestration.phases.capture_sprint_source_baseline",
+        fake_capture_sprint_source_baseline,
+    )
+    monkeypatch.setattr("src.orchestration.phases.run_generator", fake_run_generator)
+
+    await run_build_phase(ctx, 2)
+
+    plan = json.loads(
+        (ctx.file_comm.dir / "minimal_path_plan_round_2.json").read_text(encoding="utf-8")
+    )
+    assert plan["mode"] == "generate"
+    assert plan["route_scope"]["target_routes"] == ["/"]
+    assert plan["dom_change_cone"]["baseline"] == ".harness/edit_dom_source_sprint_2.json"
+    assert stack.closed is True
 
 
 @pytest.mark.anyio

@@ -9,7 +9,13 @@ import pytest
 from src.agents.sdk_runner import AgentRunStats
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
-from src.orchestration.harness import ResumeError, _next_round_cost_reserve, run_harness
+from src.orchestration.harness import (
+    ResumeError,
+    _next_round_cost_reserve,
+    _round_limit_for_task,
+    _reset_generate_edit_frames,
+    run_harness,
+)
 
 
 class DummyAppStack:
@@ -69,6 +75,27 @@ def test_next_round_cost_reserve_requires_both_observed_phases():
     assert _next_round_cost_reserve({
         "generator_r1": {"cost_usd": None}, "evaluator_r1": {"cost_usd": 0.8},
     }) == 0.8
+
+
+def test_edit_uses_its_ten_round_budget_without_forcing_all_rounds():
+    config = HarnessConfig(max_rounds=3, edit_max_rounds=10)
+
+    assert _round_limit_for_task(config, task_mode="edit", total_sprints=1) == 10
+    assert _round_limit_for_task(config, task_mode="generate", total_sprints=1) == 3
+
+
+def test_fresh_generate_discards_stale_edit_frames(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    for name in (
+        "edit_dom_baseline.json",
+        "edit_dom_source_sprint_1.json",
+        "edit_dom_source_sprint_2.json",
+    ):
+        (file_comm.dir / name).write_text('{"roots": []}')
+
+    _reset_generate_edit_frames(file_comm)
+
+    assert not list(file_comm.dir.glob("edit_dom*.json"))
 
 
 def _write_feature_list(file_comm: FileComm, total: int = 1) -> None:
@@ -172,7 +199,6 @@ async def test_resume_from_build_checkpoint_skips_planner_and_build(monkeypatch,
     monkeypatch.setattr("src.orchestration.phases.run_evaluator", fake_evaluator)
     monkeypatch.setattr("src.orchestration.phases.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.phases.start_app_stack", fake_start_app_stack)
-
     await run_harness("ignored prompt", tmp_path, HarnessConfig(max_rounds=3), resume=True)
 
     assert ("planner", None) not in calls
@@ -220,6 +246,16 @@ async def test_resume_from_evaluate_checkpoint_starts_next_build_round(monkeypat
         calls.append(("start_app_stack", round_num))
         return stack
 
+    async def fake_capture_sprint_source_baseline(**kwargs):
+        path = kwargs["file_comm"].dir / f"edit_dom_source_sprint_{kwargs['sprint_num']}.json"
+        payload = {"version": 3, "routes": ["/"], "roots": []}
+        path.write_text(json.dumps(payload))
+        return payload
+
+    async def fake_evaluate_guard(**kwargs):
+        del kwargs
+        return None
+
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
@@ -228,6 +264,11 @@ async def test_resume_from_evaluate_checkpoint_starts_next_build_round(monkeypat
     monkeypatch.setattr("src.orchestration.phases.run_evaluator", fake_evaluator)
     monkeypatch.setattr("src.orchestration.phases.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.phases.start_app_stack", fake_start_app_stack)
+    monkeypatch.setattr(
+        "src.orchestration.phases.capture_sprint_source_baseline",
+        fake_capture_sprint_source_baseline,
+    )
+    monkeypatch.setattr("src.orchestration.phases.evaluate_guard", fake_evaluate_guard)
 
     await run_harness("ignored prompt", tmp_path, HarnessConfig(max_rounds=3), resume=True)
 
@@ -306,7 +347,6 @@ async def test_successful_evaluation_preserves_completed_checkpoint_and_closes_s
     monkeypatch.setattr("src.orchestration.phases.run_evaluator", fake_evaluator)
     monkeypatch.setattr("src.orchestration.phases.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.phases.start_app_stack", fake_start_app_stack)
-
     await run_harness("build something", tmp_path, HarnessConfig(max_rounds=1))
 
     assert stack.closed is True
@@ -737,6 +777,16 @@ async def test_passed_sprint_advances_to_next_sprint_in_generate_mode(monkeypatc
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         return stack
 
+    async def fake_capture_sprint_source_baseline(**kwargs):
+        path = kwargs["file_comm"].dir / f"edit_dom_source_sprint_{kwargs['sprint_num']}.json"
+        payload = {"version": 3, "routes": ["/"], "roots": []}
+        path.write_text(json.dumps(payload))
+        return payload
+
+    async def fake_evaluate_guard(**kwargs):
+        del kwargs
+        return None
+
     async def fake_visual_review(**kwargs):
         return kwargs["grades"], _stats(0.0)
 
@@ -745,6 +795,11 @@ async def test_passed_sprint_advances_to_next_sprint_in_generate_mode(monkeypatc
     monkeypatch.setattr("src.orchestration.phases.run_evaluator", fake_evaluator)
     monkeypatch.setattr("src.orchestration.phases.apply_dedicated_visual_review", fake_visual_review)
     monkeypatch.setattr("src.orchestration.phases.start_app_stack", fake_start_app_stack)
+    monkeypatch.setattr(
+        "src.orchestration.phases.capture_sprint_source_baseline",
+        fake_capture_sprint_source_baseline,
+    )
+    monkeypatch.setattr("src.orchestration.phases.evaluate_guard", fake_evaluate_guard)
 
     await run_harness("build something", tmp_path, HarnessConfig(max_rounds=3))
 

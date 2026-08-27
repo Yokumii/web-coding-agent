@@ -14,6 +14,7 @@ from typing import Any
 
 from src.config import HarnessConfig
 from src.orchestration.browser_evidence import collect_browser_evidence
+from src.orchestration.ui_action_contracts import ASSERTION_UI_ACTIONS
 from src.orchestration.edit_dom_guard import (
     compare_contract,
     repair_baseline_name,
@@ -92,10 +93,18 @@ def record_round_build_source(
     payload = _read_json(path, {})
     key = str(round_num)
     if key not in payload:
+        trajectory_role = (
+            "repair"
+            if mode == "repair"
+            else "incremental_edit"
+            if (harness_dir / sprint_baseline_name(sprint_num)).is_file()
+            else "generate_root"
+        )
         payload[key] = {
             "round": round_num,
             "sprint": sprint_num,
             "mode": mode,
+            "trajectory_role": trajectory_role,
             "source_commit": _head(frontend),
             "destination_commit": None,
         }
@@ -172,7 +181,7 @@ def browser_target_outcome(
             preservation_passed=False,
             evidence={"reason": "target_contract_is_missing_actions"},
         )
-    if not any(action.get("action") in {"evaluate", "assert_form_valid"} for action in planned_actions):
+    if not any(action.get("action") in ASSERTION_UI_ACTIONS for action in planned_actions):
         return OracleOutcome(
             status="infrastructure_error", target_passed=False,
             preservation_passed=False,
@@ -338,7 +347,8 @@ async def certify_commit_pair(
     *, run_dir: Path, config: HarnessConfig, round_num: int, kind: str,
     source_commit: str, destination_commit: str, checks: list[dict[str, Any]],
     baseline: dict[str, Any] | None, scope: dict[str, Any] | None,
-    max_atoms: int,
+    max_atoms: int, visual_accepted: bool = False,
+    failure_round: int | None = None,
 ) -> dict[str, Any]:
     frontend = run_dir / "frontend"
     source_code = _code_at_commit(frontend, source_commit)
@@ -382,6 +392,53 @@ async def certify_commit_pair(
         certify_patch_minimality(patches, oracle, max_atoms=max_atoms),
         timeout=config.minimality_oracle_timeout_seconds,
     )
+    visual_categories = {"appearance", "responsive", "style", "visual"}
+    has_visual_contract = any(
+        str(check.get("category", "")).strip().lower() in visual_categories
+        for check in checks
+        if isinstance(check, dict)
+    )
+    redundant = set(certificate.get("redundant_change_ids") or [])
+    style_change_ids = {
+        patch.change_id
+        for patch in patches
+        if Path(patch.path).suffix.lower() in {".css", ".scss"}
+    }
+    role_covered = redundant & style_change_ids if visual_accepted and has_visual_contract else set()
+    if role_covered:
+        remaining = redundant - role_covered
+        kept = set(certificate.get("kept_change_ids") or []) | role_covered
+        certificate["kept_change_ids"] = sorted(kept)
+        certificate["redundant_change_ids"] = sorted(remaining)
+        certificate.setdefault("necessity", []).extend(
+            {
+                "change_id": change_id,
+                "failure_dimension": "accepted_visual_contract_source_role",
+                "counterfactual_kept_change_ids": sorted(kept - {change_id}),
+            }
+            for change_id in sorted(role_covered)
+        )
+        certificate["visual_role_evidence"] = {
+            "status": "covered",
+            "categories": sorted(
+                {
+                    str(check.get("category", "")).strip().lower()
+                    for check in checks
+                    if isinstance(check, dict)
+                    and str(check.get("category", "")).strip().lower()
+                    in visual_categories
+                }
+            ),
+            "accepted_destination_visual_review": True,
+            "style_change_ids": sorted(role_covered),
+            "reason": (
+                "The functional counterfactual oracle does not cover visual requirements; "
+                "accepted target-route visual review preserves target-local style atoms."
+            ),
+        }
+        if not remaining:
+            certificate["status"] = "certified"
+            certificate["reason"] = "every_atomic_change_is_covered_by_runtime_or_visual_evidence"
     certificate.update({
         "kind": kind,
         "round": round_num,
@@ -389,13 +446,47 @@ async def certify_commit_pair(
         "destination_commit": destination_commit,
         "atomic_patches": [patch.payload() for patch in patches],
     })
+    if failure_round is not None:
+        certificate["failure_round"] = failure_round
     _write_json(output_path, certificate)
     return certificate
 
 
+def _latest_real_failed_round(
+    run_dir: Path, *, before_round: int, sprint_num: int
+) -> int | None:
+    """Select the latest runtime/semantic product failure, not an evidence-only gate."""
+    for round_num in range(before_round - 1, 0, -1):
+        grade = _read_json(
+            run_dir / ".harness" / f"grade_round_{round_num}.json", {}
+        )
+        if (
+            grade.get("sprint") != sprint_num
+            or grade.get("overall_passed") is not False
+            or grade.get("evaluation_infrastructure_failure")
+        ):
+            continue
+        phase = grade.get("phase_results") or {}
+        guard = grade.get("edit_guard") or {}
+        browser = _read_json(
+            run_dir / ".harness" / f"browser_evidence_round_{round_num}.json", {}
+        )
+        browser_failed = any(
+            isinstance(item, dict) and item.get("status") == "action_failed"
+            for item in browser.get("checks", [])
+        )
+        if (
+            browser_failed
+            or phase.get("render_gate") == "fail"
+            or guard.get("passed") is False
+        ):
+            return round_num
+    return None
+
+
 async def certify_round_minimality(
     *, run_dir: Path, config: HarnessConfig, round_num: int, sprint_num: int,
-    checks: list[dict[str, Any]],
+    checks: list[dict[str, Any]], visual_accepted: bool = False,
 ) -> dict[str, Any] | None:
     policy = _read_json(run_dir / ".harness" / POLICY_NAME, None)
     if not isinstance(policy, dict) or policy.get("enabled") is not True:
@@ -423,20 +514,37 @@ async def certify_round_minimality(
     )
     max_atoms = int(policy.get("max_atomic_changes") or config.minimality_max_atoms)
     result: dict[str, Any] = {"status": "ok", "certificates": {}}
-    if (run_dir / "seed_manifest.json").is_file():
+    # Explicit Edit sprint one and later Generate sprints both freeze an
+    # accepted source frame. Treat either as a natural Edit transition; a
+    # first-sprint generation/repair has no sprint source frame and therefore
+    # remains Repair-only.
+    if (run_dir / ".harness" / sprint_baseline_name(sprint_num)).is_file():
         edit_source = str(records[0]["source_commit"])
         result["certificates"]["edit"] = await certify_commit_pair(
             run_dir=run_dir, config=config, round_num=round_num, kind="edit",
             source_commit=edit_source,
             destination_commit=str(current["destination_commit"]),
             checks=checks, baseline=baseline, scope=scope, max_atoms=max_atoms,
+            visual_accepted=visual_accepted,
         )
     if current.get("mode") == "repair":
+        failure_round = _latest_real_failed_round(
+            run_dir, before_round=round_num, sprint_num=sprint_num
+        )
+        failure_record = build_map.get(str(failure_round)) if failure_round else None
+        repair_source = (
+            str(failure_record.get("destination_commit"))
+            if isinstance(failure_record, dict)
+            and failure_record.get("destination_commit")
+            else str(current["source_commit"])
+        )
         result["certificates"]["repair"] = await certify_commit_pair(
             run_dir=run_dir, config=config, round_num=round_num, kind="repair",
-            source_commit=str(current["source_commit"]),
+            source_commit=repair_source,
             destination_commit=str(current["destination_commit"]),
             checks=checks, baseline=baseline, scope=scope, max_atoms=max_atoms,
+            visual_accepted=visual_accepted,
+            failure_round=failure_round,
         )
     return result
 

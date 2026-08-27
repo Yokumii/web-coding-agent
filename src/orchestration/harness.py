@@ -7,13 +7,21 @@ from pathlib import Path
 from typing import Any
 
 from src.config import HarnessConfig
+from src.agents.planner import recover_trace_proven_planner_checkpoint
 from src.orchestration.checkpoints import (
+    CheckpointTransaction,
     ResumeError,
     reconcile_completed_evaluation,
     restore_resume_state,
 )
 from src.orchestration.cost_tracker import CostTracker
 from src.orchestration.file_comm import FileComm
+from src.orchestration.edit_task_contract import (
+    normalize_target_routes,
+    prepare_edit_task_contract,
+    read_edit_task_contract,
+    resolve_task_mode,
+)
 from src.orchestration.phases import (
     HarnessContext,
     Verdict,
@@ -24,9 +32,34 @@ from src.orchestration.phases import (
 )
 from src.orchestration.sprint_state import SprintState
 from src.orchestration.target_profile import detect_target_profile
+from src.orchestration.task_inputs import (
+    load_task_input_manifest,
+    stage_task_inputs,
+    task_input_source_hashes,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _round_limit_for_task(
+    config: HarnessConfig, *, task_mode: str, total_sprints: int
+) -> int:
+    """Return a ceiling, never a target number of rounds.
+
+    Edit receives a wider recovery allowance because every failed round must be
+    evidence-driven. Acceptance still exits immediately. Generate retains its
+    smaller default and final-project mode only reserves enough room for its
+    planned milestones plus a bounded recovery allowance.
+    """
+    if task_mode == "edit":
+        return max(1, int(config.edit_max_rounds))
+    # Preserve the existing Generate control where ``0`` is a deliberate
+    # plan/design-only run.  The ten-round ceiling is specific to Edit.
+    limit = max(0, int(config.max_rounds))
+    if config.final_project_mode:
+        limit = max(limit, int(total_sprints) + 3)
+    return limit
 
 
 def _next_round_cost_reserve(phase_metrics: dict[str, dict[str, Any]]) -> float:
@@ -58,6 +91,13 @@ def _is_planner_checkpoint(phase: str | None) -> bool:
     return _phase_kind(phase) in {"plan", "design", "build", "evaluate"}
 
 
+def _reset_generate_edit_frames(file_comm: FileComm) -> None:
+    """Remove baselines from an older run before a fresh Generate roadmap."""
+    (file_comm.dir / "edit_dom_baseline.json").unlink(missing_ok=True)
+    for path in file_comm.dir.glob("edit_dom_source_sprint_*.json"):
+        path.unlink(missing_ok=True)
+
+
 async def run_harness(
     user_prompt: str,
     workdir: Path,
@@ -65,19 +105,62 @@ async def run_harness(
     plan_only: bool = False,
     resume: bool = False,
     keep_frontend: bool = False,
+    task_mode: str = "auto",
+    input_paths: list[Path] | None = None,
+    target_routes: list[str] | None = None,
 ) -> None:
     """执行完整的 Planner → Generator → Evaluator 主循环。"""
     start = time.time()
     workdir.mkdir(parents=True, exist_ok=True)
+    input_paths = list(input_paths or [])
+    target_routes = normalize_target_routes(target_routes or [])
+    # Validate external inputs before a fresh-run reset can discard prior
+    # harness artifacts. Staging happens only after the task mode is accepted.
+    if input_paths:
+        task_input_source_hashes(input_paths)
     file_comm = FileComm(workdir / ".harness")
     cost_tracker = CostTracker(config.max_budget_usd)
 
     existing_state = file_comm.read_state()
+    if resume and not existing_state:
+        recovered_planner = recover_trace_proven_planner_checkpoint(file_comm, config)
+        if recovered_planner is not None:
+            recovered_metrics = {"planner": recovered_planner.to_dict()}
+            CheckpointTransaction(
+                file_comm=file_comm,
+                prompt=user_prompt,
+                costs={"planner": recovered_planner.cost_usd},
+                phase_metrics=recovered_metrics,
+            ).record_plan_completed()
+            existing_state = file_comm.read_state()
+            logger.info(
+                "[bold blue]Planner[/] recovered a valid trace-proven planning bundle; "
+                "no duplicate model call made."
+            )
     if resume and existing_state:
         user_prompt = existing_state.get("prompt", user_prompt)
         _restore_costs(cost_tracker, existing_state.get("costs", {}))
         restore_resume_state(file_comm, existing_state)
         existing_state = reconcile_completed_evaluation(file_comm, existing_state)
+        contract = read_edit_task_contract(workdir)
+        resolved_task_mode = (
+            "edit"
+            if contract is not None or (workdir / "seed_manifest.json").is_file()
+            else "generate"
+        )
+        if task_mode not in {"auto", resolved_task_mode}:
+            raise ResumeError(
+                f"resume task mode {task_mode!r} conflicts with persisted {resolved_task_mode!r} run"
+            )
+        if input_paths:
+            previous_inputs = load_task_input_manifest(workdir)
+            previous_hashes = [item.get("sha256") for item in previous_inputs.get("inputs", [])]
+            if previous_hashes != task_input_source_hashes(input_paths):
+                raise ResumeError("resume inputs differ from the persisted task input manifest")
+        if target_routes:
+            persisted_routes = list((contract or {}).get("requested_target_routes") or [])
+            if target_routes != persisted_routes:
+                raise ResumeError("resume target routes differ from the persisted Edit contract")
         phase_metrics = _copy_metrics(existing_state.get("phase_metrics"))
         skip_until_phase = existing_state.get("last_completed_phase")
         logger.info(f"[bold]Harness resuming[/] from '{skip_until_phase}'")
@@ -85,6 +168,17 @@ async def run_harness(
         if resume:
             logger.warning("[bold]Resume requested but no checkpoint found.[/]")
         file_comm.reset_run_artifacts()
+        resolved_task_mode = resolve_task_mode(workdir, task_mode)
+        if resolved_task_mode == "edit":
+            prepare_edit_task_contract(
+                workdir, requested_target_routes=target_routes
+            )
+            keep_frontend = True
+        elif target_routes:
+            raise ValueError("--target-route is valid only for Edit tasks")
+        else:
+            _reset_generate_edit_frames(file_comm)
+        stage_task_inputs(workdir, input_paths)
         file_comm.write_target_profile(detect_target_profile(user_prompt))
         if not keep_frontend:
             _reset_frontend_dir(workdir)
@@ -118,6 +212,11 @@ async def run_harness(
         if cost_tracker.is_over_budget():
             logger.warning("[bold red]Budget exceeded after planning. Stopping.[/]")
             return
+        if _phase_budget_exhausted(ctx, "planner"):
+            logger.warning(
+                "[bold red]Planner phase budget exhausted after planning. Stopping.[/]"
+            )
+            return
     else:
         logger.info("[bold cyan]PHASE 1: PLAN[/] — [dim]skipped (checkpoint)[/]")
 
@@ -135,12 +234,11 @@ async def run_harness(
 
     ctx.sprint_state = SprintState.load(file_comm)
 
-    # Final-project runs follow the natural roadmap to completion instead of
-    # accidentally stopping at the generic three-round dataset default. Keep
-    # a small repair allowance while retaining the global budget and timeouts.
-    max_rounds = config.max_rounds
-    if config.final_project_mode:
-        max_rounds = max(max_rounds, ctx.sprint_state.total_sprints + 3)
+    max_rounds = _round_limit_for_task(
+        config,
+        task_mode=resolved_task_mode,
+        total_sprints=ctx.sprint_state.total_sprints,
+    )
 
     start_round = _resolve_start_round(skip_until_phase, existing_state)
     if ctx.sprint_state.current_target > ctx.sprint_state.total_sprints > 0:
@@ -165,10 +263,21 @@ async def run_harness(
             )
             break
 
+        if _phase_budget_exhausted(ctx, "generator"):
+            logger.warning(
+                "[bold red]Generator phase budget exhausted before starting another build.[/]"
+            )
+            break
+
         if skip_until_phase != f"build_r{round_num}":
             await run_build_phase(ctx, round_num, resume_state=existing_state)
             if cost_tracker.is_over_budget():
                 logger.warning("[bold red]Budget exceeded after build. Stopping.[/]")
+                break
+            if _phase_budget_exhausted(ctx, "generator"):
+                logger.warning(
+                    "[bold red]Generator phase budget exhausted after build. Stopping before evaluation.[/]"
+                )
                 break
         else:
             logger.info("[bold green]BUILD phase[/] — [dim]skipped (checkpoint)[/]")
@@ -192,6 +301,11 @@ async def run_harness(
                 )
             skip_until_phase = None
         else:
+            if _phase_budget_exhausted(ctx, "evaluator"):
+                logger.warning(
+                    "[bold red]Evaluator phase budget exhausted before evaluation. Stopping.[/]"
+                )
+                break
             verdict = await run_evaluate_phase(ctx, round_num)
             if verdict is Verdict.completed:
                 logger.info(f"[bold green]✓ Final sprint accepted in round {round_num}![/]")
@@ -199,6 +313,11 @@ async def run_harness(
                 return
             if cost_tracker.is_over_budget():
                 logger.warning("[bold red]Budget exceeded after evaluate. Stopping.[/]")
+                break
+            if _phase_budget_exhausted(ctx, "evaluator"):
+                logger.warning(
+                    "[bold red]Evaluator phase budget exhausted after evaluation. Stopping.[/]"
+                )
                 break
             if verdict is Verdict.accepted_review:
                 logger.info(
@@ -225,6 +344,22 @@ def _copy_metrics(existing: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(existing, dict):
         return {}
     return {k: dict(v) for k, v in existing.items() if isinstance(v, dict)}
+
+
+def _phase_budget_exhausted(ctx: HarnessContext, phase: str) -> bool:
+    if phase == "planner":
+        return ctx.cost_tracker.phase_budget_exceeded(
+            ctx.config.planner_budget_usd, "planner"
+        )
+    if phase == "generator":
+        return ctx.cost_tracker.phase_budget_exceeded(
+            ctx.config.generator_budget_usd, "generator"
+        )
+    if phase == "evaluator":
+        return ctx.cost_tracker.phase_budget_exceeded(
+            ctx.config.evaluator_budget_usd, "evaluator", "visual_score"
+        )
+    raise ValueError(f"unknown phase budget: {phase}")
 
 
 def _phase_kind(phase: str | None) -> str | None:

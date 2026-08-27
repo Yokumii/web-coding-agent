@@ -46,6 +46,20 @@ def test_build_frontend_command_uses_static_server_for_empty_agent_npm_stub(tmp_
     ]
 
 
+def test_build_frontend_command_uses_owned_static_server_for_http_server_wrapper(
+    tmp_path: Path,
+):
+    (tmp_path / "index.html").write_text("<main>static</main>")
+    (tmp_path / "package.json").write_text(json.dumps({
+        "scripts": {"dev": "npx http-server -p 3000 -c-1 --cors"},
+        "devDependencies": {"http-server": "^14.1.1"},
+    }))
+
+    assert build_frontend_command(tmp_path, 5173) == [
+        "python3", "-m", "http.server", "5173", "--bind", "127.0.0.1",
+    ]
+
+
 def test_forward_static_seed_ignores_agent_added_package_with_dependencies(tmp_path: Path):
     source = tmp_path / "source"; source.mkdir(); (source / "index.html").write_text("seed")
     frontend = tmp_path / "case" / "frontend"; frontend.mkdir(parents=True)
@@ -236,6 +250,7 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("src.orchestration.runtime.subprocess.Popen", FakePopen)
 
     log_path = tmp_path / "frontend.log"
+    log_path.write_text("prior attempt\n", encoding="utf-8")
     process = start_process(
         name="frontend",
         command=["echo", "hi"],
@@ -247,6 +262,8 @@ def test_start_process_launches_in_new_session(monkeypatch, tmp_path: Path):
     assert process.process.pid == 4242
     assert captured["kwargs"].get("start_new_session") is (not runtime.IS_WINDOWS)
     assert captured["kwargs"]["env"]["PORT"] == "4321"
+    process.log_file.close()
+    assert log_path.read_text(encoding="utf-8") == "prior attempt\n"
 
 
 @pytest.mark.anyio

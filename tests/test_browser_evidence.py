@@ -92,6 +92,212 @@ async def test_browser_evidence_navigates_multi_page_checks_and_preserves_same_r
 
 
 @pytest.mark.anyio
+async def test_browser_evidence_returns_to_declared_route_after_check_navigates_away(
+    tmp_path: Path,
+):
+    async def root(_request):
+        return web.Response(
+            text="<main id='root'>Root <a id='go' href='/other'>Other</a></main>",
+            content_type="text/html",
+        )
+
+    async def other(_request):
+        return web.Response(text="<main id='other'>Other</main>", content_type="text/html")
+
+    app = web.Application()
+    app.router.add_get("/", root)
+    app.router.add_get("/other", other)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        result = await collect_browser_evidence(
+            app_url=f"http://127.0.0.1:{port}",
+            checks=[
+                {
+                    "id": "NAVIGATE",
+                    "route": "/",
+                    "actions": [
+                        {"action": "click", "selector": "#go"},
+                        {"action": "assert_url", "value": "/other"},
+                    ],
+                },
+                {
+                    "id": "ROOT-AGAIN",
+                    "route": "/",
+                    "actions": [{"action": "assert_visible", "selector": "#root"}],
+                },
+            ],
+            output_path=tmp_path / "route-reset.json",
+            headless=True,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert [item["status"] for item in result["checks"]] == ["ok", "ok"]
+
+
+@pytest.mark.anyio
+async def test_browser_evidence_resets_hash_drift_on_the_same_path(tmp_path: Path):
+    async def root(_request):
+        return web.Response(
+            text="""
+            <main id="home">Home <a id="go" href="#/library">Library</a></main>
+            <script>
+              addEventListener('hashchange', () => {
+                document.querySelector('main').id = location.hash ? 'library' : 'home';
+              });
+            </script>
+            """,
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/", root)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        result = await collect_browser_evidence(
+            app_url=f"http://127.0.0.1:{port}",
+            checks=[
+                {
+                    "id": "HASH-NAVIGATE",
+                    "route": "/",
+                        "actions": [
+                            {"action": "click", "selector": "#go"},
+                            {
+                                "action": "evaluate",
+                                "expression": "location.hash === '#/library'",
+                            },
+                        ],
+                },
+                {
+                    "id": "ROOT-AGAIN",
+                    "route": "/",
+                    "actions": [{"action": "assert_visible", "selector": "#home"}],
+                },
+            ],
+            output_path=tmp_path / "hash-route-reset.json",
+            headless=True,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert [item["status"] for item in result["checks"]] == ["ok", "ok"]
+    assert result["checks"][1]["url"].endswith("/")
+
+
+@pytest.mark.anyio
+async def test_browser_evidence_executes_typed_dom_aria_and_console_assertions(
+    tmp_path: Path,
+):
+    async def page(_request):
+        return web.Response(
+            text="""
+            <label id="query-label" for="query">Search</label>
+            <input id="query" aria-labelledby="query-label" required>
+            <button id="toggle" aria-expanded="false">Open</button>
+            <section id="panel" hidden>Details</section>
+            <script>
+              toggle.addEventListener('click', () => {
+                toggle.setAttribute('aria-expanded', 'true');
+                panel.hidden = false;
+                localStorage.setItem('panel', JSON.stringify({state: 'open'}));
+              });
+            </script>
+            """,
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/", page)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        result = await collect_browser_evidence(
+            app_url=f"http://127.0.0.1:{port}",
+            checks=[
+                {
+                    "id": "UI-ARIA",
+                    "route": "/",
+                    "actions": [
+                        {"action": "click", "selector": "#toggle"},
+                        {
+                            "action": "assert_aria",
+                            "selector": "#toggle",
+                            "attribute": "aria-expanded",
+                            "value": True,
+                        },
+                    ],
+                },
+                {
+                    "id": "UI-STORAGE",
+                    "route": "/",
+                    "actions": [
+                        {
+                            "action": "assert_storage_value",
+                            "storage": "local",
+                            "key": "panel",
+                            "value": "open",
+                            "match": "contains",
+                        }
+                    ],
+                },
+                {
+                    "id": "UI-CONSOLE",
+                    "route": "/",
+                    "actions": [{"action": "assert_no_console_errors"}],
+                },
+                {
+                    "id": "UI-AX-STATE",
+                    "route": "/",
+                    "actions": [
+                        {
+                            "action": "assert_aria",
+                            "selector": "#query",
+                            "attribute": "role",
+                            "value": "textbox",
+                        },
+                        {
+                            "action": "assert_aria",
+                            "selector": "#query",
+                            "attribute": "accessible_name",
+                            "value": "Search",
+                        },
+                        {
+                            "action": "assert_property",
+                            "selector": "#query",
+                            "name": "required",
+                            "value": True,
+                        },
+                    ],
+                },
+            ],
+            output_path=tmp_path / "typed.json",
+            headless=True,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert [item["status"] for item in result["checks"]] == ["ok", "ok", "ok", "ok"]
+    assert result["checks"][0]["steps"][-1]["output"] == {
+        "actual": "true",
+        "expected": True,
+    }
+    assert result["checks"][-1]["evidence_route"] == [
+        "real_browser", "ax_semantics", "internal_state", "dom"
+    ]
+
+
+@pytest.mark.anyio
 async def test_browser_evidence_executes_0805_advanced_interaction_primitives(
     tmp_path: Path,
 ):

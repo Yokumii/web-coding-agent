@@ -12,6 +12,7 @@ from src.config import HarnessConfig
 from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.file_comm import FileComm
 from src.orchestration.pricing import estimate_cost_usd
+from src.orchestration.task_inputs import task_input_image_paths
 from src.prompts.evaluator_vision import EVALUATOR_VISION_SYSTEM_PROMPT
 from src.utils.llm_client import CompletionResult, completion
 from src.utils.llm_json import extract_json_object
@@ -151,12 +152,37 @@ def _build_vision_messages(
     workdir: Path,
     screenshot_paths: list[str],
     review_context: str,
+    reference_image_paths: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     """构造 LiteLLM 共用的文本加图片消息体。"""
     content: list[dict[str, Any]] = [{"type": "text", "text": review_context}]
+    references = reference_image_paths or []
+    for path in references:
+        suffix = path.suffix.lower()
+        media_type = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".webp": "image/webp", ".gif": "image/gif",
+        }.get(suffix)
+        if media_type is None:
+            raise ValueError(f"unsupported task reference image: {path}")
+        content.append({
+            "type": "text",
+            "text": f"User reference image ({path.name}); judge only the requested target surface against it.",
+        })
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{media_type};base64,{_read_image_as_base64(path)}"
+            },
+        })
     for relative_path in screenshot_paths:
         absolute_path = _validate_screenshot_path(relative_path, workdir)
         b64 = _read_image_as_base64(absolute_path)
+        if references:
+            content.append({
+                "type": "text",
+                "text": f"Harness-rendered screenshot ({Path(relative_path).name}).",
+            })
         content.append(
             {
                 "type": "image_url",
@@ -212,6 +238,7 @@ def _perform_visual_review_request(
         workdir=workdir,
         screenshot_paths=screenshot_paths,
         review_context=review_context,
+        reference_image_paths=task_input_image_paths(workdir),
     )
 
     started = time.perf_counter()

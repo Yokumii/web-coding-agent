@@ -122,6 +122,58 @@ def _normalize_contract_grades(
     }
 
 
+def build_deterministic_failure_grades(
+    *,
+    file_comm: FileComm,
+    round_num: int,
+    sprint_num: int,
+    sprint_context: dict[str, Any],
+    ui_checks: list[dict[str, Any]],
+    edit_guard: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any], AgentRunStats]:
+    """Convert reproduced browser/semantic failures without a paid judge call."""
+    evidence = json.loads(
+        (file_comm.dir / f"browser_evidence_round_{round_num}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    grades = _normalize_contract_grades(
+        {},
+        round_num=round_num,
+        sprint_num=sprint_num,
+        sprint_context=sprint_context,
+        ui_checks=ui_checks,
+        evidence=evidence,
+        edit_guard=edit_guard,
+    )
+    failed = [
+        str(item.get("check_id", "unknown"))
+        for item in evidence.get("checks") or []
+        if isinstance(item, dict) and item.get("status") == "action_failed"
+    ]
+    if failed:
+        grades["bugs_found"] = [
+            "Deterministic browser contract failed: " + ", ".join(failed)
+        ]
+        grades["repair_instructions"] = [
+            "Repair only the failed browser contracts using the exact observed/expected evidence."
+        ]
+    grades["evidence_route"] = {
+        "decision": "deterministic_failure_short_circuit",
+        "llm_evaluator_called": False,
+        "browser_evidence_ref": f".harness/browser_evidence_round_{round_num}.json",
+    }
+    stats = AgentRunStats(
+        cost_usd=0.0,
+        duration_ms=0,
+        duration_api_ms=0,
+        token_usage={},
+        usage={"recovery": "deterministic_failure_short_circuit"},
+        model_usage={},
+    )
+    return _determine_passed(grades), grades, stats
+
+
 async def _run_contract_only_evaluator(
     config: HarnessConfig, file_comm: FileComm, round_num: int, sprint_num: int,
     sprint_context: dict[str, Any], ui_checks: list[dict[str, Any]], edit_guard: dict[str, Any] | None,
@@ -154,25 +206,9 @@ SPRINT:\n""" + json.dumps(sprint_context, ensure_ascii=False) + "\nUI_CHECKS:\n"
         parsed = {}
     grades = parsed.get("grades") if isinstance(parsed, dict) else None
     if not isinstance(grades, dict):
-        repair = await client.complete(
-            model=config.evaluator_model,
-            messages=[
-                {"role": "system", "content": "Return JSON only; no prose."},
-                {"role": "user", "content": "Convert the following evaluator response into exactly {\"grades\": {...}}. Preserve its pass/fail judgements and include all required grade fields.\n\n" + content},
-            ],
-            temperature=0,
+        raise RuntimeError(
+            "contract-only evaluator returned no grades JSON; automatic paid format retries are disabled"
         )
-        content = repair["choices"][0]["message"].get("content") or ""
-        try:
-            parsed = extract_json_object(content)
-        except ValueError as exc:
-            raise RuntimeError("contract-only evaluator returned no grades JSON after one format repair") from exc
-        grades = parsed.get("grades") if isinstance(parsed, dict) else None
-        if not isinstance(grades, dict):
-            raise RuntimeError("contract-only evaluator returned no grades JSON after one format repair")
-        for key, value in (repair.get("usage") or {}).items():
-            if isinstance(value, int):
-                response.setdefault("usage", {})[key] = int(response.get("usage", {}).get(key, 0)) + value
     grades = _normalize_contract_grades(
         grades, round_num=round_num, sprint_num=sprint_num,
         sprint_context=sprint_context, ui_checks=ui_checks,

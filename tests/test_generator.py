@@ -12,6 +12,8 @@ from src.agents.generator import (
     _is_scope_contract_only_repair,
     _is_harness_checkpoint_for_round,
     _validate_generator_commits,
+    _validate_no_external_runtime_dependencies,
+    _validate_minimal_path_final_diff,
     _validate_repair_scope,
     _validate_generator_runnable_files,
     _trace_confirms_commit,
@@ -21,6 +23,7 @@ from src.agents.generator import (
 )
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.minimal_path_guidance import MinimalPathPolicy
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
 from src.agents._shared import expose_local_claude_skills
 
@@ -89,6 +92,171 @@ def test_trace_confirms_only_the_exact_recorded_commit(tmp_path: Path):
     assert not _trace_confirms_commit(trace, "def9876", "feat(form): validate contact form")
 
 
+def test_final_diff_guard_rejects_indirect_protected_page_change(tmp_path: Path):
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "catalog.js").write_text("catalog before\n")
+    (frontend / "settings.js").write_text("settings before\n")
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, text=True,
+        check=True, capture_output=True,
+    ).stdout.strip()
+    (frontend / "catalog.js").write_text("catalog after\n")
+    (frontend / "settings.js").write_text("settings after\n")
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "feat: edit"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    plan = {
+        "schema_version": "minimal-path-plan-v1",
+        "round": 1,
+        "source_change_cone": {
+            "initial_paths": ["frontend/catalog.js"],
+            "local_paths": ["frontend/catalog.js"],
+            "dependency_paths": [],
+            "protected_paths": ["frontend/settings.js"],
+            "dependency_edges": [],
+        },
+        "route_scope": {
+            "cross_route_shared_paths": [],
+            "off_target_paths": ["frontend/settings.js"],
+        },
+        "budgets": {"max_patch_lines": 20, "max_touched_files": 2},
+    }
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    policy.touched_paths.add("frontend/catalog.js")
+
+    error = _validate_minimal_path_final_diff(frontend, baseline, policy)
+
+    assert error is not None
+    assert "frontend/settings.js" in error
+    assert "protected multi-page source" in error
+
+
+def test_final_diff_guard_allows_only_guarded_region_in_shared_file(tmp_path: Path):
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    shared_before = (
+        "/* --- CATALOG MODULE --- */\n"
+        "const Catalog = { render: () => 'old catalog' };\n\n"
+        "/* --- SETTINGS MODULE --- */\n"
+        "const Settings = { render: () => 'old settings' };\n"
+    )
+    (frontend / "app.js").write_text(shared_before)
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, text=True,
+        check=True, capture_output=True,
+    ).stdout.strip()
+    plan = {
+        "schema_version": "minimal-path-plan-v3",
+        "round": 1,
+        "source_change_cone": {
+            "initial_paths": ["frontend/app.js"],
+            "local_paths": ["frontend/app.js"],
+            "dependency_paths": [],
+            "protected_paths": [],
+            "dependency_edges": [],
+            "guarded_shared_regions": [
+                {
+                    "path": "frontend/app.js",
+                    "route": "/catalog.html",
+                    "symbol": "Catalog",
+                    "kind": "object",
+                    "start_line": 1,
+                    "end_line": 2,
+                }
+            ],
+        },
+        "route_scope": {
+            "cross_route_shared_paths": ["frontend/app.js"],
+            "off_target_paths": [],
+        },
+        "budgets": {"max_patch_lines": 20, "max_touched_files": 1},
+    }
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    policy.touched_paths.add("frontend/app.js")
+
+    (frontend / "app.js").write_text(
+        shared_before.replace("old catalog", "new catalog")
+    )
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "catalog"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    assert _validate_minimal_path_final_diff(frontend, baseline, policy) is None
+
+    (frontend / "app.js").write_text(
+        (frontend / "app.js").read_text().replace("old settings", "changed settings")
+    )
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "settings"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    error = _validate_minimal_path_final_diff(frontend, baseline, policy)
+    assert error is not None and "outside the guarded target-route region" in error
+
+
+def test_final_diff_guard_rejects_uncontracted_asset_change(tmp_path: Path):
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "catalog.js").write_text("before\n")
+    (frontend / "hero.png").write_bytes(b"before")
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, text=True,
+        check=True, capture_output=True,
+    ).stdout.strip()
+    (frontend / "hero.png").write_bytes(b"after")
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "feat: image"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    plan = {
+        "schema_version": "minimal-path-plan-v1", "round": 1,
+        "source_change_cone": {
+            "initial_paths": ["frontend/catalog.js"],
+            "local_paths": ["frontend/catalog.js"], "dependency_paths": [],
+            "protected_paths": [], "dependency_edges": [],
+        },
+        "route_scope": {"cross_route_shared_paths": [], "off_target_paths": []},
+        "budgets": {"max_patch_lines": 20, "max_touched_files": 2},
+    }
+
+    error = _validate_minimal_path_final_diff(
+        frontend, baseline, MinimalPathPolicy.from_plan(tmp_path, plan)
+    )
+
+    assert error is not None and "hero.png" in error
+    assert "resource-manifest contract" in error
+
+
 def test_trace_written_frontend_paths_requires_successful_explicit_source_writes(tmp_path: Path):
     trace = tmp_path / "generator.jsonl"
     trace.write_text(
@@ -146,6 +314,171 @@ def test_interrupted_checkpoint_requires_trace_recorded_validation(tmp_path: Pat
 
     assert _checkpoint_interrupted_model_work(frontend, file_comm, workdir, 1, "generate") is None
     assert subprocess.run(["git", "status", "--porcelain"], cwd=frontend, text=True, capture_output=True, check=True).stdout == " M main.js\n"
+
+
+def test_interrupted_root_generate_checkpoints_trace_written_untracked_files(tmp_path: Path):
+    import json
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "chore: baseline"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    (frontend / "main.js").write_text("const value = 1;\n", encoding="utf-8")
+    file_comm = FileComm(tmp_path / ".harness")
+    trace = file_comm.dir / "traces" / "generator_round_1.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("\n".join([
+        json.dumps({"event": "run_start", "model": "qwen3.6-plus"}),
+        json.dumps({"event": "assistant", "message": {"tool_calls": [{"function": {"name": "write_file", "arguments": json.dumps({"path": "frontend/main.js"})}}]}}),
+        json.dumps({"event": "tool", "name": "write_file", "ok": True, "output": "wrote"}),
+        json.dumps({"event": "usage", "cumulative_usage": {"input_tokens": 100, "output_tokens": 20}, "estimated_cost_usd": 0.001}),
+        json.dumps({"event": "assistant", "message": {"tool_calls": [{"function": {"name": "run_command", "arguments": json.dumps({"command": "node --check frontend/main.js"})}}]}}),
+        json.dumps({"event": "tool", "name": "run_command", "ok": True, "output": ""}),
+    ]) + "\n", encoding="utf-8")
+
+    commit = _checkpoint_interrupted_model_work(
+        frontend, file_comm, tmp_path, 1, "generate"
+    )
+
+    assert commit == subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=frontend, check=True,
+        text=True, capture_output=True,
+    ).stdout == ""
+    metadata = json.loads(
+        (file_comm.dir / "recovery_commit_round_1.json").read_text(encoding="utf-8")
+    )
+    assert metadata["source_files"] == ["main.js"]
+    assert metadata["precheckpoint_usage"]["estimated_cost_usd"] == 0.001
+
+
+def test_interrupted_generate_prompt_does_not_hide_untracked_files(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.dir.mkdir(parents=True, exist_ok=True)
+    sprint_context = {
+        "number": 1,
+        "title": "Root",
+        "feature_ids": ["F001"],
+        "deliverables": [],
+        "exit_criteria": [],
+    }
+
+    prompt = _build_generator_prompt(
+        mode="generate",
+        file_comm=file_comm,
+        round_num=1,
+        sprint_num=1,
+        sprint_context=sprint_context,
+        accepted_sprints={"accepted": []},
+        resume_uncommitted_work=True,
+    )
+
+    assert "git -C frontend status --short" in prompt
+    assert "untracked" in prompt
+
+
+def test_generator_rejects_external_runtime_resources_but_allows_plain_links(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<a href="https://example.com/docs">Docs</a>\n'
+        '<link rel="stylesheet" href="https://fonts.example.com/font.css">\n',
+        encoding="utf-8",
+    )
+
+    error = _validate_no_external_runtime_dependencies(frontend)
+
+    assert error is not None
+    assert "index.html" in error
+    assert "fonts.example.com" in error
+    (frontend / "index.html").write_text(
+        '<a href="https://example.com/docs">Docs</a>\n'
+        '<link rel="stylesheet" href="styles.css">\n',
+        encoding="utf-8",
+    )
+    assert _validate_no_external_runtime_dependencies(frontend) is None
+
+
+def test_generator_rejects_external_css_and_javascript_network_dependencies(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "styles.css").write_text(
+        '.hero { background: url("https://cdn.example.com/hero.png"); }\n',
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text(
+        'fetch("https://api.example.com/books");\n', encoding="utf-8"
+    )
+
+    error = _validate_no_external_runtime_dependencies(frontend)
+
+    assert error is not None
+    assert "app.js" in error
+    assert "styles.css" in error
+
+
+def test_incremental_generator_grandfathers_accepted_external_runtime_dependency(
+    tmp_path: Path,
+):
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=frontend,
+        check=True,
+    )
+    (frontend / "index.html").write_text(
+        '<link rel="stylesheet" href="https://fonts.example.com/legacy.css">\n',
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text("const version = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "feat: accepted source"],
+        cwd=frontend,
+        check=True,
+        capture_output=True,
+    )
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=frontend,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    (frontend / "app.js").write_text("const version = 2;\n", encoding="utf-8")
+
+    assert _validate_no_external_runtime_dependencies(
+        frontend, baseline_commit=baseline
+    ) is None
+
+    (frontend / "app.js").write_text(
+        'fetch("https://api.example.com/new");\n', encoding="utf-8"
+    )
+    error = _validate_no_external_runtime_dependencies(
+        frontend, baseline_commit=baseline
+    )
+    assert error is not None
+    assert "api.example.com/new" in error
 
 
 def test_harness_checkpoint_requires_exact_metadata_commit_and_clean_tree(tmp_path: Path):
@@ -837,7 +1170,10 @@ def test_forward_prompt_consumes_harness_owned_minimal_path_plan(tmp_path: Path)
     assert "harness already materialized" in prompt
     assert "Existing source overwrites are rejected" in prompt
     assert "route_scope.target_routes" in prompt
-    assert "cross_route_shared_paths" in prompt
+    assert "guarded_shared_regions" in prompt
+    assert "route_isolation_strategy" in prompt
+    assert "planned_companion_path" in prompt
+    assert "do not wrap or rewrite an accepted page script" in prompt
     assert "write `.harness/edit_scope_round_1.json`" not in prompt
 
 
@@ -903,7 +1239,9 @@ def test_repair_scope_gate_rejects_large_diff(tmp_path: Path):
     subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
     subprocess.run(["git", "commit", "-m", "fix(core): broad rewrite"], cwd=frontend, check=True, capture_output=True)
 
-    error = _validate_repair_scope(frontend, baseline)
+    error = _validate_repair_scope(
+        frontend, baseline, max_files=2, max_changed_lines=120
+    )
     assert error is not None
     assert "too broad" in error
     assert "1002 changed lines" in error
@@ -928,7 +1266,9 @@ def test_repair_scope_gate_accepts_small_diff(tmp_path: Path):
     subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
     subprocess.run(["git", "commit", "-m", "fix(core): enable interaction"], cwd=frontend, check=True, capture_output=True)
 
-    assert _validate_repair_scope(frontend, baseline) is None
+    assert _validate_repair_scope(
+        frontend, baseline, max_files=2, max_changed_lines=120
+    ) is None
 
 
 def test_generator_runnable_files_gate_requires_package_json(tmp_path: Path):

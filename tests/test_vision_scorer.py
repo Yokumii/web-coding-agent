@@ -84,6 +84,31 @@ def test_build_vision_messages_uses_unified_image_url_block(tmp_path: Path):
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_build_vision_messages_labels_user_reference_before_rendered_screenshots(tmp_path: Path):
+    from src.agents.vision_scorer import _build_vision_messages
+
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    screenshot = harness / "round.png"
+    screenshot.write_bytes(b"screenshot")
+    reference = harness / "inputs" / "reference.png"
+    reference.parent.mkdir()
+    reference.write_bytes(b"reference")
+
+    messages = _build_vision_messages(
+        workdir=tmp_path,
+        screenshot_paths=[".harness/round.png"],
+        review_context="review",
+        reference_image_paths=[reference],
+    )
+
+    content = messages[1]["content"]
+    assert content[1]["text"].startswith("User reference image")
+    assert content[2]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert content[3]["text"].startswith("Harness-rendered screenshot")
+    assert content[4]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
 def test_build_vision_messages_rejects_path_traversal(tmp_path: Path):
     (tmp_path / ".harness").mkdir()
     with pytest.raises(ValueError, match="escapes workdir|outside"):

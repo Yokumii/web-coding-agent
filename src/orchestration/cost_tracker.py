@@ -41,6 +41,16 @@ class CostTracker:
     def is_over_budget(self) -> bool:
         return self.total_cost >= self.max_budget
 
+    def phase_total(self, *prefixes: str) -> float:
+        return sum(
+            cost
+            for name, cost in self.breakdown.items()
+            if any(name == prefix or name.startswith(prefix + "_") for prefix in prefixes)
+        )
+
+    def phase_budget_exceeded(self, limit_usd: float, *prefixes: str) -> bool:
+        return limit_usd <= 0 or self.phase_total(*prefixes) >= limit_usd
+
     def remaining(self) -> float:
         return max(0.0, self.max_budget - self.total_cost)
 

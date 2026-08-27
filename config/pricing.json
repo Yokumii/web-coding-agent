@@ -1,7 +1,10 @@
 {
-  "version": 1,
+  "version": 2,
   "currency": "USD",
   "unit": "per_million_tokens",
+  "pricing_basis": {
+    "qwen3.6-plus": "Conservative USD upper bound derived from the official Beijing >256K CNY tier at 0.15 USD/CNY; requests at or below 256K are billed lower by the provider."
+  },
   "models": {
     "claude-opus-4-7": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_creation": 6.25 },
     "claude-opus-4-6": { "input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_creation": 6.25 },
@@ -13,6 +16,7 @@
     "deepseek-v4-pro": { "input": 0.435, "output": 0.87 },
     "deepseek-chat": { "input": 0.27, "output": 1.10 },
     "kimi-k2.6": { "input": 0.95, "output": 4.0 },
+    "qwen3.6-plus": { "input": 1.2, "output": 7.2 },
     "gpt-5.5": { "input": 5.0, "output": 30.0},
     "gpt-5.4": { "input": 2.5, "output": 15.0},
     "gpt-4o": { "input": 2.5, "output": 10.0 },

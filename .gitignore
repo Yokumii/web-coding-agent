@@ -16,6 +16,7 @@ runs/
 .claude/worktrees/
 .claude/settings.local.json
 .playwright-mcp/
+agent.md
 
 # Python
 __pycache__/

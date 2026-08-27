@@ -8,8 +8,10 @@ from claude_agent_sdk.types import ResultMessage
 
 from src.agents.planner import (
     PlannerValidationError,
+    _check_edit_transaction,
     _make_planner_stop_hook,
     _validate_planning_bundle,
+    recover_trace_proven_planner_checkpoint,
     run_planner,
 )
 from src.config import HarnessConfig
@@ -121,6 +123,117 @@ def _write_valid_planning_bundle(file_comm: FileComm) -> None:
     file_comm.write_progress("# Progress Log\n\n## planning\n- status: complete")
 
 
+def test_explicit_edit_is_one_multi_page_transaction(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "edit_task_contract.json").write_text(
+        '{"schema_version":"edit-task-contract-v1"}'
+    )
+    sprint = {
+        "number": 1,
+        "requirement_changes": [{"requirement_id": "REQ-1", "relation": "add"}],
+        "impact_tags": ["shared-store"],
+        "visual_evidence_reason": "State-only change uses DOM/property evidence.",
+    }
+    verification = {"sprints": [{"sprint": 1, "checks": [
+        {"id": "UI-a", "requirement_id": "REQ-1", "impact_tags": ["shared-store"]},
+        {"id": "UI-b", "requirement_id": "REQ-1", "impact_tags": ["shared-store"]},
+    ]}]}
+
+    _check_edit_transaction(
+        file_comm,
+        {"total_sprints": 1, "sprints": [sprint]},
+        verification,
+    )
+
+    with pytest.raises(PlannerValidationError, match="exactly one Sprint"):
+        _check_edit_transaction(
+            file_comm,
+            {"total_sprints": 2, "sprints": [sprint, {**sprint, "number": 2}]},
+            verification,
+        )
+
+
+def _write_planner_trace(file_comm: FileComm, artifact_names: list[str]) -> None:
+    trace_dir = file_comm.dir / "traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    events: list[dict] = []
+    for index, name in enumerate(artifact_names):
+        events.extend(
+            [
+                {
+                    "event": "assistant",
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps(
+                                        {"path": f".harness/{name}", "content": "model output"}
+                                    ),
+                                },
+                                "id": f"call-{index}",
+                            }
+                        ]
+                    },
+                },
+                {"event": "tool", "name": "write_file", "ok": True},
+            ]
+        )
+    events.append(
+        {
+            "event": "run_error",
+            "cumulative_usage": {"input_tokens": 100, "output_tokens": 20},
+            "estimated_cost_usd": 0.001,
+        }
+    )
+    (trace_dir / "planner.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def test_recover_trace_proven_planner_checkpoint_without_second_model_call(
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    _write_planner_trace(
+        file_comm,
+        [
+            "spec.md",
+            "design_tokens.json",
+            "feature_list.json",
+            "sprint_plan.json",
+            "ui_verification_plan.json",
+        ],
+    )
+
+    stats = recover_trace_proven_planner_checkpoint(file_comm, HarnessConfig())
+
+    assert stats is not None
+    assert stats.cost_usd == 0.001
+    assert stats.token_usage == {"input_tokens": 100, "output_tokens": 20}
+    assert stats.usage["recovery"] == "trace_proven_planner_checkpoint"
+    assert file_comm.read_accepted_sprints() == {
+        "accepted": [],
+        "current_target": 1,
+        "last_evaluated_round": 0,
+    }
+
+
+def test_planner_checkpoint_recovery_requires_every_semantic_artifact_in_trace(
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    _write_planner_trace(
+        file_comm,
+        ["spec.md", "design_tokens.json", "feature_list.json", "sprint_plan.json"],
+    )
+
+    assert recover_trace_proven_planner_checkpoint(file_comm, HarnessConfig()) is None
+
+
 def test_final_project_mode_instruction_requests_natural_complete_roadmap():
     from src.agents.planner import _build_planner_prompt
 
@@ -158,7 +271,7 @@ def test_planner_rejects_malformed_browser_action_contract(tmp_path: Path):
         "expected_result": "Control is visible.", "critical": True, "category": "scroll",
         "actions": [
             {"action": "scroll", "count": 0},
-            {"action": "evaluate", "expression": "window.scrollTo(0, 500); return true"},
+            {"action": "assert_visible", "selector": "#control"},
         ],
     }]}]})
 
@@ -179,7 +292,7 @@ def test_planner_rejects_unsafe_browser_route(tmp_path: Path, route: str):
         _validate_planning_bundle(file_comm)
 
 
-def test_planner_requires_final_boolean_evaluate_for_authored_contract(tmp_path: Path):
+def test_planner_requires_final_typed_assertion_for_authored_contract(tmp_path: Path):
     file_comm = FileComm(tmp_path / ".harness")
     _write_valid_planning_bundle(file_comm)
     file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
@@ -188,11 +301,11 @@ def test_planner_requires_final_boolean_evaluate_for_authored_contract(tmp_path:
         "actions": [{"action": "click", "selector": "#control"}],
     }]}]})
 
-    with pytest.raises(PlannerValidationError, match="must end with evaluate"):
+    with pytest.raises(PlannerValidationError, match="must end with a typed assertion"):
         _validate_planning_bundle(file_comm)
 
 
-def test_planner_rejects_multiple_evaluates_in_one_action_contract(tmp_path: Path):
+def test_planner_accepts_related_typed_assertions_in_one_action_contract(tmp_path: Path):
     file_comm = FileComm(tmp_path / ".harness")
     _write_valid_planning_bundle(file_comm)
     file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
@@ -200,13 +313,291 @@ def test_planner_rejects_multiple_evaluates_in_one_action_contract(tmp_path: Pat
         "expected_result": "State changes.", "critical": True, "category": "interaction",
         "actions": [
             {"action": "click", "selector": "#control"},
-            {"action": "evaluate", "expression": "document.querySelector('#control') !== null"},
-            {"action": "evaluate", "expression": "document.querySelector('#control').classList.contains('active')"},
+            {"action": "assert_visible", "selector": "#control"},
+            {"action": "assert_attribute", "selector": "#control", "name": "data-state", "value": "active"},
         ],
     }]}]})
 
-    with pytest.raises(PlannerValidationError, match="exactly one final evaluate"):
+    _validate_planning_bundle(file_comm)
+
+
+@pytest.mark.parametrize("attribute", ["class", "style"])
+def test_planner_rejects_exact_presentation_attribute_as_state_proxy(
+    tmp_path: Path, attribute: str
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Focus the control.",
+        "expected_result": "Focus is observable.", "critical": True,
+        "category": "accessibility", "route": "/",
+        "actions": [
+            {"action": "key_press", "selector": "#name", "key": "Tab"},
+            {"action": "assert_focus", "selector": "#save"},
+            {"action": "assert_attribute", "selector": "#save", "name": attribute, "value": "focused"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="exact class/style assertions are forbidden"):
         _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_observational_exact_count_without_declared_fixtures(
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Inspect catalog.",
+        "expected_result": "Catalog has suggestions.", "critical": True,
+        "category": "functionality", "route": "/catalog",
+        "actions": [
+            {"action": "reload"},
+            {"action": "wait_for", "selector": ".item", "state": "visible"},
+            {"action": "assert_count", "selector": ".item", "count": 1},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="exact count has no state-producing setup or declared fixtures"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_accepts_filter_literal_backed_by_declared_fixture(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Filter catalog.",
+        "expected_result": "Matching fixture remains.", "critical": True,
+        "category": "functionality", "route": "/catalog",
+        "fixtures": ["Dune"],
+        "actions": [
+            {"action": "fill", "selector": "#filter", "value": "Dune"},
+            {"action": "assert_text", "selector": ".item", "value": "Dune", "match": "contains"},
+        ],
+    }]}]})
+
+    _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_filter_literal_without_declared_fixture(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Filter catalog.",
+        "expected_result": "Matching item remains.", "critical": True,
+        "category": "functionality", "route": "/catalog",
+        "actions": [
+            {"action": "fill", "selector": "#filter", "value": "Dune"},
+            {"action": "assert_text", "selector": ".item", "value": "Dune", "match": "contains"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="filter assertion literal 'Dune' is not declared in fixtures"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_more_than_four_typed_assertions(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    actions = [
+        {"action": "assert_visible", "selector": f"#control-{index}"}
+        for index in range(5)
+    ]
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Inspect one journey.",
+        "expected_result": "Related states are visible.", "critical": True,
+        "category": "interaction", "route": "/", "actions": actions,
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="1 to 4 related typed assertions"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_tab_asserting_focus_remains_on_start(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Tab from save.",
+        "expected_result": "Focus advances.", "critical": True, "category": "accessibility",
+        "route": "/",
+        "actions": [
+            {"action": "key_press", "selector": "#save", "key": "Tab"},
+            {"action": "assert_focus", "selector": "#save"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="destination selector"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_tab_starting_from_global_container(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Tab into the form.",
+        "expected_result": "Title receives focus.", "critical": True,
+        "category": "accessibility", "route": "/",
+        "actions": [
+            {"action": "key_press", "selector": "body", "key": "Tab"},
+            {"action": "assert_focus", "selector": "#title"},
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="Tab start must name a focusable control"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_requires_explicit_storage_string_match_mode(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Check saved item.",
+        "expected_result": "Storage contains the title.", "critical": True,
+        "category": "persistence", "route": "/",
+        "actions": [
+            {
+                "action": "assert_storage_value",
+                "storage": "local",
+                "key": "items",
+                "value": "Dune",
+            },
+        ],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="string storage assertions require explicit match"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_initial_empty_state_after_stateful_route_checks(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [
+        {
+            "id": "UI-001", "feature_id": "F001", "task": "Create item.",
+            "expected_result": "Item exists.", "critical": True,
+            "category": "functionality", "route": "/",
+            "actions": [
+                {"action": "fill", "selector": "#name", "value": "Atlas"},
+                {"action": "click", "selector": "#create"},
+                {"action": "assert_count", "selector": ".item", "count": 1},
+            ],
+        },
+        {
+            "id": "UI-002", "feature_id": "F001", "task": "Show initial empty state.",
+            "expected_result": "Empty guidance is visible.", "critical": True,
+            "category": "empty_state", "route": "/",
+            "actions": [
+                {"action": "reload"},
+                {"action": "assert_visible", "selector": ".empty-state"},
+            ],
+        },
+    ]}]})
+
+    with pytest.raises(PlannerValidationError, match="initial empty-state reload"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_persistence_count_not_established_in_current_sprint(
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [
+        {
+            "id": "UI-001", "feature_id": "F001", "task": "Save from catalog.",
+            "expected_result": "One item is visible.", "critical": True,
+            "category": "functionality", "route": "/library.html",
+            "actions": [
+                {"action": "click", "selector": ".save-btn"},
+                {"action": "click", "selector": "a[href='/']"},
+                {"action": "assert_url", "value": "/"},
+                {"action": "assert_visible", "selector": ".item"},
+            ],
+        },
+        {
+            "id": "UI-002", "feature_id": "F001", "task": "Reload saved items.",
+            "expected_result": "Two items persist.", "critical": True,
+            "category": "persistence", "route": "/",
+            "actions": [
+                {"action": "reload"},
+                {"action": "assert_count", "selector": ".item", "count": 2},
+            ],
+        },
+    ]}]})
+
+    with pytest.raises(PlannerValidationError, match="current-sprint setup establishes only 1"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_accepts_persistence_count_established_after_route_transition(
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [
+        {
+            "id": "UI-001", "feature_id": "F001", "task": "Save from catalog.",
+            "expected_result": "One item is visible.", "critical": True,
+            "category": "functionality", "route": "/library.html",
+            "actions": [
+                {"action": "click", "selector": ".save-btn"},
+                {"action": "click", "selector": "a[href='/']"},
+                {"action": "assert_url", "value": "/"},
+                {"action": "assert_visible", "selector": ".item"},
+            ],
+        },
+        {
+            "id": "UI-002", "feature_id": "F001", "task": "Reload saved item.",
+            "expected_result": "One item persists.", "critical": True,
+            "category": "persistence", "route": "/",
+            "actions": [
+                {"action": "reload"},
+                {"action": "assert_count", "selector": ".item", "count": 1},
+            ],
+        },
+    ]}]})
+
+    _validate_planning_bundle(file_comm)
+
+
+def test_planner_rejects_legacy_model_authored_evaluate(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [{
+        "id": "UI-001", "feature_id": "F001", "task": "Activate control.",
+        "expected_result": "State changes.", "critical": True, "category": "interaction",
+        "actions": [{"action": "evaluate", "expression": "true"}],
+    }]}]})
+
+    with pytest.raises(PlannerValidationError, match="must end with a typed assertion"):
+        _validate_planning_bundle(file_comm)
+
+
+def test_planner_reports_all_typed_contract_errors_in_one_retry(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_valid_planning_bundle(file_comm)
+    file_comm.write_ui_verification_plan({"sprints": [{"sprint": 1, "checks": [
+        {
+            "id": "UI-001", "feature_id": "F001", "task": "Check class.",
+            "expected_result": "Changed.", "critical": True, "category": "interaction",
+            "actions": [{
+                "action": "assert_attribute", "selector": "#control",
+                "attribute": "class", "match": "contains", "value": "active",
+            }],
+        },
+        {
+            "id": "UI-002", "feature_id": "F001", "task": "Check URL.",
+            "expected_result": "Changed.", "critical": True, "category": "interaction",
+            "actions": [{"action": "assert_url", "url": "/done"}],
+        },
+    ]}]})
+
+    with pytest.raises(PlannerValidationError) as caught:
+        _validate_planning_bundle(file_comm)
+
+    message = str(caught.value)
+    assert "UI-001" in message and "unsupported fields: attribute, match" in message
+    assert "UI-002" in message and "unsupported fields: url" in message
 
 
 def test_planner_rejects_invalid_action_settle_time(tmp_path: Path):
@@ -217,7 +608,7 @@ def test_planner_rejects_invalid_action_settle_time(tmp_path: Path):
         "expected_result": "State changes.", "critical": True, "category": "interaction",
         "actions": [
             {"action": "fill", "selector": "#control", "value": "x", "settle_ms": 9000},
-            {"action": "evaluate", "expression": "true"},
+            {"action": "assert_visible", "selector": "#control"},
         ],
     }]}]})
 
@@ -233,7 +624,7 @@ def test_planner_rejects_unsupported_browser_action_before_evaluation(tmp_path: 
         "expected_result": "State changes.", "critical": True, "category": "interaction",
         "actions": [
             {"action": "teleport", "selector": "#control"},
-            {"action": "evaluate", "expression": "true"},
+            {"action": "assert_visible", "selector": "#control"},
         ],
     }]}]})
 
@@ -253,7 +644,7 @@ def test_planner_rejects_unsafe_upload_fixture_contract(tmp_path: Path):
                 "selector": "#upload",
                 "files": [{"name": "../secret.txt", "mime_type": "text/plain", "content": "x"}],
             },
-            {"action": "evaluate", "expression": "true"},
+            {"action": "assert_visible", "selector": "#upload"},
         ],
     }]}]})
 
@@ -811,7 +1202,9 @@ def test_validate_sprint_plan_rejects_too_many_deliverables(tmp_path: Path):
     file_comm.write_sprint_plan(sprint_plan)
 
     with pytest.raises(PlannerValidationError, match=r"deliverables.*max allowed is 5"):
-        _validate_planning_bundle(file_comm)
+        _validate_planning_bundle(
+            file_comm, HarnessConfig(max_deliverables_per_sprint=5)
+        )
 
 
 def test_validate_sprint_plan_rejects_too_many_exit_criteria(tmp_path: Path):
@@ -823,7 +1216,9 @@ def test_validate_sprint_plan_rejects_too_many_exit_criteria(tmp_path: Path):
     file_comm.write_sprint_plan(sprint_plan)
 
     with pytest.raises(PlannerValidationError, match=r"exit_criteria.*max allowed is 5"):
-        _validate_planning_bundle(file_comm)
+        _validate_planning_bundle(
+            file_comm, HarnessConfig(max_exit_criteria_per_sprint=5)
+        )
 
 
 def test_validate_sprint_plan_accepts_at_cap(tmp_path: Path):
@@ -880,10 +1275,9 @@ def test_expansive_data_enforces_three_item_sprint_cap(tmp_path: Path):
 def test_planner_prompt_documents_sprint_size_caps():
     from src.prompts.planner import PLANNER_SYSTEM_PROMPT
 
-    # Hard cap on per-sprint scope must be visible in the system prompt so
-    # the planner doesn't ship 8-deliverable mega-sprints (see test-chunk-1-c2).
-    assert "5 deliverables" in PLANNER_SYSTEM_PROMPT
-    assert "5 exit_criteria" in PLANNER_SYSTEM_PROMPT
+    # Bounded caps remain visible while allowing one coherent multi-page slice.
+    assert "10 concise deliverables" in PLANNER_SYSTEM_PROMPT
+    assert "10 concise exit_criteria" in PLANNER_SYSTEM_PROMPT
     assert "vertical slice" in PLANNER_SYSTEM_PROMPT.lower()
 
 

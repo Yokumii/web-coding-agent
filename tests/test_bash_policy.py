@@ -25,6 +25,17 @@ def test_validate_bash_command_rejects_path_escape():
         validate_bash_command("cat ../secret.txt")
 
 
+def test_validate_bash_command_allows_shell_punctuation_inside_quoted_commit_message():
+    assert validate_bash_command(
+        'git commit -m "feat(dashboard): add Paper & Ink theme"'
+    ) == [
+        "git",
+        "commit",
+        "-m",
+        "feat(dashboard): add Paper & Ink theme",
+    ]
+
+
 def test_validate_bash_command_readonly_rejects_inline_python():
     with pytest.raises(ValueError, match="inline code flag not allowed"):
         validate_bash_command_readonly("python3 -c 'print(1)'")

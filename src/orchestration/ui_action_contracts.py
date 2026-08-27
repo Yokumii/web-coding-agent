@@ -5,8 +5,32 @@ from pathlib import PurePath
 from typing import Any
 
 
+TYPED_ASSERTION_ACTIONS = frozenset(
+    {
+        "assert_aria",
+        "assert_attribute",
+        "assert_count",
+        "assert_focus",
+        "assert_hidden",
+        "assert_property",
+        "assert_no_console_errors",
+        "assert_storage_value",
+        "assert_text",
+        "assert_url",
+        "assert_value",
+        "assert_visible",
+    }
+)
+
+# ``evaluate`` remains executable only so historical tapes can be replayed and
+# audited.  New planner output is required to end in one of the bounded typed
+# assertions above; model-authored JavaScript is not a current contract format.
+LEGACY_ASSERTION_ACTIONS = frozenset({"evaluate"})
+ASSERTION_UI_ACTIONS = TYPED_ASSERTION_ACTIONS | LEGACY_ASSERTION_ACTIONS
+
 SUPPORTED_UI_ACTIONS = frozenset(
     {
+        *TYPED_ASSERTION_ACTIONS,
         "assert_form_valid",
         "click",
         "drag_and_drop",
@@ -15,6 +39,7 @@ SUPPORTED_UI_ACTIONS = frozenset(
         "fill",
         "hover",
         "key_press",
+        "reload",
         "scroll",
         "select_option",
         "set_input_files",
@@ -24,7 +49,19 @@ SUPPORTED_UI_ACTIONS = frozenset(
 )
 
 _ACTION_FIELDS = {
+    "assert_aria": {"selector", "attribute", "value"},
+    "assert_attribute": {"selector", "name", "value"},
+    "assert_count": {"selector", "count"},
+    "assert_focus": {"selector"},
     "assert_form_valid": {"selector"},
+    "assert_hidden": {"selector"},
+    "assert_property": {"selector", "name", "value"},
+    "assert_no_console_errors": set(),
+    "assert_storage_value": {"storage", "key", "value", "match"},
+    "assert_text": {"selector", "value", "match"},
+    "assert_url": {"value", "match"},
+    "assert_value": {"selector", "value"},
+    "assert_visible": {"selector"},
     "click": {"selector", "button"},
     "drag_and_drop": {"source_selector", "target_selector"},
     "emulate_media": {"media", "color_scheme"},
@@ -32,6 +69,7 @@ _ACTION_FIELDS = {
     "fill": {"selector", "value"},
     "hover": {"selector"},
     "key_press": {"selector", "key", "count"},
+    "reload": set(),
     "scroll": {"y"},
     "select_option": {"selector", "value"},
     "set_input_files": {"selector", "files"},
@@ -79,7 +117,16 @@ def validate_ui_action(step: dict[str, Any]) -> None:
         _bounded_int(step, "settle_ms", action, minimum=0, maximum=5_000)
 
     if action in {
+        "assert_aria",
+        "assert_attribute",
+        "assert_count",
+        "assert_focus",
         "assert_form_valid",
+        "assert_hidden",
+        "assert_property",
+        "assert_text",
+        "assert_value",
+        "assert_visible",
         "click",
         "fill",
         "hover",
@@ -88,7 +135,64 @@ def validate_ui_action(step: dict[str, Any]) -> None:
         "wait_for",
     }:
         _non_empty_string(step, "selector", action)
-    if action == "set_viewport":
+    if action == "assert_aria":
+        attribute = _non_empty_string(step, "attribute", action)
+        if attribute != "role" and attribute != "accessible_name" and not attribute.startswith("aria-"):
+            raise ActionContractError(
+                "assert_aria attribute must be role, accessible_name, or an aria-* attribute"
+            )
+        if not isinstance(step.get("value"), (str, bool)):
+            raise ActionContractError("assert_aria requires string or boolean value")
+    elif action == "assert_attribute":
+        _non_empty_string(step, "name", action)
+        if not isinstance(step.get("value"), (str, bool, int, float)):
+            raise ActionContractError("assert_attribute requires scalar value")
+    elif action == "assert_count":
+        _bounded_int(step, "count", action, minimum=0, maximum=10_000)
+    elif action == "assert_property":
+        name = _non_empty_string(step, "name", action)
+        if name not in {
+            "checked",
+            "disabled",
+            "indeterminate",
+            "multiple",
+            "open",
+            "readOnly",
+            "required",
+            "selected",
+            "selectedIndex",
+            "value",
+        }:
+            raise ActionContractError(
+                "assert_property property name must be a bounded form/dialog state"
+            )
+        if not isinstance(step.get("value"), (str, bool, int, float)) and step.get("value") is not None:
+            raise ActionContractError("assert_property requires scalar or null value")
+    elif action == "assert_storage_value":
+        if step.get("storage") not in {"local", "session"}:
+            raise ActionContractError("assert_storage_value storage must be local or session")
+        _non_empty_string(step, "key", action)
+        if not isinstance(step.get("value"), (str, int, float, bool)) and step.get("value") is not None:
+            raise ActionContractError("assert_storage_value requires scalar or null value")
+        if step.get("match", "exact") not in {"exact", "contains"}:
+            raise ActionContractError(
+                "assert_storage_value match must be exact or contains"
+            )
+    elif action in {"assert_text", "assert_url"}:
+        if action == "assert_url":
+            expected_url = _non_empty_string(step, "value", action)
+            if "#" in expected_url:
+                raise ActionContractError(
+                    "assert_url fragments are unsupported for new contracts; use an owned pathname route"
+                )
+        elif not isinstance(step.get("value"), (str, int, float)):
+            raise ActionContractError("assert_text requires scalar value")
+        if step.get("match", "exact") not in {"exact", "contains"}:
+            raise ActionContractError(f"{action} match must be exact or contains")
+    elif action == "assert_value":
+        if not isinstance(step.get("value"), (str, int, float)):
+            raise ActionContractError("assert_value requires scalar value")
+    elif action == "set_viewport":
         _bounded_int(step, "width", action, minimum=240, maximum=4_096)
         _bounded_int(step, "height", action, minimum=200, maximum=4_096)
     elif action == "click":
@@ -118,9 +222,13 @@ def validate_ui_action(step: dict[str, Any]) -> None:
         if "value" not in step or not isinstance(step["value"], (str, int, float)):
             raise ActionContractError(f"{action} requires scalar value")
     elif action == "key_press":
-        _non_empty_string(step, "key", action)
+        key = _non_empty_string(step, "key", action)
         if "selector" in step:
             _non_empty_string(step, "selector", action)
+        elif key == "Tab":
+            raise ActionContractError(
+                "key_press Tab requires a starting selector so focus order is deterministic"
+            )
         if "count" in step:
             _bounded_int(step, "count", action, minimum=1, maximum=20)
     elif action == "scroll":
@@ -167,4 +275,32 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             _bounded_int(step, "timeout_ms", action, minimum=1, maximum=5_000)
 
 
-__all__ = ["ActionContractError", "SUPPORTED_UI_ACTIONS", "validate_ui_action"]
+def validate_ui_action_sequence(actions: list[dict[str, Any]]) -> None:
+    """Reject cross-step contradictions that would manufacture product failures."""
+    if not isinstance(actions, list) or not actions:
+        raise ActionContractError("action sequence must be a non-empty list")
+    for step in actions:
+        validate_ui_action(step)
+    for previous, current in zip(actions, actions[1:]):
+        if (
+            previous.get("action") == "key_press"
+            and previous.get("key") == "Tab"
+            and isinstance(previous.get("selector"), str)
+            and current.get("action") == "assert_focus"
+            and current.get("selector") == previous.get("selector")
+        ):
+            raise ActionContractError(
+                "Tab moves focus away from its starting selector; the following "
+                "assert_focus must name the destination selector"
+            )
+
+
+__all__ = [
+    "ASSERTION_UI_ACTIONS",
+    "ActionContractError",
+    "LEGACY_ASSERTION_ACTIONS",
+    "SUPPORTED_UI_ACTIONS",
+    "TYPED_ASSERTION_ACTIONS",
+    "validate_ui_action",
+    "validate_ui_action_sequence",
+]

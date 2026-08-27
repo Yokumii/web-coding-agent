@@ -17,6 +17,17 @@ def _snapshot(*items):
     return {"roots": [{"key": key, "fingerprint": fingerprint} for key, fingerprint in items]}
 
 
+def _fragment_snapshot(*items):
+    return {
+        "version": 4,
+        "stable": True,
+        "fragments": [
+            {"key": key, "fingerprint": fingerprint, "route": route, **extra}
+            for key, fingerprint, route, extra in items
+        ],
+    }
+
+
 def test_guard_allows_only_declared_semantic_surface():
     result = compare_contract(
         _snapshot(("header", "a"), ("main", "b"), ("footer", "c")),
@@ -63,6 +74,266 @@ def test_guard_protects_keyboard_reachability_as_part_of_surface_fingerprint():
     )
     assert result["passed"] is False
     assert result["violations"] == [{"root": "header", "kind": "semantic_changed"}]
+
+
+def test_fragment_guard_allows_target_but_protects_sibling_inside_same_main():
+    baseline = _fragment_snapshot(
+        ("main", "before", "/", {}),
+        ("target-card", "before", "/", {"parent_key": "main"}),
+        ("protected-card", "stable", "/", {"parent_key": "main"}),
+    )
+    current = _fragment_snapshot(
+        ("main", "changed", "/", {}),
+        ("target-card", "changed", "/", {"parent_key": "main"}),
+        ("protected-card", "collateral", "/", {"parent_key": "main"}),
+    )
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": ["target-card"],
+            "expected_new_fragments": [],
+            "target_routes": ["/"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is False
+    assert result["violations"] == [
+        {"fragment": "protected-card", "kind": "semantic_changed"}
+    ]
+
+
+def test_fragment_guard_allows_dynamic_descendants_of_authorized_container():
+    baseline = _fragment_snapshot(
+        ("main", "before", "/catalog", {}),
+        ("catalog-grid", "before", "/catalog", {"parent_key": "main"}),
+        ("button:Klara", "before", "/catalog", {"parent_key": "catalog-grid"}),
+        ("protected-summary", "stable", "/catalog", {"parent_key": "main"}),
+    )
+    current = _fragment_snapshot(
+        ("main", "after", "/catalog", {}),
+        ("catalog-grid", "after", "/catalog", {"parent_key": "main"}),
+        ("button:Dune", "after", "/catalog", {"parent_key": "catalog-grid"}),
+        ("protected-summary", "stable", "/catalog", {"parent_key": "main"}),
+    )
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": ["catalog-grid"],
+            "expected_new_fragments": [],
+            "target_routes": ["/catalog"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+
+
+def test_fragment_guard_allows_only_one_explicit_new_selector():
+    baseline = _fragment_snapshot(("main", "same", "/catalog", {}))
+    current = _fragment_snapshot(
+        ("main", "same", "/catalog", {}),
+        ("new-dialog", "new", "/catalog", {"anchors": ["#new-dialog"]}),
+    )
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [
+                {"route": "/catalog", "selector": "#new-dialog", "max_count": 1}
+            ],
+            "target_routes": ["/catalog"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+
+
+def test_fragment_guard_allows_repeated_expected_subtrees_and_changed_ancestors():
+    baseline = _fragment_snapshot(
+        ("main", "before", "/catalog", {}),
+        ("section", "before", "/catalog", {"parent_key": "main"}),
+        ("nav", "stable", "/catalog", {}),
+    )
+    additions = []
+    for index in range(5):
+        additions.extend(
+            [
+                (
+                    f"catalog-{index}",
+                    f"book-{index}",
+                    "/catalog",
+                    {"parent_key": "section", "anchors": [".catalog-item", ".save-btn"]},
+                ),
+                (
+                    f"save-{index}",
+                    f"button-{index}",
+                    "/catalog",
+                    {"parent_key": f"catalog-{index}", "anchors": [".save-btn"]},
+                ),
+            ]
+        )
+    current = _fragment_snapshot(
+        ("main", "after", "/catalog", {}),
+        ("section", "after", "/catalog", {"parent_key": "main"}),
+        ("nav", "stable", "/catalog", {}),
+        *additions,
+    )
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [
+                {"route": "/catalog", "selector": ".catalog-item", "max_count": 5}
+            ],
+            "target_routes": ["/catalog"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["expected_new_hits"] == [5]
+
+
+def test_fragment_guard_uses_real_selector_count_for_one_semantic_subtree():
+    baseline = _fragment_snapshot(
+        ("main", "before", "/catalog", {}),
+        ("section", "before", "/catalog", {"parent_key": "main"}),
+    )
+    current = _fragment_snapshot(
+        ("main", "after", "/catalog", {}),
+        ("section", "after", "/catalog", {"parent_key": "main"}),
+        (
+            "catalog-list",
+            "five-books",
+            "/catalog",
+            {"parent_key": "section", "anchors": [".catalog-item", ".save-btn"]},
+        ),
+        (
+            "save-button",
+            "first-save",
+            "/catalog",
+            {"parent_key": "catalog-list", "anchors": [".save-btn"]},
+        ),
+    )
+    current["selector_counts"] = [
+        {"route": "/catalog", "selector": ".catalog-item", "count": 5}
+    ]
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [
+                {"route": "/catalog", "selector": ".catalog-item", "max_count": 5}
+            ],
+            "target_routes": ["/catalog"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["expected_new_hits"] == [5]
+
+
+def test_fragment_guard_allows_only_the_declared_new_route():
+    baseline = _fragment_snapshot(("/::main", "stable", "/", {}))
+    current = _fragment_snapshot(
+        ("/::main", "stable", "/", {}),
+        ("/library.html::nav", "new-nav", "/library.html", {}),
+        ("/library.html::main", "new-main", "/library.html", {}),
+        (
+            "/library.html::search",
+            "new-search",
+            "/library.html",
+            {"parent_key": "/library.html::main", "anchors": ["#search"]},
+        ),
+    )
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [],
+            "expected_new_routes": ["/library.html"],
+            "target_routes": ["/library.html"],
+            "protected_routes": ["/"],
+        },
+    )
+
+    assert result["passed"] is True
+
+
+def test_fragment_guard_aligns_legacy_single_route_baseline_with_routed_current():
+    baseline = _fragment_snapshot(
+        ("header", "stable-header", "/", {}),
+        ("main", "stable-main", "/", {}),
+    )
+    current = _fragment_snapshot(
+        ("/::header", "stable-header", "/", {}),
+        ("/::main", "stable-main", "/", {}),
+        ("/library.html::nav", "new-nav", "/library.html", {}),
+        ("/library.html::main", "new-main", "/library.html", {}),
+    )
+    current["routes"] = ["/", "/library.html"]
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [],
+            "expected_new_routes": ["/library.html"],
+            "target_routes": ["/library.html"],
+            "protected_routes": ["/"],
+        },
+    )
+
+    assert result["passed"] is True
+
+
+def test_generator_scope_validation_accepts_bounded_repeated_new_fragments(tmp_path):
+    (tmp_path / "seed_manifest.json").write_text("{}")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_dom_baseline.json").write_text(
+        json.dumps(
+            {
+                "version": 4,
+                "stable": True,
+                "roots": [],
+                "fragments": [],
+                "routes": ["/catalog"],
+            }
+        )
+    )
+    (harness / "edit_scope_round_1.json").write_text(
+        json.dumps(
+            {
+                "allowed_root_keys": [],
+                "allowed_fragment_keys": [],
+                "expected_new_fragments": [
+                    {"route": "/catalog", "selector": ".catalog-item", "max_count": 5}
+                ],
+                "target_routes": ["/catalog"],
+                "protected_routes": [],
+                "allow_new_roots": True,
+            }
+        )
+    )
+
+    assert _validate_edit_scope(tmp_path, 1) is None
 
 
 def test_forward_edit_requires_small_machine_readable_scope(tmp_path):
@@ -193,7 +464,8 @@ async def test_multi_route_semantic_guard_detects_protected_page_change():
     finally:
         await runner.cleanup()
 
-    assert baseline["version"] == 3
+    assert baseline["version"] == 4
+    assert baseline["stable"] is True
     assert baseline["routes"] == routes
     assert {root["key"] for root in baseline["roots"]} == {
         "/::home",
@@ -212,8 +484,57 @@ async def test_multi_route_semantic_guard_detects_protected_page_change():
     )
     assert result["passed"] is False
     assert result["violations"] == [
-        {"root": "/settings.html::settings", "kind": "semantic_changed"}
+        {"fragment": "/settings.html::settings", "kind": "semantic_changed"}
     ]
+
+
+@pytest.mark.anyio
+async def test_semantic_snapshot_records_expected_selector_counts():
+    async def catalog(_request):
+        return web.Response(
+            text="<main><ul>" + "".join(
+                f"<li class='catalog-item'>Book {index}</li>" for index in range(5)
+            ) + "</ul></main>",
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/catalog", catalog)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        snapshot = await snapshot_semantic_dom(
+            f"http://127.0.0.1:{port}",
+            headless=True,
+            routes=["/catalog"],
+            selector_contracts=[
+                {"route": "/catalog", "selector": ".catalog-item", "max_count": 5}
+            ],
+        )
+    finally:
+        await runner.cleanup()
+
+    assert snapshot["selector_counts"] == [
+        {"route": "/catalog", "selector": ".catalog-item", "count": 5}
+    ]
+
+
+def test_fragment_guard_fails_closed_on_unstable_baseline():
+    baseline = _fragment_snapshot(("main", "a", "/", {}))
+    baseline["stable"] = False
+    baseline["unstable_fragment_keys"] = ["main"]
+
+    result = compare_contract(
+        baseline,
+        _fragment_snapshot(("main", "a", "/", {})),
+        {"allowed_fragment_keys": [], "expected_new_fragments": []},
+    )
+
+    assert result["passed"] is False
+    assert "unstable" in result["reason"]
 
 
 def test_multi_route_scope_rejects_allowed_root_from_protected_page():

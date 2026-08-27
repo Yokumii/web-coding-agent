@@ -5,6 +5,7 @@ from pathlib import Path
 
 from src.orchestration.minimal_path_guidance import (
     MinimalPathPolicy,
+    _fragment_dom_scope,
     ensure_minimal_path_plan,
 )
 
@@ -70,6 +71,62 @@ def _write_contract(workdir: Path) -> None:
     )
 
 
+def test_fragment_scope_tracks_route_transitions_and_groups_new_subtrees():
+    baseline = {
+        "version": 4,
+        "fragments": [
+            {
+                "key": "/library.html::home-link",
+                "route": "/library.html",
+                "anchors": ['a[href="/"]'],
+            }
+        ],
+    }
+    checks = [
+        {
+            "route": "/library.html",
+            "actions": [
+                {
+                    "action": "assert_count",
+                    "selector": ".catalog-item",
+                    "count": 5,
+                },
+                {"action": "fill", "selector": "#catalog-filter", "value": "Dune"},
+                {
+                    "action": "click",
+                    "selector": ".catalog-item:first-child .save-btn",
+                },
+                {"action": "click", "selector": "nav a[href='/']"},
+                {"action": "assert_url", "value": "/"},
+                {"action": "assert_visible", "selector": ".book-item"},
+            ],
+        }
+    ]
+
+    allowed, expected, evidence, unresolved = _fragment_dom_scope(
+        baseline,
+        checks,
+        ["/", "/library.html"],
+        existing_source_selectors={".book-item"},
+    )
+
+    assert allowed == ["/library.html::home-link"]
+    assert expected == [
+        {"route": "/library.html", "selector": ".catalog-item", "max_count": 5},
+        {"route": "/library.html", "selector": "#catalog-filter", "max_count": 1},
+    ]
+    assert unresolved == []
+    assert any(
+        item.get("selector") == ".book-item"
+        and item.get("route") == "/"
+        and item.get("resolution") == "runtime_state_source_anchor"
+        for item in evidence
+    )
+    assert any(
+        item.get("selector") == ".catalog-item:first-child .save-btn"
+        and item.get("resolution") == "covered_by_expected_subtree"
+        for item in evidence
+    )
 def test_harness_builds_change_cone_from_action_contract_and_dom(tmp_path: Path):
     workdir = tmp_path
     frontend = workdir / "frontend"
@@ -112,15 +169,18 @@ def test_harness_builds_change_cone_from_action_contract_and_dom(tmp_path: Path)
         (workdir / ".harness" / "edit_scope_round_1.json").read_text(encoding="utf-8")
     )
     assert scope == {
-            "schema_version": "edit-scope-v3",
+        "schema_version": "edit-scope-v4",
         "owner": "harness",
         "plan": ".harness/minimal_path_plan_round_1.json",
         "baseline": ".harness/edit_dom_source_sprint_1.json",
-            "allowed_root_keys": ["main:catalog"],
-            "allow_new_roots": False,
-            "target_routes": ["/"],
-            "protected_routes": [],
-        }
+        "allowed_root_keys": ["main:catalog"],
+        "allow_new_roots": False,
+        "allowed_fragment_keys": [],
+        "expected_new_fragments": [],
+        "expected_new_routes": [],
+        "target_routes": ["/"],
+        "protected_routes": [],
+    }
 
 
 def test_visual_contract_routes_initial_path_to_style_source(tmp_path: Path):
@@ -172,6 +232,170 @@ def test_visual_contract_routes_initial_path_to_style_source(tmp_path: Path):
 
     assert plan["target_contract"]["requested_source_roles"] == ["style"]
     assert plan["source_change_cone"]["initial_paths"] == ["frontend/styles.css"]
+
+
+def test_repair_prioritizes_source_role_of_failed_typed_checks(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<link rel="stylesheet" href="styles.css">\n'
+        '<div id="catalog"><button class="import-btn">Import</button></div>\n'
+        '<script src="app.js"></script>\n',
+        encoding="utf-8",
+    )
+    (frontend / "styles.css").write_text(
+        "\n".join(["#catalog .import-btn { color: navy; }"] * 8),
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text(
+        "document.querySelector('.import-btn').addEventListener('click', () => {});\n",
+        encoding="utf-8",
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-VISUAL",
+                                "category": "visual",
+                                "actions": [
+                                    {
+                                        "action": "assert_visible",
+                                        "selector": "#catalog .import-btn",
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "UI-IMPORT",
+                                "category": "functional",
+                                "actions": [
+                                    {
+                                        "action": "click",
+                                        "selector": ".import-btn",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (harness / "grade_round_1.json").write_text(
+        json.dumps(
+            {
+                "ui_checks": [
+                    {"check_id": "UI-VISUAL", "status": "pass"},
+                    {"check_id": "UI-IMPORT", "status": "fail"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+        max_patch_lines=20,
+        max_touched_files=2,
+    )
+
+    assert plan["target_contract"]["requested_source_roles"] == [
+        "behavior",
+        "style",
+    ]
+    assert plan["target_contract"]["priority_source_roles"] == ["behavior"]
+    assert plan["target_contract"]["failed_check_ids"] == ["UI-IMPORT"]
+    assert plan["source_change_cone"]["initial_paths"] == ["frontend/app.js"]
+    assert plan["source_change_cone"]["hotspots"][0]["path"] == "frontend/app.js"
+
+
+def test_semantic_guard_only_repair_does_not_route_to_stylesheet(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<link rel="stylesheet" href="styles.css">\n'
+        '<div id="catalog"><button class="import-btn">Import</button></div>\n'
+        '<script src="app.js"></script>\n',
+        encoding="utf-8",
+    )
+    (frontend / "styles.css").write_text(
+        "\n".join(["#catalog .import-btn { color: navy; }"] * 8),
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text(
+        "document.querySelector('.import-btn').addEventListener('click', () => {});\n",
+        encoding="utf-8",
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-VISUAL",
+                                "category": "visual",
+                                "actions": [
+                                    {"action": "assert_visible", "selector": "#catalog"}
+                                ],
+                            },
+                            {
+                                "id": "UI-IMPORT",
+                                "category": "functional",
+                                "actions": [
+                                    {"action": "click", "selector": ".import-btn"}
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (harness / "grade_round_1.json").write_text(
+        json.dumps(
+            {
+                "ui_checks": [
+                    {"check_id": "UI-VISUAL", "status": "pass"},
+                    {"check_id": "UI-IMPORT", "status": "pass"},
+                ],
+                "edit_guard": {
+                    "passed": False,
+                    "violations": [
+                        {"fragment": "button:Other", "kind": "removed"}
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+        max_patch_lines=20,
+        max_touched_files=2,
+    )
+
+    assert plan["target_contract"]["priority_source_roles"] == ["behavior"]
+    assert plan["source_change_cone"]["initial_paths"] == ["frontend/app.js"]
 
 
 def test_change_cone_can_widen_to_file_that_references_initial_source(tmp_path: Path):
@@ -355,6 +579,267 @@ def test_multi_page_edit_scopes_dependencies_to_target_route(tmp_path: Path):
     assert denial is not None and "non-target routes" in denial
 
 
+def test_static_target_without_behavior_source_gets_isolated_companion_plan(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main id="dashboard"></main><script src="./app.js"></script>\n'
+    )
+    (frontend / "library.html").write_text(
+        '<link rel="stylesheet" href="./styles.css">\n'
+        '<main class="catalog-section"><h1>Library</h1></main>\n'
+    )
+    (frontend / "app.js").write_text(
+        "const STORAGE_KEY = 'books';\n"
+        "document.querySelector('#dashboard').textContent = localStorage.getItem(STORAGE_KEY);\n"
+    )
+    (frontend / "styles.css").write_text(".catalog-section { display: grid; }\n")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-LIBRARY",
+                                "route": "/library.html",
+                                "category": "interaction",
+                                "actions": [
+                                    {
+                                        "action": "fill",
+                                        "selector": "#catalog-filter",
+                                        "value": "Dune",
+                                    },
+                                    {
+                                        "action": "assert_count",
+                                        "selector": ".catalog-item",
+                                        "count": 1,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=120,
+        max_touched_files=3,
+    )
+
+    strategy = plan["source_change_cone"]["route_isolation_strategy"]
+    assert strategy == {
+        "status": "recommended",
+        "routes": [
+            {
+                "route": "/library.html",
+                "entry_path": "frontend/library.html",
+                "planned_companion_path": "frontend/library.js",
+            }
+        ],
+        "reason": "interactive static route has no route-owned behavior source",
+        "preserve_existing_behavior_sources": ["frontend/app.js"],
+    }
+    assert plan["source_change_cone"]["initial_paths"] == [
+        "frontend/library.html"
+    ]
+    assert "frontend/library.js" in plan["source_change_cone"]["planned_new_paths"]
+    assert "frontend/library.js" in plan["source_change_cone"]["dependency_paths"]
+    assert "frontend/app.js" in plan["source_change_cone"]["protected_paths"]
+    assert {
+        "from": "frontend/library.html",
+        "to": "frontend/library.js",
+        "kind": "planned_route_companion",
+    } in plan["source_change_cone"]["dependency_edges"]
+
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    policy.observe_result(
+        "read_file",
+        {"path": "frontend/library.html"},
+        ok=True,
+        output="library",
+    )
+    entry_patch = {
+        "path": "frontend/library.html",
+        "old_text": "</main>",
+        "new_text": '</main><script src="./library.js"></script>',
+    }
+    assert policy.check("apply_patch", entry_patch) is None
+    policy.observe_result("apply_patch", entry_patch, ok=True, output="patched")
+    planned_write = {
+        "path": "frontend/library.js",
+        "content": "document.querySelector('#catalog-filter');\n",
+    }
+    assert "validation attempt" in policy.check("write_file", planned_write)
+    policy.observe_result(
+        "run_command", {"command": "git diff --check"}, ok=True, output=""
+    )
+    assert policy.check("write_file", planned_write) is None
+    assert "unplanned new source" in policy.check(
+        "write_file",
+        {"path": "frontend/extra.js", "content": "export {};\n"},
+    )
+
+
+def test_generate_can_plan_one_new_static_route_without_widening_existing_page(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main id="dashboard"></main><script src="./app.js"></script>\n'
+    )
+    (frontend / "app.js").write_text(
+        "document.querySelector('#dashboard').textContent = 'accepted';\n"
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-NEW-PAGE",
+                                "route": "/library.html",
+                                "category": "interaction",
+                                "actions": [
+                                    {"action": "fill", "selector": "#search", "value": "Dune"},
+                                    {"action": "assert_count", "selector": ".catalog-item", "count": 1},
+                                ],
+                            },
+                            {
+                                "id": "UI-NEW-PAGE-VISUAL",
+                                "route": "/library.html",
+                                "category": "visual",
+                                "actions": [
+                                    {"action": "assert_visible", "selector": ".catalog-grid"},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=120,
+        max_touched_files=3,
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["route_scope"]["target_routes"] == ["/library.html"]
+    assert plan["route_scope"]["planned_new_route_entries"] == [
+        "frontend/library.html"
+    ]
+    assert plan["dom_change_cone"]["expected_new_routes"] == ["/library.html"]
+    assert plan["source_change_cone"]["initial_paths"] == [
+        "frontend/library.html"
+    ]
+    assert plan["source_change_cone"]["planned_new_paths"] == [
+        "frontend/library.css",
+        "frontend/library.html",
+        "frontend/library.js",
+    ]
+    assert "frontend/app.js" in plan["source_change_cone"]["protected_paths"]
+
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    planned_page = {
+        "path": "frontend/library.html",
+        "content": '<main><input id="search"></main><script src="library.js"></script>\n',
+    }
+    assert policy.check("write_file", planned_page) is None
+    assert "unplanned new source" in policy.check(
+        "write_file",
+        {"path": "frontend/settings.html", "content": "<main>Settings</main>\n"},
+    )
+
+
+def test_explicit_edit_contract_rejects_planner_route_drift(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "catalog.html").write_text('<input id="catalog-filter">\n')
+    (frontend / "settings.html").write_text('<input id="profile-name">\n')
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(json.dumps({
+        "schema_version": "edit-task-contract-v1",
+        "task_mode": "edit",
+        "requested_target_routes": ["/catalog.html"],
+        "protect_non_target_routes": True,
+    }))
+    (harness / "ui_verification_plan.json").write_text(json.dumps({
+        "sprints": [{"sprint": 1, "checks": [{
+            "id": "UI-WRONG", "route": "/settings.html", "category": "interaction",
+            "actions": [{"action": "evaluate", "expression": "true"}],
+        }]}],
+    }))
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path, harness_dir=harness, round_num=1, sprint_num=1,
+        mode="generate", max_patch_lines=30, max_touched_files=3,
+    )
+
+    assert plan["status"] == "blocked"
+    assert plan["route_scope"]["status"] == "target_route_contract_mismatch"
+    assert plan["route_scope"]["target_routes"] == ["/catalog.html"]
+    assert plan["route_scope"]["protected_routes"] == ["/settings.html"]
+    assert plan["route_scope"]["unexpected_check_routes"] == ["/settings.html"]
+
+
+def test_multi_route_edit_contract_opens_only_current_sprint_route(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "catalog.html").write_text('<input id="catalog-filter">\n')
+    (frontend / "settings.html").write_text('<input id="profile-name">\n')
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(json.dumps({
+        "schema_version": "edit-task-contract-v1",
+        "task_mode": "edit",
+        "requested_target_routes": ["/catalog.html", "/settings.html"],
+        "protect_non_target_routes": True,
+    }))
+    (harness / "ui_verification_plan.json").write_text(json.dumps({
+        "sprints": [{"sprint": 1, "checks": [{
+            "id": "UI-CATALOG", "route": "/catalog.html", "category": "interaction",
+            "actions": [{"action": "evaluate", "expression": "true"}],
+        }]}],
+    }))
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path, harness_dir=harness, round_num=1, sprint_num=1,
+        mode="generate", max_patch_lines=30, max_touched_files=3,
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["route_scope"]["contract_allowed_routes"] == [
+        "/catalog.html", "/settings.html",
+    ]
+    assert plan["route_scope"]["target_routes"] == ["/catalog.html"]
+    assert plan["route_scope"]["protected_routes"] == ["/settings.html"]
+
+
 def test_shared_file_is_admissible_when_every_owner_route_is_targeted(tmp_path: Path):
     frontend = tmp_path / "frontend"
     (frontend / "shared").mkdir(parents=True)
@@ -407,6 +892,166 @@ def test_shared_file_is_admissible_when_every_owner_route_is_targeted(tmp_path: 
     assert plan["source_change_cone"]["initial_paths"] == [
         "frontend/shared/navigation.js"
     ]
+
+
+def test_shared_file_opens_only_the_named_target_route_region(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    for page, module in (("catalog", "Catalog"), ("settings", "Settings")):
+        (frontend / f"{page}.html").write_text(
+            '<script src="./app.js"></script>\n'
+            f'<script>{module}.init()</script>\n'
+        )
+    (frontend / "app.js").write_text(
+        "/* --- CATALOG MODULE --- */\n"
+        "const Catalog = {\n"
+        "    init: () => {},\n"
+        "    render: () => 'old catalog'\n"
+        "};\n\n"
+        "/* --- SETTINGS MODULE --- */\n"
+        "const Settings = {\n"
+        "    init: () => {},\n"
+        "    render: () => 'old settings'\n"
+        "};\n"
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(
+        json.dumps({"requested_target_routes": ["/catalog.html"]})
+    )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-CATALOG-PAGE",
+                                "route": "/catalog.html",
+                                "category": "interaction",
+                                "actions": [
+                                    {
+                                        "action": "assert_text",
+                                        "selector": "#current-page",
+                                        "value": "1",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=30,
+        max_touched_files=2,
+    )
+
+    assert plan["route_scope"]["cross_route_shared_paths"] == ["frontend/app.js"]
+    assert plan["source_change_cone"]["guarded_shared_regions"] == [
+        {
+            "path": "frontend/app.js",
+            "route": "/catalog.html",
+            "symbol": "Catalog",
+            "kind": "object",
+            "start_line": 1,
+            "end_line": 5,
+        }
+    ]
+    assert "frontend/app.js" in plan["source_change_cone"]["local_paths"]
+    assert {"from": "frontend/catalog.html", "to": "frontend/app.js"} in plan[
+        "source_change_cone"
+    ]["dependency_edges"]
+
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    shared_before = (frontend / "app.js").read_text()
+    assert (
+        policy.validate_guarded_shared_file(
+            "frontend/app.js",
+            before=shared_before,
+            after=shared_before.replace("old catalog", "new catalog"),
+        )
+        is None
+    )
+    assert "outside" in str(
+        policy.validate_guarded_shared_file(
+            "frontend/app.js",
+            before=shared_before,
+            after=shared_before.replace("old settings", "changed settings"),
+        )
+    )
+    assert "cannot be resolved" in str(
+        policy.validate_guarded_shared_file(
+            "frontend/app.js",
+            before=shared_before,
+            after=shared_before.replace("const Catalog", "const CatalogRenamed"),
+        )
+    )
+    policy.observe_result(
+        "read_file",
+        {"path": "frontend/catalog.html"},
+        ok=True,
+        output="source",
+    )
+    assert (
+        policy.check(
+            "apply_patch",
+            {
+                "path": "frontend/catalog.html",
+                "old_text": '<script>Catalog.init()</script>',
+                "new_text": '<main id="current-page">1</main>',
+            },
+        )
+        is None
+    )
+    policy.observe_result(
+        "apply_patch",
+        {"path": "frontend/catalog.html"},
+        ok=True,
+        output="done",
+    )
+    policy.observe_validation(ok=False, output="target control is not wired", tool="test")
+    policy.observe_result(
+        "read_file",
+        {"path": "frontend/app.js"},
+        ok=True,
+        output="source",
+    )
+
+    assert (
+        policy.check(
+            "apply_patch",
+            {
+                "path": "frontend/app.js",
+                "old_text": "render: () => 'old catalog'",
+                "new_text": "render: () => 'new catalog'",
+            },
+        )
+        is None
+    )
+    settings_denial = policy.check(
+        "apply_patch",
+        {
+            "path": "frontend/app.js",
+            "old_text": "render: () => 'old settings'",
+            "new_text": "render: () => 'changed settings'",
+        },
+    )
+    assert settings_denial is not None
+    assert "guarded target-route region" in settings_denial
+    overwrite_denial = policy.check(
+        "write_file", {"path": "frontend/app.js", "content": "replacement"}
+    )
+    assert overwrite_denial is not None
+    assert "cannot be overwritten" in overwrite_denial
 
 
 def test_react_router_edit_protects_component_shared_with_other_route(tmp_path: Path):

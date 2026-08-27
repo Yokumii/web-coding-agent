@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -11,13 +12,32 @@ from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
 from src.orchestration.ui_action_contracts import (
     ActionContractError,
+    TYPED_ASSERTION_ACTIONS,
     validate_ui_action,
+    validate_ui_action_sequence,
 )
 from src.orchestration.target_profile import target_profile_guidance
+from src.orchestration.edit_task_contract import read_edit_task_contract
+from src.orchestration.accepted_tapes import accepted_obligation_summary
+from src.orchestration.task_inputs import (
+    task_input_image_paths,
+    task_input_prompt_context,
+)
 from src.prompts.planner import planner_system_prompt
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_PLANNER_TRACE_ARTIFACTS = {
+    "spec.md",
+    "design_tokens.json",
+    "feature_list.json",
+    "sprint_plan.json",
+    "ui_verification_plan.json",
+}
+# progress.md is operational provenance: the stop hook is explicitly allowed
+# to write it after every semantic planning artifact validates. Recovery still
+# validates its current contents, but does not falsely require model authorship.
 
 _REQUIRED_SPEC_HEADERS = (
     "## Product Overview",
@@ -139,22 +159,75 @@ def _validate_planning_bundle(
     )
     _check_action_contracts(verification_plan)
     _check_sprint_size_caps(sprint_plan, config)
+    _check_edit_transaction(file_comm, sprint_plan, verification_plan)
 
 
+def _check_edit_transaction(
+    file_comm: FileComm,
+    sprint_plan: dict[str, Any],
+    verification_plan: dict[str, Any],
+) -> None:
+    """Keep one user Edit atomic while retaining multi-route/multi-file scope."""
+    contract = read_edit_task_contract(file_comm.dir.parent)
+    if contract is None:
+        return
+    sprints = sprint_plan.get("sprints") or []
+    if int(sprint_plan.get("total_sprints") or 0) != 1 or len(sprints) != 1:
+        raise PlannerValidationError(
+            "Explicit Edit planning requires exactly one Sprint; split an oversized "
+            "instruction before it enters the Harness, not into internal Sprints."
+        )
+    sprint = sprints[0]
+    if not sprint.get("requirement_changes"):
+        raise PlannerValidationError(
+            "Explicit Edit sprint requires requirement_changes with add/refine/replace/withdraw semantics."
+        )
+    if not sprint.get("impact_tags"):
+        raise PlannerValidationError("Explicit Edit sprint requires non-empty impact_tags.")
+    if not str(sprint.get("visual_evidence_reason") or "").strip():
+        raise PlannerValidationError(
+            "Explicit Edit sprint requires visual_evidence_reason, including when vision is not required."
+        )
+    verification_sprints = verification_plan.get("sprints") or []
+    if len(verification_sprints) != 1:
+        raise PlannerValidationError(
+            "Explicit Edit requires exactly one UI verification Sprint."
+        )
+    for check in verification_sprints[0].get("checks") or []:
+        if not str(check.get("requirement_id") or "").strip():
+            raise PlannerValidationError(
+                f"Explicit Edit check {check.get('id', 'unknown')} requires requirement_id."
+            )
+        if not check.get("impact_tags"):
+            raise PlannerValidationError(
+                f"Explicit Edit check {check.get('id', 'unknown')} requires impact_tags."
+            )
+
+
+# Keep validation feedback batch-oriented. A billable planner should receive
+# every malformed check in one correction turn instead of discovering one
+# schema error per retry.
 def _check_action_contracts(verification_plan: dict[str, Any]) -> None:
-    """Reject planner-authored tests that would fabricate a product failure."""
+    errors: list[str] = []
     for sprint in verification_plan.get("sprints") or []:
+        # Each sprint's target checks execute in a fresh browser context. State
+        # from an accepted earlier sprint is replayed independently as a
+        # regression tape and is not setup for the current sprint's checks.
+        stateful_routes: set[str] = set()
+        known_selector_min: dict[tuple[str, str], int] = {}
+        known_selector_exact: dict[tuple[str, str], int] = {}
         for check in sprint.get("checks") or []:
             check_id = str(check.get("id", "unknown"))
             route = check.get("route", "/")
-            if not isinstance(route, str) or not route:
-                raise PlannerValidationError(
-                    f"Planner action contract {check_id} route must be a non-empty same-origin path."
-                )
-            parsed_route = urlsplit(route)
-            route_segments = parsed_route.path.replace("\\", "/").split("/")
+            parsed_route = urlsplit(route) if isinstance(route, str) else None
+            route_segments = (
+                parsed_route.path.replace("\\", "/").split("/")
+                if parsed_route is not None else []
+            )
             if (
-                not route.startswith("/")
+                parsed_route is None
+                or not route
+                or not route.startswith("/")
                 or route.startswith("//")
                 or "\\" in route
                 or parsed_route.scheme
@@ -163,60 +236,225 @@ def _check_action_contracts(verification_plan: dict[str, Any]) -> None:
                 or parsed_route.fragment
                 or any(segment in {".", ".."} for segment in route_segments)
             ):
-                raise PlannerValidationError(
-                    f"Planner action contract {check_id} route must be a safe same-origin path; got {route!r}."
+                errors.append(
+                    f"{check_id}: route must be a safe same-origin path; got {route!r}"
                 )
             actions = check.get("actions") or []
-            if not actions:  # Backwards compatibility for legacy plans.
+            fixtures = check.get("fixtures") or []
+            if not isinstance(fixtures, list) or any(
+                not isinstance(value, str) or not value.strip() or len(value) > 200
+                for value in fixtures
+            ):
+                errors.append(
+                    f"{check_id}: fixtures must be a list of non-empty strings up to 200 characters"
+                )
+                fixtures = []
+            if not actions:  # Historical action-less plans remain readable.
                 continue
-            if str(actions[-1].get("action")) != "evaluate":
-                raise PlannerValidationError(
-                    f"Planner action contract {check_id} must end with evaluate "
-                    "so the observable result is asserted."
+            action_kinds = [
+                str(action.get("action", ""))
+                for action in actions
+                if isinstance(action, dict)
+            ]
+            if (
+                check.get("category") == "empty_state"
+                and action_kinds[:1] == ["reload"]
+                and route in stateful_routes
+            ):
+                errors.append(
+                    f"{check_id}: an initial empty-state reload must run before state-producing "
+                    f"functionality/persistence checks on route {route!r}"
                 )
-            evaluate_count = sum(
-                1 for action in actions if str(action.get("action")) == "evaluate"
+            final_action = (
+                str(actions[-1].get("action"))
+                if isinstance(actions[-1], dict) else ""
             )
-            if evaluate_count != 1:
-                raise PlannerValidationError(
-                    f"Planner action contract {check_id} must contain exactly one final evaluate; "
-                    "combine related assertions into one boolean expression."
+            if final_action not in TYPED_ASSERTION_ACTIONS:
+                errors.append(f"{check_id}: must end with a typed assertion")
+            assertion_count = sum(
+                isinstance(action, dict)
+                and action.get("action") in TYPED_ASSERTION_ACTIONS
+                for action in actions
+            )
+            if not 1 <= assertion_count <= 4:
+                errors.append(
+                    f"{check_id}: must contain 1 to 4 related typed assertions; found {assertion_count}"
                 )
-            for action in actions:
-                kind = str(action.get("action", ""))
-                if "settle_ms" in action:
-                    settle_ms = action.get("settle_ms")
-                    if (
-                        isinstance(settle_ms, bool)
-                        or not isinstance(settle_ms, int)
-                        or not 0 <= settle_ms <= 5_000
-                    ):
-                        raise PlannerValidationError(
-                            f"Planner action contract {check_id} settle_ms must be an integer from 0 to 5000."
-                        )
-                if kind == "scroll":
-                    y = action.get("y")
-                    if isinstance(y, bool) or not isinstance(y, int):
-                        raise PlannerValidationError(
-                            f"Planner action contract {check_id} scroll action requires integer y."
-                        )
-                if kind == "evaluate":
-                    expression = str(action.get("expression", "")).strip()
-                    if not expression:
-                        raise PlannerValidationError(
-                            f"Planner action contract {check_id} evaluate requires an expression."
-                        )
-                    if "return " in expression or expression.startswith("return"):
-                        raise PlannerValidationError(
-                            f"Planner action contract {check_id} contains a top-level return; "
-                            "write a directly evaluable boolean expression instead."
-                        )
+            for index, action in enumerate(actions, 1):
+                if (
+                    isinstance(action, dict)
+                    and action.get("action") == "scroll"
+                    and (
+                        isinstance(action.get("y"), bool)
+                        or not isinstance(action.get("y"), int)
+                    )
+                ):
+                    errors.append(
+                        f"{check_id} action {index}: scroll action requires integer y"
+                    )
+                if isinstance(action, dict) and action.get("action") == "evaluate":
+                    errors.append(
+                        f"{check_id} action {index}: legacy evaluate is forbidden; use a bounded typed assertion"
+                    )
+                    continue
+                if (
+                    isinstance(action, dict)
+                    and action.get("action") == "key_press"
+                    and action.get("key") == "Tab"
+                    and str(action.get("selector", "")).strip().lower()
+                    in {"body", "html", "main"}
+                ):
+                    errors.append(
+                        f"{check_id} action {index}: Tab start must name a focusable "
+                        "control, not a global container"
+                    )
+                if (
+                    isinstance(action, dict)
+                    and action.get("action") == "assert_storage_value"
+                    and isinstance(action.get("value"), str)
+                    and "match" not in action
+                ):
+                    errors.append(
+                        f"{check_id} action {index}: string storage assertions require "
+                        "explicit match exact/contains; JSON-backed storage normally uses contains"
+                    )
+                if (
+                    isinstance(action, dict)
+                    and action.get("action") == "assert_attribute"
+                    and str(action.get("name", "")).lower() in {"class", "style"}
+                ):
+                    errors.append(
+                        f"{check_id} action {index}: exact class/style assertions are forbidden; "
+                        "use a stable state selector/attribute or assert_focus"
+                    )
                 try:
                     validate_ui_action(action)
                 except ActionContractError as exc:
-                    raise PlannerValidationError(
-                        f"Planner action contract {check_id} {exc}."
-                    ) from exc
+                    errors.append(f"{check_id} action {index}: {exc}")
+            try:
+                validate_ui_action_sequence(actions)
+            except ActionContractError as exc:
+                errors.append(f"{check_id} sequence: {exc}")
+
+            active_route = str(route)
+            state_producing = False
+            for index, action in enumerate(actions, 1):
+                if not isinstance(action, dict):
+                    continue
+                kind = str(action.get("action", ""))
+                if kind in {
+                    "click",
+                    "drag_and_drop",
+                    "fill",
+                    "key_press",
+                    "select_option",
+                    "set_input_files",
+                }:
+                    state_producing = True
+                if kind == "assert_count" and isinstance(action.get("selector"), str):
+                    key = (active_route, str(action["selector"]))
+                    count = int(action.get("count", 0))
+                    if (
+                        not state_producing
+                        and not fixtures
+                        and known_selector_exact.get(key) != count
+                        and known_selector_min.get(key) != count
+                    ):
+                        errors.append(
+                            f"{check_id} action {index}: exact count has no state-producing "
+                            "setup or declared fixtures; use assert_visible or declare the "
+                            "planned fixture literals"
+                        )
+                    known_selector_exact[key] = count
+                if kind == "assert_url" and isinstance(action.get("value"), str):
+                    active_route = str(action["value"])
+
+            for index, action in enumerate(actions):
+                if not isinstance(action, dict) or action.get("action") != "fill":
+                    continue
+                value = action.get("value")
+                if not isinstance(value, str) or not value:
+                    continue
+                later_actions = [
+                    item for item in actions[index + 1 :] if isinstance(item, dict)
+                ]
+                creates_value = any(
+                    item.get("action")
+                    in {"click", "drag_and_drop", "key_press", "select_option", "set_input_files"}
+                    for item in later_actions
+                )
+                asserts_literal = any(
+                    item.get("action") == "assert_text" and item.get("value") == value
+                    for item in later_actions
+                )
+                if asserts_literal and not creates_value and value not in fixtures:
+                    errors.append(
+                        f"{check_id}: filter assertion literal {value!r} is not declared "
+                        "in fixtures; bind pre-existing test data explicitly"
+                    )
+
+            # A persistence check that starts with reload may rely only on
+            # state established by earlier checks in this same sprint. A prior
+            # `assert_visible` proves one matching node, not two; accepted-tape
+            # state from another sprint is deliberately not assumed here.
+            if (
+                check.get("category") == "persistence"
+                and action_kinds[:1] == ["reload"]
+            ):
+                active_route = str(route)
+                for action in actions:
+                    if not isinstance(action, dict):
+                        continue
+                    kind = str(action.get("action", ""))
+                    selector = action.get("selector")
+                    if kind in TYPED_ASSERTION_ACTIONS and isinstance(selector, str):
+                        required = (
+                            int(action.get("count", 1))
+                            if kind == "assert_count"
+                            else 1
+                        )
+                        established = known_selector_min.get(
+                            (active_route, selector), 0
+                        )
+                        if required > established:
+                            errors.append(
+                                f"{check_id}: persistence assertion for {selector!r} "
+                                f"expects {required}, but current-sprint setup establishes "
+                                f"only {established}; add explicit setup/assertion or lower "
+                                "the contract to the proven state"
+                            )
+                    if kind == "assert_url":
+                        destination = action.get("value")
+                        if isinstance(destination, str):
+                            active_route = destination
+
+            active_route = str(route)
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                kind = str(action.get("action", ""))
+                selector = action.get("selector")
+                if kind in TYPED_ASSERTION_ACTIONS and isinstance(selector, str):
+                    bound = int(action.get("count", 1)) if kind == "assert_count" else 1
+                    key = (active_route, selector)
+                    known_selector_min[key] = max(known_selector_min.get(key, 0), bound)
+                if kind == "assert_url":
+                    destination = action.get("value")
+                    if isinstance(destination, str):
+                        active_route = destination
+            if (
+                check.get("category") in {"functionality", "persistence"}
+                and any(
+                    action in {"click", "fill", "select_option", "set_input_files"}
+                    for action in action_kinds
+                )
+            ):
+                stateful_routes.add(route)
+    if errors:
+        raise PlannerValidationError(
+            "Planning UI action contract validation failed:\n- "
+            + "\n- ".join(dict.fromkeys(errors))
+        )
 
 
 def _check_cross_references(
@@ -330,6 +568,85 @@ def _initialize_accepted_sprints(file_comm: FileComm) -> None:
     )
 
 
+def _planner_trace_written_artifacts(trace_path: Path) -> set[str]:
+    pending: list[tuple[str, str]] = []
+    written: set[str] = set()
+    try:
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event.get("event") == "assistant":
+                for call in ((event.get("message") or {}).get("tool_calls") or []):
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if not isinstance(function, dict) or function.get("name") not in {
+                        "write_file", "apply_patch",
+                    }:
+                        continue
+                    raw_args = function.get("arguments", "{}")
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    raw_path = args.get("path") if isinstance(args, dict) else None
+                    if isinstance(raw_path, str) and raw_path.startswith(".harness/"):
+                        pending.append((str(function.get("name")), Path(raw_path).name))
+            elif event.get("event") == "tool" and event.get("ok") is True:
+                tool_name = str(event.get("name", ""))
+                match = next(
+                    (index for index, (name, _path) in enumerate(pending) if name == tool_name),
+                    None,
+                )
+                if match is not None:
+                    _name, path = pending.pop(match)
+                    written.add(path)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return set()
+    return written
+
+
+def _planner_trace_usage(trace_path: Path) -> dict[str, Any]:
+    latest = {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0}
+    try:
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event.get("event") not in {"usage", "run_error"}:
+                continue
+            usage = event.get("cumulative_usage")
+            if isinstance(usage, dict):
+                latest["input_tokens"] = int(usage.get("input_tokens") or 0)
+                latest["output_tokens"] = int(usage.get("output_tokens") or 0)
+            cost = event.get("estimated_cost_usd")
+            if isinstance(cost, (int, float)) and cost >= 0:
+                latest["estimated_cost_usd"] = float(cost)
+    except (OSError, ValueError, TypeError):
+        return {"input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": 0.0}
+    return latest
+
+
+def recover_trace_proven_planner_checkpoint(
+    file_comm: FileComm, config: HarnessConfig
+) -> AgentRunStats | None:
+    """Recover a valid, model-written plan after the process died before checkpointing."""
+    trace_path = file_comm.dir / "traces" / "planner.jsonl"
+    if not trace_path.is_file() or not _PLANNER_TRACE_ARTIFACTS.issubset(
+        _planner_trace_written_artifacts(trace_path)
+    ):
+        return None
+    try:
+        _validate_planning_bundle(file_comm, config)
+    except (PlannerValidationError, ValidationError, ValueError, OSError):
+        return None
+    _initialize_accepted_sprints(file_comm)
+    usage = _planner_trace_usage(trace_path)
+    return AgentRunStats(
+        cost_usd=float(usage["estimated_cost_usd"]),
+        duration_ms=0,
+        duration_api_ms=0,
+        token_usage={
+            "input_tokens": int(usage["input_tokens"]),
+            "output_tokens": int(usage["output_tokens"]),
+        },
+        usage={"recovery": "trace_proven_planner_checkpoint", **usage},
+        model_usage={},
+    )
+
+
 def _build_planner_prompt(
     config: HarnessConfig, user_prompt: str, workdir: Path,
     target_profile: dict | None = None,
@@ -394,6 +711,29 @@ async def run_planner(
     prompt = _build_planner_prompt(
         config, user_prompt, workdir, file_comm.read_target_profile()
     ) + repair_context
+    input_context = task_input_prompt_context(workdir)
+    edit_contract = read_edit_task_contract(workdir)
+    if edit_contract is not None:
+        obligations = accepted_obligation_summary(file_comm.dir)
+        prompt += (
+            "\n\n## Harness-owned Edit contract\n"
+            "This is an Edit of the accepted existing project, not a new product generation. "
+            "Plan only the requested change. Put every UI check on the exact requested target "
+            "route(s); all other discovered routes are protected.\n"
+            f"Requested target routes: {edit_contract.get('requested_target_routes') or 'derive narrowly from the request'}\n"
+            "Use exactly one Sprint for this one Edit transaction, including a coherent multi-route "
+            "or multi-file change. If the request contains independent product changes, do not invent "
+            "internal Sprints; report them as an unresolved conflict so upstream can split the request.\n"
+            "In that Sprint add requirement_changes (add/refine/replace/withdraw with requirement_id, "
+            "prior_requirement_ids, and rationale), non-empty impact_tags, unresolved_conflicts, "
+            "visual_evidence (required/conditional/not_required), and visual_evidence_reason. "
+            "Every UI check must repeat its requirement_id and relevant impact_tags.\n"
+            "Historical accepted obligations, when available, are metadata for semantic conflict and "
+            "impact decisions; do not copy them into the user instruction:\n"
+            f"{json.dumps(obligations, ensure_ascii=False)}\n"
+        )
+    if input_context:
+        prompt += "\n\n" + input_context
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
         prompt=prompt,
@@ -401,10 +741,11 @@ async def run_planner(
         workdir=workdir,
         model=config.planner_model,
         system_prompt=planner_system_prompt(config.planner_scope_mode),
-        max_turns=16,
+        max_turns=config.planner_max_turns,
         allow_bash=False,
         stop_hooks=[_make_planner_stop_hook(file_comm, config)],
         trace_path=file_comm.dir / "traces" / "planner.jsonl",
+        image_paths=task_input_image_paths(workdir),
     )
 
     _validate_planning_bundle(file_comm, config)

@@ -55,6 +55,17 @@ def test_cost_tracker_budget_gate_uses_replaced_total():
     assert tracker.remaining() == pytest.approx(0.8)
 
 
+def test_cost_tracker_enforces_cumulative_phase_caps():
+    tracker = CostTracker(20.0)
+    tracker.add("evaluator_r1", 0.7)
+    tracker.add("visual_score_r1", 0.2)
+    tracker.add("evaluator_r2", 0.4)
+
+    assert tracker.phase_total("evaluator", "visual_score") == pytest.approx(1.3)
+    assert tracker.phase_budget_exceeded(1.25, "evaluator", "visual_score") is True
+    assert tracker.phase_budget_exceeded(2.0, "evaluator", "visual_score") is False
+
+
 # --- warn as we approach the budget cap ---
 
 

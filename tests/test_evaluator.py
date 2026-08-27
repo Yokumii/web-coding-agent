@@ -10,6 +10,8 @@ from src.agents.evaluator import (
     _determine_passed,
     _extract_grades_from_response,
     _normalize_contract_grades,
+    _run_contract_only_evaluator,
+    build_deterministic_failure_grades,
     run_evaluator,
 )
 from src.config import HarnessConfig
@@ -192,6 +194,69 @@ def test_contract_grade_normalization_repairs_provider_schema_drift():
     assert grades["phase_results"]["ui_functionality"] == "fail"
     assert grades["ui_checks"][0]["status"] == "fail"
     assert grades["overall_passed"] is False
+
+
+def test_reproduced_browser_failure_builds_zero_cost_grades(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "browser_evidence_round_1.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"action_failed"}]}'
+    )
+
+    passed, grades, stats = build_deterministic_failure_grades(
+        file_comm=file_comm,
+        round_num=1,
+        sprint_num=1,
+        sprint_context={"exit_criteria": ["Archive state changes"]},
+        ui_checks=[{
+            "id": "UI-001",
+            "feature_id": "F001",
+            "critical": True,
+            "task": "Archive item",
+            "expected_result": "Item leaves active list",
+        }],
+        edit_guard={"passed": True},
+    )
+
+    assert passed is False
+    assert grades["evidence_route"]["llm_evaluator_called"] is False
+    assert grades["bugs_found"] == ["Deterministic browser contract failed: UI-001"]
+    assert stats.cost_usd == 0
+
+
+@pytest.mark.anyio
+async def test_contract_evaluator_does_not_pay_for_format_retry(monkeypatch, tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "browser_evidence_round_1.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"ok"}]}'
+    )
+    calls = 0
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def complete(self, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return {"choices": [{"message": {"content": "not-json"}}], "usage": {}}
+
+    monkeypatch.setattr("src.agents.evaluator.OpenAIHTTPClient", FakeClient)
+
+    with pytest.raises(RuntimeError, match="automatic paid format retries are disabled"):
+        await _run_contract_only_evaluator(
+            HarnessConfig(),
+            file_comm,
+            1,
+            1,
+            {"exit_criteria": ["Works"]},
+            [{
+                "id": "UI-001", "feature_id": "F001", "critical": True,
+                "task": "Use control", "expected_result": "It works",
+            }],
+            {"passed": True},
+        )
+
+    assert calls == 1
 
 
 @pytest.mark.anyio

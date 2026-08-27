@@ -199,6 +199,125 @@ async def test_native_loop_executes_tool_and_returns_compatible_result(tmp_path:
 
 
 @pytest.mark.anyio
+async def test_native_loop_records_usage_and_stops_before_phase_overspend(tmp_path: Path):
+    trace_path = tmp_path / "planner.jsonl"
+    client = CapturingFakeClient([
+        reply(tool_calls=[{
+            "id": "1",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": '{"path":"partial.txt","content":"real progress"}',
+            },
+        }]),
+        reply(content="must not be requested"),
+    ])
+
+    async def incomplete_hook(*_args):
+        return {"decision": "block", "reason": "required artifact missing"}
+
+    with pytest.raises(RuntimeError, match="planner cost budget exhausted"):
+        await run_openai_agent(
+            prompt="plan",
+            config=HarnessConfig(planner_budget_usd=0.00001),
+            workdir=tmp_path,
+            model="qwen3.6-plus",
+            system_prompt="system",
+            max_turns=10,
+            allow_bash=False,
+            client=client,
+            stop_hooks=[incomplete_hook],
+            trace_path=trace_path,
+        )
+
+    assert len(client.requests) == 1
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    usage_event = next(event for event in events if event["event"] == "usage")
+    assert usage_event["cumulative_usage"] == {"input_tokens": 3, "output_tokens": 2}
+    assert usage_event["estimated_cost_usd"] > usage_event["phase_budget_usd"]
+
+
+@pytest.mark.anyio
+async def test_native_loop_carries_failed_attempt_spend_across_resume(tmp_path: Path):
+    trace_path = tmp_path / "planner.jsonl"
+    trace_path.write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in [
+                {"event": "run_start", "model": "deepseek-chat"},
+                {
+                    "event": "usage",
+                    "cumulative_usage": {"input_tokens": 4, "output_tokens": 3},
+                },
+                {
+                    "event": "run_error",
+                    "cumulative_usage": {"input_tokens": 4, "output_tokens": 3},
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    client = CapturingFakeClient([reply(content="done")])
+
+    result, _cost, _text, _denials = await run_openai_agent(
+        prompt="resume", config=HarnessConfig(planner_budget_usd=1),
+        workdir=tmp_path, model="deepseek-chat", system_prompt="system",
+        max_turns=2, allow_bash=False, client=client, trace_path=trace_path,
+    )
+
+    assert result.usage == {"input_tokens": 7, "output_tokens": 5}
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert events[-2]["attempt_usage"] == {"input_tokens": 3, "output_tokens": 2}
+    assert events[-2]["cumulative_usage"] == {"input_tokens": 7, "output_tokens": 5}
+
+
+@pytest.mark.anyio
+async def test_native_loop_refuses_new_request_when_prior_attempt_spent_phase_budget(
+    tmp_path: Path,
+):
+    trace_path = tmp_path / "planner.jsonl"
+    trace_path.write_text(
+        json.dumps({"event": "run_start", "model": "qwen3.6-plus"}) + "\n"
+        + json.dumps(
+            {
+                "event": "run_error",
+                "cumulative_usage": {"input_tokens": 3, "output_tokens": 2},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    client = CapturingFakeClient([reply(content="must not be requested")])
+
+    with pytest.raises(RuntimeError, match="planner cost budget exhausted"):
+        await run_openai_agent(
+            prompt="resume", config=HarnessConfig(planner_budget_usd=0.000001),
+            workdir=tmp_path, model="qwen3.6-plus", system_prompt="system",
+            max_turns=2, allow_bash=False, client=client, trace_path=trace_path,
+        )
+
+    assert client.requests == []
+
+
+@pytest.mark.anyio
+async def test_native_loop_sends_user_reference_images_as_multimodal_content(tmp_path: Path):
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nreference")
+    client = CapturingFakeClient([reply(content="done")])
+
+    await run_openai_agent(
+        prompt="edit to match", image_paths=[image], config=HarnessConfig(),
+        workdir=tmp_path, model="deepseek-chat", system_prompt="system",
+        max_turns=2, allow_bash=False, client=client,
+    )
+
+    content = client.requests[0]["messages"][1]["content"]
+    assert content[0] == {"type": "text", "text": "edit to match"}
+    assert content[1]["type"] == "image_url"
+
+
+@pytest.mark.anyio
 async def test_turn_limit_grants_one_finalization_window(tmp_path: Path):
     client = CapturingFakeClient([
         reply(tool_calls=[{
@@ -302,12 +421,93 @@ async def test_phase_timeout_is_hard(tmp_path: Path):
             import asyncio
             await asyncio.sleep(60)
 
+    trace_path = tmp_path / "timeout.jsonl"
     with pytest.raises(RuntimeError, match="phase timed out"):
         await run_openai_agent(
             prompt="build", config=HarnessConfig(), workdir=tmp_path, model="deepseek-chat",
             system_prompt="system", max_turns=10, allow_bash=False, client=SlowClient(),
             limits=OpenAIRunLimits(phase_timeout=0.02, request_timeout=60),
+            trace_path=trace_path,
         )
+
+    error_event = [
+        json.loads(line) for line in trace_path.read_text().splitlines()
+        if json.loads(line)["event"] == "run_error"
+    ][0]
+    assert error_event["error_type"] == "CancelledError"
+    assert error_event["cumulative_usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+
+@pytest.mark.anyio
+async def test_completion_validation_is_traced_and_warns_against_rewrite(tmp_path: Path):
+    client = CapturingFakeClient([reply(content="done"), reply(content="done")])
+    hook_calls = 0
+
+    async def commit_hook(*_args):
+        nonlocal hook_calls
+        hook_calls += 1
+        if hook_calls == 1:
+            return {"decision": "block", "reason": "No `feat` commit was created."}
+        return {"decision": "complete"}
+
+    trace_path = tmp_path / "completion.jsonl"
+    await run_openai_agent(
+        prompt="build", config=HarnessConfig(), workdir=tmp_path, model="deepseek-chat",
+        system_prompt="system", max_turns=3, allow_bash=True, client=client,
+        stop_hooks=[commit_hook], trace_path=trace_path,
+    )
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    validation = next(event for event in events if event["event"] == "completion_validation")
+    assert validation["reason"] == "No `feat` commit was created."
+    retry_messages = client.requests[1]["messages"]
+    assert any(
+        "Do not rewrite it" in str(message.get("content", ""))
+        for message in retry_messages
+    )
+
+
+@pytest.mark.anyio
+async def test_planner_receives_validation_at_progress_bundle_boundary(tmp_path: Path):
+    client = CapturingFakeClient([
+        reply(tool_calls=[{
+            "id": "progress",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": '{"path":".harness/progress.md","content":"done"}',
+            },
+        }]),
+        reply(tool_calls=[{
+            "id": "fix",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": '{"path":".harness/ui_verification_plan.json","content":"{}"}',
+            },
+        }]),
+    ])
+    hook_calls = 0
+
+    async def planner_hook(*_args):
+        nonlocal hook_calls
+        hook_calls += 1
+        if hook_calls == 1:
+            return {"decision": "block", "reason": "UI-001 has two assertions"}
+        return {"decision": "complete"}
+
+    await run_openai_agent(
+        prompt="plan", config=HarnessConfig(), workdir=tmp_path,
+        model="deepseek-chat", system_prompt="system", max_turns=4,
+        allow_bash=False, client=client, stop_hooks=[planner_hook],
+    )
+
+    next_messages = client.requests[1]["messages"]
+    assert any(
+        "Edit only the named invalid artifacts" in str(message.get("content", ""))
+        and "UI-001 has two assertions" in str(message.get("content", ""))
+        for message in next_messages
+    )
 
 
 def test_evaluation_policy_enters_finalization_after_browser_diagnostic_budget():

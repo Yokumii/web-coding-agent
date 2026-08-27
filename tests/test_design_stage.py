@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -119,4 +120,43 @@ async def test_design_stage_generates_missing_assets_when_image_api_is_configure
     assert calls[0]["reference_images"] is None
     assert calls[1]["reference_images"] == [
         file_comm.design_dir / "approved_concept.png"
+    ]
+
+
+@pytest.mark.anyio
+async def test_design_stage_conditions_generated_concept_on_user_image(monkeypatch, tmp_path: Path):
+    from src.orchestration.task_inputs import stage_task_inputs
+
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_spec("# Example")
+    file_comm.write_design_tokens({
+        "theme_name": "reference", "color": {}, "typography": {}, "spacing": {},
+        "radius": {}, "motion": {}, "style_rules": ["match reference"],
+        "anti_patterns": [],
+        "visual_experiment": {
+            "design_hypothesis": "Follow the supplied composition.",
+            "reason_for_image_first": "The reference encodes layout.",
+            "desired_break_from_web_templates": ["reference hierarchy"],
+            "visual_opportunities_beyond_css": ["reference texture"],
+            "forbidden_generic_patterns": ["generic grid"],
+        },
+    })
+    source = tmp_path / "reference.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\nreference")
+    stage_task_inputs(tmp_path, [source])
+    calls: list[dict] = []
+
+    async def fake_generate_image(**kwargs):
+        calls.append(kwargs)
+        kwargs["output_path"].write_bytes(b"png")
+
+    monkeypatch.setattr("src.agents.design_stage.generate_image", fake_generate_image)
+
+    await run_design_stage(
+        HarnessConfig(design_mode="image-first", design_image_api_key="test-key"),
+        file_comm, tmp_path,
+    )
+
+    assert calls[0]["reference_images"] == [
+        tmp_path / json.loads((tmp_path / ".harness/task_inputs.json").read_text())["inputs"][0]["staged_path"]
     ]

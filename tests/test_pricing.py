@@ -45,6 +45,15 @@ def test_estimate_cost_usd_known_model_uses_its_rates(tmp_path: Path):
     assert cost == pytest.approx(0.85, abs=1e-6)
 
 
+def test_repository_qwen_price_is_conservative_long_context_upper_bound():
+    cost = estimate_cost_usd(
+        "qwen3.6-plus",
+        {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+    )
+
+    assert cost == pytest.approx(8.4, abs=1e-6)
+
+
 def test_estimate_cost_usd_unknown_model_falls_back_to_default(tmp_path: Path, caplog):
     config = tmp_path / "pricing.json"
     _write_pricing(

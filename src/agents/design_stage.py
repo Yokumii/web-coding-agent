@@ -7,6 +7,7 @@ from typing import Any
 from src.agents.image_generation import generate_image
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
+from src.orchestration.task_inputs import task_input_image_paths
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -312,12 +313,13 @@ async def _try_generate_missing_assets(
         return generation_records
 
     if not approved_concept.exists():
+        user_references = task_input_image_paths(file_comm.dir.parent)
         try:
             result = await generate_image(
                 config=config,
                 prompt=_build_concept_prompt(file_comm),
                 output_path=approved_concept,
-                reference_images=None,
+                reference_images=user_references or None,
             )
             generation_records.append(
                 {
@@ -326,6 +328,7 @@ async def _try_generate_missing_assets(
                     "model": config.design_image_model,
                     "size": config.design_image_size,
                     "usage": getattr(result, "usage", {}) if result is not None else {},
+                    "reference_assets": [path.name for path in user_references],
                 }
             )
             logger.info("[bold magenta]DESIGN phase[/] generated approved concept image.")

@@ -184,3 +184,20 @@ def test_build_config_evaluator_vision_model_cli_override(monkeypatch):
     )
     config = build_config(args)
     assert config.evaluator_vision_model == "gpt-4o-mini"
+
+
+def test_cli_exposes_first_class_edit_routes_and_repeatable_inputs(tmp_path):
+    image = tmp_path / "reference.png"
+    notes = tmp_path / "notes.md"
+    args = build_parser().parse_args([
+        "Edit the catalog only",
+        "--task-mode", "edit",
+        "--target-route", "/catalog",
+        "--target-route", "/search",
+        "--input", str(image),
+        "--input", str(notes),
+    ])
+
+    assert args.task_mode == "edit"
+    assert args.target_routes == ["/catalog", "/search"]
+    assert args.input_paths == [image, notes]

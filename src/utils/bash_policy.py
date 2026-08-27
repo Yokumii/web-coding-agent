@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import re
 import shlex
 from pathlib import Path
 
 _DISALLOWED_SHELL_SNIPPETS = (">", "<", "$(", "`", "&", "\n", "\r")
 _DISALLOWED_READONLY_SHELL_OPERATORS = ("&&", "||", "|", ";", "&")
-_SHELL_OPERATOR_PATTERN = re.compile(r"(\&\&|\|\||[|;&])")
 _ALLOWED_BASH_COMMANDS = {
     "cat",
     "cd",
@@ -131,8 +129,16 @@ def _reject_disallowed_shell_snippets(command: str) -> None:
     for snippet, label in _DISALLOWED_SHELL_MESSAGE_MAP.items():
         if snippet in command:
             raise ValueError(f"shell control operator not allowed: {label}")
-    if re.search(r"(^|[^&])&([^&]|$)", command):
+    if "&" in _shell_tokens(command):
         raise ValueError("shell control operator not allowed: &")
+
+
+def _shell_tokens(command: str) -> list[str]:
+    """Tokenize operators while preserving punctuation inside quoted arguments."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
 
 
 def _validate_relative_tokens(tokens: list[str]) -> None:
@@ -166,16 +172,19 @@ def validate_bash_command(command: str) -> list[str]:
 
 def _split_bash_segments(command: str) -> list[list[str]]:
     """按 shell 运算符拆分命令链，并保留每段 argv。"""
-    parts = _SHELL_OPERATOR_PATTERN.split(command)
+    tokens = _shell_tokens(command)
     segments: list[list[str]] = []
-    for part in parts:
-        stripped = part.strip()
-        if not stripped or stripped in {"&&", "||", "|", ";", "&"}:
-            continue
-        argv = shlex.split(stripped)
-        if not argv:
-            raise ValueError("empty command")
-        segments.append(argv)
+    current: list[str] = []
+    for token in tokens:
+        if token in {"&&", "||", "|", ";", "&"}:
+            if not current:
+                raise ValueError("empty command")
+            segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
     return segments
 
 
@@ -217,9 +226,9 @@ def _validate_find_argv(argv: list[str]) -> None:
 
 def validate_bash_command_readonly(command: str) -> list[str]:
     """校验只读 Bash 指令，额外阻断改写文件与执行脚本的能力。"""
-    for snippet in _DISALLOWED_READONLY_SHELL_OPERATORS:
-        if snippet in command:
-            raise ValueError(f"shell control operator not allowed: {snippet}")
+    for token in _shell_tokens(command):
+        if token in _DISALLOWED_READONLY_SHELL_OPERATORS:
+            raise ValueError(f"shell control operator not allowed: {token}")
 
     argv = validate_bash_command(command)
     executable = argv[0]

@@ -70,7 +70,17 @@ def _is_static_html_project(package_json: Path) -> bool:
         package = json.loads(package_json.read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    return not package.get("dependencies") and not package.get("devDependencies")
+    dependencies = package.get("dependencies") or {}
+    dev_dependencies = package.get("devDependencies") or {}
+    dev_script = str((package.get("scripts") or {}).get("dev") or "")
+    if dependencies:
+        return False
+    if not dev_dependencies:
+        return True
+    # A static project sometimes adds http-server solely as a preview wrapper.
+    # The harness already owns a fixed-port Python server, so using it avoids
+    # package-specific CLI flags and preserves the exact static source tree.
+    return set(dev_dependencies) <= {"http-server"} and "http-server" in dev_script
 
 
 def _forward_seed_is_static(frontend_dir: Path) -> bool:
@@ -247,7 +257,8 @@ def start_process(
     env_overrides: dict[str, str] | None = None,
 ) -> ManagedProcess:
     """以独立会话启动子进程，并将日志落到文件。"""
-    log_file = log_path.open("w", encoding="utf-8")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("a", encoding="utf-8")
     env = _build_subprocess_env()
     if env_overrides:
         env.update(env_overrides)

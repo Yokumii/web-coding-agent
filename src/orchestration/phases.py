@@ -13,7 +13,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from src.agents.evaluator import _determine_passed, run_evaluator
+from src.agents.evaluator import (
+    _determine_passed,
+    build_deterministic_failure_grades,
+    run_evaluator,
+)
 from src.agents.design_stage import run_design_stage
 from src.agents.generator import run_generator
 from src.agents.planner import run_planner
@@ -35,7 +39,25 @@ from src.orchestration.edit_dom_guard import (
     snapshot_semantic_dom,
     sprint_baseline_name,
 )
-from src.orchestration.browser_evidence import collect_browser_evidence
+from src.orchestration.browser_evidence import (
+    _same_origin_route_url,
+    collect_browser_evidence,
+)
+from src.orchestration.accepted_tapes import (
+    AcceptedTapeError,
+    accepted_replay_checks,
+    append_accepted_tape,
+    select_accepted_replay_checks,
+)
+from src.orchestration.edit_card import (
+    materialize_edit_card,
+    read_edit_card,
+    visual_evidence_required,
+)
+from src.orchestration.edit_task_contract import read_edit_task_contract
+from src.orchestration.repair_packet import write_repair_packet
+from src.orchestration.task_inputs import load_task_input_manifest
+from src.orchestration.ui_action_contracts import TYPED_ASSERTION_ACTIONS
 from src.orchestration.minimality_runtime import (
     certify_round_minimality,
     ensure_minimality_policy,
@@ -48,7 +70,7 @@ from src.orchestration.minimal_path_guidance import (
 )
 from src.orchestration.runtime import start_app_stack
 from src.orchestration.sprint_state import SprintState
-from src.prompts.grading import evaluation_is_inconclusive
+from src.prompts.grading import criterion_threshold, evaluation_is_inconclusive
 from src.utils.logger import get_logger
 from src.utils.sdk_session import safe_sdk_session
 
@@ -89,6 +111,11 @@ class HarnessContext:
     sprint_state: SprintState
     phase_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
     user_prompt: str = ""
+
+
+def _task_has_image_input(workdir: Path) -> bool:
+    manifest = load_task_input_manifest(workdir)
+    return any(item.get("kind") == "image" for item in manifest.get("inputs", []))
 
 
 # ---- 局部辅助函数 ----
@@ -141,6 +168,15 @@ async def run_planner_phase(ctx: HarnessContext) -> None:
     started = time.perf_counter()
     async with _agent_phase_session(ctx, phase_name="planner"):
         raw_stats = await run_planner(ctx.config, ctx.user_prompt, ctx.file_comm, ctx.workdir)
+        edit_contract = read_edit_task_contract(ctx.workdir)
+        if edit_contract is not None:
+            materialize_edit_card(
+                harness_dir=ctx.file_comm.dir,
+                instruction_delta=ctx.user_prompt,
+                edit_contract=edit_contract,
+                sprint_plan=ctx.file_comm.read_sprint_plan() or {},
+                verification_plan=ctx.file_comm.read_ui_verification_plan() or {},
+            )
         _record_phase_stats(ctx, "planner", _coerce_stats(raw_stats), started_at=started)
         _checkpoint_transaction(ctx).record_plan_completed()
 
@@ -154,6 +190,21 @@ async def run_design_phase(ctx: HarnessContext) -> dict[str, Any]:
 
 
 # ---- Build 阶段 ----
+
+
+def _is_incremental_edit_sprint(ctx: HarnessContext, sprint_num: int) -> bool:
+    """Whether this build extends an already accepted product checkpoint.
+
+    Explicit Edit runs are scoped from their seed starting at sprint one. A
+    Generate run becomes an incremental Edit producer only after every earlier
+    sprint has been accepted; a failed first build therefore remains a Repair
+    source rather than being mislabeled as an Edit.
+    """
+    if is_forward_edit(ctx.workdir):
+        return True
+    return sprint_num > 1 and set(range(1, sprint_num)).issubset(
+        set(ctx.sprint_state.accepted)
+    )
 
 
 def _resume_requests_repair(
@@ -197,6 +248,111 @@ def _select_generator_mode(
     return "generate"
 
 
+def _visual_style_recheck_allowed(
+    grade: dict[str, Any], certificate: dict[str, Any], checks: list[dict[str, Any]]
+) -> bool:
+    """Allow a zero-mutation recheck only for uncovered target-local style atoms."""
+    if (
+        grade.get("overall_passed") is not False
+        or grade.get("bugs_found")
+        or not isinstance(grade.get("ui_checks"), list)
+        or not grade["ui_checks"]
+        or any(
+            not isinstance(item, dict)
+            or str(item.get("status", "")).strip().lower() != "pass"
+            for item in grade["ui_checks"]
+        )
+        or (grade.get("edit_guard") or {}).get("passed") is not True
+        or certificate.get("status") != "non_minimal"
+    ):
+        return False
+    redundant = set(certificate.get("redundant_change_ids") or [])
+    patches = {
+        str(item.get("change_id")): str(item.get("path", ""))
+        for item in certificate.get("atomic_patches", [])
+        if isinstance(item, dict) and item.get("change_id")
+    }
+    if not redundant or not redundant <= set(patches) or any(
+        Path(patches[change_id]).suffix.lower() not in {".css", ".scss"}
+        for change_id in redundant
+    ):
+        return False
+    return any(
+        isinstance(check, dict)
+        and str(check.get("category", "")).strip().lower()
+        in {"appearance", "responsive", "style", "visual"}
+        for check in checks
+    )
+
+
+def _dedicated_visual_recheck_allowed(grade: dict[str, Any]) -> bool:
+    """Retry vision without source mutation when every non-visual gate passed."""
+    phase = grade.get("phase_results") or {}
+    return bool(
+        grade.get("overall_passed") is False
+        and phase.get("render_gate") == "pass"
+        and phase.get("ui_functionality") == "pass"
+        and phase.get("source_inspection") == "pass"
+        and phase.get("appearance") == "skipped"
+        and not grade.get("bugs_found")
+        and not grade.get("regressions_found")
+        and not grade.get("repair_instructions")
+        and (grade.get("edit_guard") or {}).get("passed") is True
+        and isinstance(grade.get("ui_checks"), list)
+        and grade["ui_checks"]
+        and all(
+            isinstance(item, dict)
+            and str(item.get("status", "")).strip().lower() == "pass"
+            for item in grade["ui_checks"]
+        )
+    )
+
+
+def _contract_functionality_recheck_allowed(
+    file_comm: FileComm, previous_round: int, grade: dict[str, Any]
+) -> bool:
+    """Retry evidence only when executable behavior was the sole scoring conflict."""
+    phase = grade.get("phase_results") or {}
+    criteria = grade.get("criteria") or {}
+    functionality = criteria.get("functionality") if isinstance(criteria, dict) else None
+    score = functionality.get("score") if isinstance(functionality, dict) else None
+    ui_checks = grade.get("ui_checks")
+    if (
+        grade.get("overall_passed") is not False
+        or not isinstance(score, (int, float))
+        or isinstance(score, bool)
+        or score >= criterion_threshold("functionality")
+        or phase.get("render_gate") != "pass"
+        or phase.get("ui_functionality") != "pass"
+        or phase.get("source_inspection") != "pass"
+        or phase.get("appearance") not in {"pass", "skipped"}
+        or grade.get("bugs_found")
+        or grade.get("regressions_found")
+        or grade.get("repair_instructions")
+        or (grade.get("edit_guard") or {}).get("passed") is not True
+        or not isinstance(ui_checks, list)
+        or not ui_checks
+        or any(
+            not isinstance(item, dict)
+            or not item.get("check_id")
+            or str(item.get("status", "")).strip().lower() != "pass"
+            for item in ui_checks
+        )
+    ):
+        return False
+    evidence_path = file_comm.dir / f"browser_evidence_round_{previous_round}.json"
+    try:
+        records = json.loads(evidence_path.read_text(encoding="utf-8")).get("checks", [])
+    except (OSError, ValueError, TypeError):
+        return False
+    observed = {
+        str(item.get("check_id")): str(item.get("status"))
+        for item in records
+        if isinstance(item, dict) and item.get("check_id")
+    }
+    return all(observed.get(str(item["check_id"])) == "ok" for item in ui_checks)
+
+
 async def run_build_phase(
     ctx: HarnessContext,
     round_num: int,
@@ -211,26 +367,28 @@ async def run_build_phase(
     semantic_routes = discover_page_routes(ctx.workdir) or None
     baseline_path = ctx.file_comm.dir / "edit_dom_baseline.json"
     sprint_baseline_path = ctx.file_comm.dir / sprint_baseline_name(sprint_num)
-    if is_forward_edit(ctx.workdir) and (
-        not baseline_path.exists() or not sprint_baseline_path.exists()
-    ):
+    incremental_edit = _is_incremental_edit_sprint(ctx, sprint_num)
+    needs_global_baseline = is_forward_edit(ctx.workdir) and not baseline_path.exists()
+    needs_sprint_baseline = incremental_edit and not sprint_baseline_path.exists()
+    if needs_global_baseline or needs_sprint_baseline:
         # Capture the accepted source before the editor can touch it.  The
         # global seed frame supports provenance; the per-sprint frame prevents
-        # earlier accepted edits from looking like new collateral damage.
+        # earlier accepted edits from looking like new collateral damage. A
+        # Generate run starts using this same frame from sprint two onward.
         app_stack = await start_app_stack(ctx.workdir, ctx.file_comm.dir, ctx.config, round_num)
         try:
-            if not baseline_path.exists():
+            if needs_global_baseline:
                 snapshot = await capture_baseline(
                     workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
                     app_url=app_stack.frontend_url,
                     routes=semantic_routes,
                 )
-                if not sprint_baseline_path.exists():
+                if needs_sprint_baseline:
                     sprint_baseline_path.write_text(
                         json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8",
                     )
-            elif not sprint_baseline_path.exists():
+            elif needs_sprint_baseline:
                 await capture_sprint_source_baseline(
                     file_comm=ctx.file_comm, config=ctx.config,
                     app_url=app_stack.frontend_url, sprint_num=sprint_num,
@@ -255,6 +413,11 @@ async def run_build_phase(
                     headless=ctx.config.playwright_headless,
                     routes=semantic_routes,
                 )
+                if snapshot.get("stable") is not True:
+                    raise RuntimeError(
+                        "Repair source DOM is unstable across two samples; "
+                        "refusing to derive a Repair contract."
+                    )
                 repair_baseline_path.write_text(
                     json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
@@ -263,11 +426,11 @@ async def run_build_phase(
                 await app_stack.close()
     guide_minimal_path = (
         ctx.config.minimal_path_guidance_enabled
-        and (is_forward_edit(ctx.workdir) or mode == "repair")
+        and (incremental_edit or mode == "repair")
         and frontend_dir.is_dir()
     )
     if guide_minimal_path:
-        ensure_minimal_path_plan(
+        minimal_path_plan = ensure_minimal_path_plan(
             workdir=ctx.workdir,
             harness_dir=ctx.file_comm.dir,
             round_num=round_num,
@@ -276,9 +439,19 @@ async def run_build_phase(
             max_patch_lines=ctx.config.minimal_path_max_patch_lines,
             max_touched_files=ctx.config.minimal_path_max_touched_files,
         )
+        if minimal_path_plan.get("status") == "blocked":
+            route_scope = minimal_path_plan.get("route_scope") or {}
+            raise RuntimeError(
+                "Edit task contract is blocked before source mutation: "
+                f"route_status={route_scope.get('status')}, "
+                f"unresolved={route_scope.get('unresolved_routes') or []}, "
+                f"unexpected_checks={route_scope.get('unexpected_check_routes') or []}, "
+                f"missing_checks={route_scope.get('missing_check_routes') or []}. "
+                "Correct the planner route contract; do not widen the Edit to another page."
+            )
     track_minimality = (
         ctx.config.minimality_guard_enabled
-        and (is_forward_edit(ctx.workdir) or mode == "repair")
+        and (incremental_edit or mode == "repair")
         and (frontend_dir / ".git").exists()
     )
     if track_minimality:
@@ -287,13 +460,52 @@ async def run_build_phase(
             ctx.file_comm.dir, frontend_dir, round_num=round_num,
             sprint_num=sprint_num, mode=mode,
         )
+    previous_grade = ctx.file_comm.read_grades(round_num - 1) or {}
+    previous_certificate = (
+        previous_grade.get("minimality_certificate", {}).get("edit", {})
+        if isinstance(previous_grade.get("minimality_certificate"), dict)
+        else {}
+    )
+    certificate_artifact = previous_certificate.get("artifact")
+    certificate_payload = (
+        json.loads((ctx.workdir / str(certificate_artifact)).read_text(encoding="utf-8"))
+        if isinstance(certificate_artifact, str)
+        and certificate_artifact.startswith(".harness/")
+        and (ctx.workdir / certificate_artifact).is_file()
+        else {}
+    )
+    evidence_only_recheck = mode == "repair" and (
+        _visual_style_recheck_allowed(
+            previous_grade,
+            certificate_payload,
+            ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+        )
+        or _dedicated_visual_recheck_allowed(previous_grade)
+        or _contract_functionality_recheck_allowed(
+            ctx.file_comm, round_num - 1, previous_grade
+        )
+    )
     async with _agent_phase_session(ctx, phase_name=f"generator round {round_num}"):
         ctx.sprint_state.mark_sprint_in_progress(sprint_num)
         started = time.perf_counter()
-        raw_stats = await run_generator(
-            ctx.config, ctx.file_comm, ctx.workdir,
-            round_num=round_num, sprint_num=sprint_num, mode=mode,
-        )
+        if evidence_only_recheck:
+            logger.info(
+                "[bold green]Generator[/] skipped for evidence-only visual/style recheck; "
+                "the committed frontend remains byte-identical."
+            )
+            raw_stats = AgentRunStats(
+                cost_usd=0.0,
+                duration_ms=0,
+                duration_api_ms=0,
+                token_usage={},
+                usage={"recovery": "evidence_only_visual_style_recheck"},
+                model_usage={},
+            )
+        else:
+            raw_stats = await run_generator(
+                ctx.config, ctx.file_comm, ctx.workdir,
+                round_num=round_num, sprint_num=sprint_num, mode=mode,
+            )
         if track_minimality:
             record_round_build_destination(
                 ctx.file_comm.dir, frontend_dir, round_num=round_num
@@ -383,6 +595,59 @@ def _edit_guard_requires_repair(
     if not guard_result.get("passed"):
         return True
     return evaluator_mode == "full" and grades.get("edit_scope_audit") != "pass"
+
+
+def _apply_accepted_tape_gate(
+    grades: dict[str, Any], evidence: dict[str, Any] | None, *, round_num: int
+) -> dict[str, Any]:
+    if evidence is None:
+        return grades
+    failed = [
+        str(item.get("check_id", "unknown"))
+        for item in evidence.get("checks", [])
+        if isinstance(item, dict) and item.get("status") == "action_failed"
+    ]
+    gated = json.loads(json.dumps(grades))
+    gated["accepted_tape_replay"] = {
+        "status": "failed" if failed else "ok",
+        "failed_check_ids": failed,
+        "evidence_ref": f".harness/accepted_tape_replay_round_{round_num}.json",
+    }
+    if not failed:
+        return gated
+    finding = "Previously accepted browser behavior regressed: " + ", ".join(failed)
+    gated.setdefault("regressions_found", []).append(finding)
+    gated.setdefault("repair_instructions", []).append(
+        "Restore the failed accepted-tape behavior without widening the current Edit scope."
+    )
+    gated.setdefault("phase_results", {})["ui_functionality"] = "fail"
+    gated["sprint_passed"] = False
+    gated["regression_passed"] = False
+    gated["overall_passed"] = False
+    gated["mode_recommendation"] = "repair"
+    return gated
+
+
+def _checks_are_tape_eligible(checks: list[dict[str, Any]]) -> bool:
+    if not checks or any(not isinstance(check, dict) for check in checks):
+        return False
+    for check in checks:
+        actions = check.get("actions")
+        if not isinstance(actions, list) or not actions:
+            return False
+        assertion_count = sum(
+            1
+            for action in actions
+            if isinstance(action, dict)
+            and action.get("action") in TYPED_ASSERTION_ACTIONS
+        )
+        if (
+            not 1 <= assertion_count <= 4
+            or not isinstance(actions[-1], dict)
+            or actions[-1].get("action") not in TYPED_ASSERTION_ACTIONS
+        ):
+            return False
+    return True
 
 
 def _apply_browser_click_evidence_gate(
@@ -520,9 +785,39 @@ def _reconcile_action_contract_evidence(
             changed.append(check_id)
         feature_id = str(check.get("feature_id", ""))
         if feature_id:
-            feature_status[feature_id] = passed
+            feature_status[feature_id] = feature_status.get(feature_id, True) and passed
 
-    if not changed:
+    # Typed browser actions are the authoritative functionality oracle when
+    # they cover every evaluator UI check and all executions passed.  Preserve
+    # the model's score above threshold, but do not let an exploratory score
+    # below threshold contradict complete executable evidence.
+    grade_check_ids = {
+        str(check.get("check_id"))
+        for check in ui_checks
+        if isinstance(check, dict) and check.get("check_id")
+    }
+    contracts_complete = bool(grade_check_ids) and all(
+        status_by_id.get(check_id) == "ok" for check_id in grade_check_ids
+    )
+    functionality_calibrated = False
+    if contracts_complete:
+        criteria = reconciled.get("criteria")
+        functionality = criteria.get("functionality") if isinstance(criteria, dict) else None
+        if isinstance(functionality, dict):
+            score = functionality.get("score")
+            threshold = criterion_threshold("functionality")
+            if isinstance(score, (int, float)) and not isinstance(score, bool) and score < threshold:
+                functionality["score"] = threshold
+                functionality["passed"] = True
+                prior_notes = str(functionality.get("notes", "")).strip()
+                evidence_note = (
+                    "All typed browser action contracts passed; functionality was "
+                    "calibrated to the deterministic acceptance threshold."
+                )
+                functionality["notes"] = f"{prior_notes} {evidence_note}".strip()
+                functionality_calibrated = True
+
+    if not changed and not functionality_calibrated:
         return reconciled
     for result in reconciled.get("target_exit_criteria_results", []):
         if not isinstance(result, dict):
@@ -534,6 +829,7 @@ def _reconcile_action_contract_evidence(
         result["notes"] = "Matched to the harness action-contract result for feature " + feature_id + "."
     reconciled["browser_action_contract_reconciliation"] = {
         "changed_check_ids": changed,
+        "functionality_calibrated": functionality_calibrated,
         "evidence_ref": f".harness/browser_evidence_round_{round_num}.json",
     }
     logger.warning(
@@ -569,6 +865,50 @@ def _action_contract_grade_conflicts(file_comm: FileComm, round_num: int, grades
     return conflicts
 
 
+def _non_visual_gates_passed(
+    grades: dict[str, Any],
+    browser_evidence: dict[str, Any] | None,
+    accepted_tape_evidence: dict[str, Any] | None,
+    guard_result: dict[str, Any] | None,
+) -> bool:
+    """Whether deterministic behavior/source gates permit dedicated vision."""
+    phase = grades.get("phase_results") or {}
+    legacy_positive = not phase and grades.get("overall_passed") is True
+    phase_failed = bool(phase) and (
+        phase.get("render_gate") != "pass"
+        or phase.get("ui_functionality") != "pass"
+        or phase.get("source_inspection") != "pass"
+    )
+    if (
+        grades.get("evaluation_infrastructure_failure")
+        or (not legacy_positive and (not phase or phase_failed))
+        or grades.get("bugs_found")
+        or grades.get("regressions_found")
+        or (guard_result is not None and guard_result.get("passed") is not True)
+    ):
+        return False
+    for evidence in (browser_evidence, accepted_tape_evidence):
+        if evidence is None:
+            continue
+        observed = evidence.get("checks") if isinstance(evidence, dict) else None
+        if not isinstance(observed, list) or any(
+            not isinstance(item, dict) or item.get("status") != "ok"
+            for item in observed
+        ):
+            return False
+    return True
+
+
+def _has_reproduced_action_failure(evidence: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(evidence, dict)
+        and any(
+            isinstance(item, dict) and item.get("status") == "action_failed"
+            for item in evidence.get("checks") or []
+        )
+    )
+
+
 def _merge_visual_evidence_manifest(
     manifest: dict[str, Any] | None,
     *,
@@ -593,6 +933,14 @@ def _merge_visual_evidence_manifest(
     }
 
 
+def _visual_routes_for_checks(checks: list[dict[str, Any]]) -> list[str]:
+    return list(dict.fromkeys(
+        str(check.get("route", "/"))
+        for check in checks
+        if isinstance(check, dict)
+    )) or ["/"]
+
+
 async def _capture_independent_visual_evidence(
     ctx: HarnessContext, *, app_url: str, round_num: int
 ) -> None:
@@ -605,26 +953,40 @@ async def _capture_independent_visual_evidence(
     from playwright.async_api import async_playwright
     from src.utils.playwright_browser import launch_chromium
 
-    refs = [f".harness/visual_round_{round_num}_auto_top.png"]
-    top_path = ctx.workdir / refs[0]
-    top_path.parent.mkdir(parents=True, exist_ok=True)
+    checks = ctx.sprint_state.ui_checks_for_sprint(ctx.sprint_state.current_target)
+    routes = _visual_routes_for_checks(checks)
+    refs: list[str] = []
     async with async_playwright() as playwright:
         browser = await launch_chromium(playwright, headless=True)
         try:
             page = await browser.new_page(viewport={"width": 1440, "height": 900})
-            await page.goto(app_url, wait_until="networkidle", timeout=30_000)
-            await page.screenshot(path=str(top_path))
-            can_scroll = await page.evaluate(
-                "document.documentElement.scrollHeight > window.innerHeight + 80"
-            )
-            if can_scroll:
-                await page.evaluate(
-                    "window.scrollTo(0, Math.min(document.documentElement.scrollHeight - window.innerHeight, Math.max(500, window.innerHeight)));"
+            for index, route in enumerate(routes[:3], 1):
+                route_url = _same_origin_route_url(app_url, route)
+                top_ref = (
+                    f".harness/visual_round_{round_num}_auto_top.png"
+                    if index == 1
+                    else f".harness/visual_round_{round_num}_auto_route_{index}_top.png"
                 )
-                await page.wait_for_timeout(350)
-                scrolled_ref = f".harness/visual_round_{round_num}_auto_scrolled.png"
-                await page.screenshot(path=str(ctx.workdir / scrolled_ref))
-                refs.append(scrolled_ref)
+                top_path = ctx.workdir / top_ref
+                top_path.parent.mkdir(parents=True, exist_ok=True)
+                await page.goto(route_url, wait_until="networkidle", timeout=30_000)
+                await page.screenshot(path=str(top_path))
+                refs.append(top_ref)
+                can_scroll = await page.evaluate(
+                    "document.documentElement.scrollHeight > window.innerHeight + 80"
+                )
+                if can_scroll:
+                    await page.evaluate(
+                        "document.documentElement.scrollTop = Math.min(document.documentElement.scrollHeight - window.innerHeight, Math.max(500, window.innerHeight));"
+                    )
+                    await page.wait_for_timeout(350)
+                    scrolled_ref = (
+                        f".harness/visual_round_{round_num}_auto_scrolled.png"
+                        if index == 1
+                        else f".harness/visual_round_{round_num}_auto_route_{index}_scrolled.png"
+                    )
+                    await page.screenshot(path=str(ctx.workdir / scrolled_ref))
+                    refs.append(scrolled_ref)
         finally:
             await browser.close()
 
@@ -648,6 +1010,8 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     guard_result: dict[str, Any] | None = None
     grades: dict[str, Any] = {}
     passed = False
+    browser_evidence: dict[str, Any] | None = None
+    accepted_tape_evidence: dict[str, Any] | None = None
 
     async with _agent_phase_session(ctx, phase_name=f"evaluator round {round_num}"):
         try:
@@ -686,6 +1050,50 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                     app_url=app_stack.frontend_url, round_num=round_num,
                     sprint_num=sprint_num,
                 )
+                edit_card = read_edit_card(ctx.file_comm.dir)
+                try:
+                    if edit_card is not None:
+                        regression_selection = select_accepted_replay_checks(
+                            ctx.file_comm.dir,
+                            edit_card=edit_card,
+                            accepted_edit_index=len(ctx.sprint_state.accepted) + 1,
+                            full_replay_interval=ctx.config.edit_full_replay_interval,
+                            before_round=round_num,
+                        )
+                        replay_checks = list(regression_selection.pop("checks"))
+                        (ctx.file_comm.dir / f"regression_selection_round_{round_num}.json").write_text(
+                            json.dumps(regression_selection, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                    else:
+                        regression_selection = None
+                        replay_checks = accepted_replay_checks(ctx.file_comm.dir)
+                except AcceptedTapeError as exc:
+                    raise EvaluationInfrastructureError(str(exc)) from exc
+                if replay_checks:
+                    accepted_tape_evidence = await asyncio.wait_for(
+                        collect_browser_evidence(
+                            app_url=app_stack.frontend_url,
+                            checks=replay_checks,
+                            output_path=ctx.file_comm.dir
+                            / f"accepted_tape_replay_round_{round_num}.json",
+                            headless=ctx.config.playwright_headless,
+                            fail_fast=True,
+                        ),
+                        timeout=75,
+                    )
+                    invalid_tapes = [
+                        str(item.get("check_id", "unknown"))
+                        for item in accepted_tape_evidence.get("checks", [])
+                        if isinstance(item, dict)
+                        and item.get("status")
+                        in {"invalid_test_contract", "no_action_contract"}
+                    ]
+                    if invalid_tapes:
+                        raise EvaluationInfrastructureError(
+                            "Accepted tape is no longer executable for checks "
+                            + ", ".join(invalid_tapes)
+                        )
                 # Run planner-authored concrete actions independently.  Empty
                 # legacy plans remain valid; their evaluator falls back to the
                 # existing exploratory path.
@@ -716,19 +1124,34 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                         + ", ".join(invalid_contracts)
                         + "; refusing to fabricate a code repair from a broken test."
                     )
-                try:
-                    passed, grades, ev_stats = await asyncio.wait_for(
-                        run_evaluator(
-                            ctx.config, ctx.file_comm, ctx.workdir,
-                            round_num=round_num, app_url=app_stack.frontend_url, edit_guard=guard_result,
-                        ),
-                        timeout=180,
+                reproduced_failure = (
+                    _has_reproduced_action_failure(browser_evidence)
+                    or _has_reproduced_action_failure(accepted_tape_evidence)
+                    or (guard_result is not None and guard_result.get("passed") is not True)
+                )
+                if reproduced_failure:
+                    passed, grades, ev_stats = build_deterministic_failure_grades(
+                        file_comm=ctx.file_comm,
+                        round_num=round_num,
+                        sprint_num=sprint_num,
+                        sprint_context=sprint_ctx,
+                        ui_checks=ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+                        edit_guard=guard_result,
                     )
-                except asyncio.TimeoutError as exc:
-                    raise EvaluationInfrastructureError(
-                        "Evaluator exceeded its 180s hard timeout; refusing to fabricate a repair "
-                        "from an incomplete evaluation."
-                    ) from exc
+                else:
+                    try:
+                        passed, grades, ev_stats = await asyncio.wait_for(
+                            run_evaluator(
+                                ctx.config, ctx.file_comm, ctx.workdir,
+                                round_num=round_num, app_url=app_stack.frontend_url, edit_guard=guard_result,
+                            ),
+                            timeout=180,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise EvaluationInfrastructureError(
+                            "Evaluator exceeded its 180s hard timeout; refusing to fabricate a repair "
+                            "from an incomplete evaluation."
+                        ) from exc
                 conflicts = _action_contract_grade_conflicts(ctx.file_comm, round_num, grades)
                 if conflicts:
                     raise EvaluationInfrastructureError(
@@ -737,8 +1160,20 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                     )
                 grades = _reconcile_action_contract_evidence(ctx.file_comm, round_num, grades)
                 grades = _apply_browser_click_evidence_gate(ctx.workdir, round_num, grades)
+                grades = _apply_accepted_tape_gate(
+                    grades, accepted_tape_evidence, round_num=round_num
+                )
+                if regression_selection is not None:
+                    grades["regression_selection"] = {
+                        **regression_selection,
+                        "artifact": f".harness/regression_selection_round_{round_num}.json",
+                    }
                 passed = _determine_passed(grades)
-                if passed:
+                if _non_visual_gates_passed(
+                    grades, browser_evidence, accepted_tape_evidence, guard_result
+                ) and visual_evidence_required(
+                    edit_card, has_image_input=_task_has_image_input(ctx.workdir)
+                ):
                     try:
                         await _capture_independent_visual_evidence(
                             ctx, app_url=app_stack.frontend_url, round_num=round_num
@@ -804,7 +1239,14 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     # A reproduced browser failure already establishes a repair source.  A
     # costly visual review cannot turn that failure into an accepted edit and
     # should not delay the next repair round.
-    if ctx.config.evaluator_mode == "full" and startup_error is None and passed:
+    visual_ready = _non_visual_gates_passed(
+        grades, browser_evidence, accepted_tape_evidence, guard_result
+    )
+    edit_card = read_edit_card(ctx.file_comm.dir)
+    needs_visual = visual_evidence_required(
+        edit_card, has_image_input=_task_has_image_input(ctx.workdir)
+    )
+    if ctx.config.evaluator_mode == "full" and startup_error is None and visual_ready and needs_visual:
         async with _agent_phase_session(ctx, phase_name=f"visual review round {round_num}"):
             try:
                 grades, vs_stats = await asyncio.wait_for(
@@ -827,6 +1269,15 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
             _coerce_stats(vs_stats),
             started_at=vs_started,
         )
+    elif ctx.config.evaluator_mode == "full" and visual_ready and not needs_visual:
+        grades.setdefault("phase_results", {})["appearance"] = "skipped"
+        grades["visual_evidence_decision"] = {
+            "status": "not_required",
+            "reason": str((edit_card or {}).get("visual_evidence_reason") or "behavior/state-only Edit"),
+            "evidence_route": ["dom", "ax_semantics", "internal_state", "real_browser"],
+        }
+
+    passed = _determine_passed(grades)
 
     if passed:
         try:
@@ -836,6 +1287,7 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                 round_num=round_num,
                 sprint_num=sprint_num,
                 checks=ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+                visual_accepted=(grades.get("phase_results") or {}).get("appearance") == "pass",
             )
         except asyncio.TimeoutError:
             minimality = {
@@ -901,7 +1353,49 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
         sprint_num=sprint_num,
         grades=grades,
     )
+    if not passed and read_edit_task_contract(ctx.workdir) is not None:
+        packet = write_repair_packet(
+            workdir=ctx.workdir,
+            round_num=round_num,
+            sprint_num=sprint_num,
+            grades=grades,
+        )
+        if packet.get("status") != "repairable":
+            raise EvaluationInfrastructureError(
+                "Failed Edit has no identifiable browser/semantic evidence; refusing an open-ended Repair round."
+            )
+        grades["repair_packet"] = {
+            "status": packet["status"],
+            "artifact": f".harness/repair_packet_round_{round_num}.json",
+            "failed_check_ids": [
+                str(item.get("check_id", "unknown")) for item in packet.get("failed_checks") or []
+            ],
+        }
     if isinstance(grades.get("criteria"), dict) and "round" in grades:
+        current_checks = ctx.sprint_state.ui_checks_for_sprint(sprint_num)
+        if (
+            recommendation in {"generate_next_sprint", "complete"}
+            and browser_evidence is not None
+            and _checks_are_tape_eligible(current_checks)
+        ):
+            try:
+                tape_path = append_accepted_tape(
+                    harness_dir=ctx.file_comm.dir,
+                    sprint_num=sprint_num,
+                    round_num=round_num,
+                    checks=current_checks,
+                    evidence=browser_evidence,
+                )
+            except AcceptedTapeError as exc:
+                raise EvaluationInfrastructureError(
+                    "Accepted checkpoint could not be recorded as a typed tape: " + str(exc)
+                ) from exc
+            grades["accepted_tape"] = {
+                "status": "recorded",
+                "artifact": f".harness/{tape_path.name}",
+                "sprint": sprint_num,
+                "round": round_num,
+            }
         ctx.file_comm.write_grades(round_num, grades)
         ctx.file_comm.write_feedback(round_num, render_feedback_from_grades(grades))
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from html.parser import HTMLParser
 from pathlib import Path
 import json
+import re
 import subprocess
 from typing import Any, Literal
 
@@ -23,6 +25,10 @@ from src.orchestration.target_profile import (
     target_profile_guidance,
     validate_target_submission,
 )
+from src.orchestration.task_inputs import (
+    task_input_image_paths,
+    task_input_prompt_context,
+)
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
 from src.prompts.grading import criterion_threshold
 from src.utils.logger import get_logger
@@ -39,6 +45,138 @@ _GENERATE_REQUIRED_READS = (
 )
 _MAX_REPAIR_FILES = 4
 _MAX_REPAIR_CHANGED_LINES = 1000
+_REMOTE_URL_RE = re.compile(r"https?://[^\s'\"<>),]+", re.IGNORECASE)
+
+
+class _ExternalRuntimeResourceParser(HTMLParser):
+    """Collect remote URLs that a page fetches, excluding ordinary anchors."""
+
+    _RESOURCE_ATTRIBUTES = {
+        "audio": ("src",),
+        "embed": ("src",),
+        "iframe": ("src",),
+        "img": ("src", "srcset"),
+        "input": ("src",),
+        "object": ("data",),
+        "script": ("src",),
+        "source": ("src", "srcset"),
+        "track": ("src",),
+        "video": ("src", "poster"),
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.urls: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        values = {name.lower(): value or "" for name, value in attrs}
+        candidates = [
+            values.get(name, "")
+            for name in self._RESOURCE_ATTRIBUTES.get(tag.lower(), ())
+        ]
+        if tag.lower() == "link":
+            rel = {item.lower() for item in values.get("rel", "").split()}
+            if rel & {
+                "dns-prefetch",
+                "icon",
+                "modulepreload",
+                "preconnect",
+                "prefetch",
+                "preload",
+                "stylesheet",
+            }:
+                candidates.append(values.get("href", ""))
+        for candidate in candidates:
+            self.urls.extend(match.group(0) for match in _REMOTE_URL_RE.finditer(candidate))
+
+
+def _external_runtime_urls(relative: str, content: str) -> list[tuple[str, str]]:
+    suffix = Path(relative).suffix.lower()
+    urls: list[str] = []
+    if suffix in {".htm", ".html"}:
+        parser = _ExternalRuntimeResourceParser()
+        parser.feed(content)
+        urls.extend(parser.urls)
+    elif suffix == ".css":
+        for match in re.finditer(
+            r"(?:@import\s+(?:url\()?|url\()\s*['\"]?(https?://[^\s'\"\)]+)",
+            content,
+            re.IGNORECASE,
+        ):
+            urls.append(match.group(1))
+    else:
+        for match in re.finditer(
+            r"\b(?:fetch|WebSocket|EventSource)\s*\(\s*['\"](https?://[^'\"]+)",
+            content,
+            re.IGNORECASE,
+        ):
+            urls.append(match.group(1))
+    return [(relative, url) for url in urls]
+
+
+def _working_tree_external_runtime_dependencies(
+    frontend_dir: Path,
+) -> set[tuple[str, str]]:
+    violations: set[tuple[str, str]] = set()
+    ignored_parts = {".git", "build", "dist", "node_modules"}
+    for path in sorted(frontend_dir.rglob("*")):
+        if (
+            not path.is_file()
+            or set(path.relative_to(frontend_dir).parts) & ignored_parts
+            or path.stat().st_size > 1_000_000
+        ):
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in {".css", ".htm", ".html", ".js", ".jsx", ".mjs", ".ts", ".tsx"}:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        relative = path.relative_to(frontend_dir).as_posix()
+        violations.update(_external_runtime_urls(relative, content))
+    return violations
+
+
+def _commit_external_runtime_dependencies(
+    frontend_dir: Path, commit: str
+) -> set[tuple[str, str]]:
+    violations: set[tuple[str, str]] = set()
+    paths = _git_output(frontend_dir, "ls-tree", "-r", "--name-only", commit).splitlines()
+    for relative in paths:
+        if Path(relative).suffix.lower() not in {
+            ".css", ".htm", ".html", ".js", ".jsx", ".mjs", ".ts", ".tsx",
+        }:
+            continue
+        content = _git_output(frontend_dir, "show", f"{commit}:{relative}")
+        violations.update(_external_runtime_urls(relative, content))
+    return violations
+
+
+def _validate_no_external_runtime_dependencies(
+    frontend_dir: Path, *, baseline_commit: str | None = None
+) -> str | None:
+    """Reject newly introduced runtime URLs while grandfathering accepted source."""
+    violations = _working_tree_external_runtime_dependencies(frontend_dir)
+    if baseline_commit is not None:
+        try:
+            violations -= _commit_external_runtime_dependencies(
+                frontend_dir, baseline_commit
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            return f"Could not audit baseline runtime dependencies: {exc}"
+    if not violations:
+        return None
+    evidence = ", ".join(
+        f"frontend/{path} -> {url}" for path, url in sorted(violations)[:8]
+    )
+    return (
+        "External runtime dependencies are forbidden for portable harness data: "
+        + evidence
+        + ". Vendor the asset locally or use system fonts/local source, then validate and commit."
+    )
 
 
 def _git_output(frontend_dir: Path, *args: str) -> str:
@@ -209,23 +347,69 @@ def _trace_has_successful_validation(trace_path: Path) -> bool:
     return False
 
 
+def _trace_usage_totals(trace_path: Path) -> dict[str, Any]:
+    """Sum the last cumulative usage snapshot from every appended agent run."""
+    totals = {"input_tokens": 0, "output_tokens": 0}
+    total_cost = 0.0
+    segment_usage = {"input_tokens": 0, "output_tokens": 0}
+    segment_cost = 0.0
+    seen_segment = False
+    try:
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event.get("event") == "run_start":
+                if seen_segment:
+                    totals["input_tokens"] += segment_usage["input_tokens"]
+                    totals["output_tokens"] += segment_usage["output_tokens"]
+                    total_cost += segment_cost
+                segment_usage = {"input_tokens": 0, "output_tokens": 0}
+                segment_cost = 0.0
+                seen_segment = True
+            elif event.get("event") in {"usage", "run_error"}:
+                usage = event.get("cumulative_usage")
+                if isinstance(usage, dict):
+                    segment_usage = {
+                        "input_tokens": int(usage.get("input_tokens") or 0),
+                        "output_tokens": int(usage.get("output_tokens") or 0),
+                    }
+                cost = event.get("estimated_cost_usd")
+                if isinstance(cost, (int, float)) and cost >= 0:
+                    segment_cost = float(cost)
+    except (OSError, ValueError, TypeError):
+        return {**totals, "estimated_cost_usd": round(total_cost, 6)}
+    if seen_segment:
+        totals["input_tokens"] += segment_usage["input_tokens"]
+        totals["output_tokens"] += segment_usage["output_tokens"]
+        total_cost += segment_cost
+    return {**totals, "estimated_cost_usd": round(total_cost, 6)}
+
+
 def _checkpoint_interrupted_model_work(
     frontend_dir: Path, file_comm: FileComm, workdir: Path, round_num: int, mode: GeneratorMode,
 ) -> str | None:
     """Atomically checkpoint a *previously model-written* uncommitted edit.
 
-    This recovery never changes product source.  It is deliberately available
-    only after a prior model attempt has produced the forward-edit scope. The
-    harness independently validates the exact source diff before committing;
-    browser evaluation then determines whether the interrupted implementation
-    is a natural repair source or an accepted edit.
+    This recovery never changes product source. For a forward Edit it requires
+    the harness-owned scope contract; for a root Generate it accepts untracked
+    model-written files. The harness independently validates exact provenance
+    and syntax before committing; browser evaluation still decides acceptance.
     """
-    if mode != "generate" or not (workdir / "seed_manifest.json").is_file():
+    if mode != "generate":
         return None
-    if _validate_edit_scope(workdir, round_num) is not None:
+    is_forward_edit = (workdir / "seed_manifest.json").is_file()
+    if is_forward_edit and _validate_edit_scope(workdir, round_num) is not None:
         return None
     try:
-        changed_paths = set(filter(None, _git_output(frontend_dir, "diff", "--name-only").splitlines()))
+        changed_paths = set(filter(
+            None,
+            _git_output(frontend_dir, "diff", "HEAD", "--name-only").splitlines(),
+        ))
+        changed_paths.update(filter(
+            None,
+            _git_output(
+                frontend_dir, "ls-files", "--others", "--exclude-standard"
+            ).splitlines(),
+        ))
         if not changed_paths:
             return None
         subprocess.run(["git", "diff", "--check"], cwd=frontend_dir, check=True,
@@ -233,7 +417,13 @@ def _checkpoint_interrupted_model_work(
     except (OSError, subprocess.CalledProcessError):
         return None
     trace_path = RoundArtifacts(file_comm, round_num).trace_path("generator")
-    if not changed_paths.issubset(_trace_written_frontend_paths(trace_path)):
+    # ``ensure_repo`` creates this fixed scaffold file before the model runs.
+    # All other recovered files must be explicitly model-authored in the trace.
+    harness_scaffold_paths = {".gitignore"} if (frontend_dir / ".gitignore").is_file() else set()
+    model_changed_paths = changed_paths - harness_scaffold_paths
+    if not model_changed_paths or not model_changed_paths.issubset(
+        _trace_written_frontend_paths(trace_path)
+    ):
         return None
     # A timeout after a few writes is an infrastructure interruption, not yet a
     # natural completed edit.  Do not manufacture a repair seed by committing
@@ -273,11 +463,15 @@ def _checkpoint_interrupted_model_work(
         f"## Round {round_num} recovery\n\n"
         f"Harness checkpointed the trace-proven model diff at `{commit[:12]}` after tool-budget exhaustion."
     )
+    trace_usage = _trace_usage_totals(trace_path)
     (file_comm.dir / f"recovery_commit_round_{round_num}.json").write_text(
         json.dumps({
             "status": "ok", "commit_mode": "harness_checkpoint", "round": round_num,
             "commit": commit, "source_change_author": "native_model_trace",
-            "source_files": sorted(changed_paths), "cost_status": "precheckpoint_model_cost_unknown",
+            "source_files": sorted(model_changed_paths),
+            "harness_scaffold_files": sorted(changed_paths - model_changed_paths),
+            "precheckpoint_usage": trace_usage,
+            "cost_status": "recovered_from_append_only_trace",
         }, indent=2) + "\n", encoding="utf-8"
     )
     return commit
@@ -309,7 +503,13 @@ def _is_harness_checkpoint_for_round(
     )
 
 
-def _validate_repair_scope(frontend_dir: Path, baseline_commit: str) -> str | None:
+def _validate_repair_scope(
+    frontend_dir: Path,
+    baseline_commit: str,
+    *,
+    max_files: int,
+    max_changed_lines: int,
+) -> str | None:
     """Reject broad repair commits before they become accepted trajectory states."""
     try:
         output = _git_output(
@@ -331,13 +531,100 @@ def _validate_repair_scope(frontend_dir: Path, baseline_commit: str) -> str | No
             changed_lines += int(added)
         if removed.isdigit():
             changed_lines += int(removed)
-    if changed_files > _MAX_REPAIR_FILES or changed_lines > _MAX_REPAIR_CHANGED_LINES:
+    max_files = max(1, int(max_files))
+    max_changed_lines = max(1, int(max_changed_lines))
+    if changed_files > max_files or changed_lines > max_changed_lines:
         return (
             "Repair diff is too broad for an atomic repair: "
             f"{changed_files} source files and {changed_lines} changed lines; allowed maximum is "
-            f"{_MAX_REPAIR_FILES} files and {_MAX_REPAIR_CHANGED_LINES} changed lines. "
+            f"{max_files} files and {max_changed_lines} changed lines. "
             "Reduce the committed diff to the evaluator-confirmed defect only. Preserve all "
             "unrelated code and formatting byte-for-byte, then create a corrective fix commit."
+        )
+    return None
+
+
+def _validate_minimal_path_final_diff(
+    frontend_dir: Path,
+    baseline_commit: str,
+    mutation_policy: MinimalPathPolicy | None,
+) -> str | None:
+    """Reject source changes that bypassed the online minimal-path controller.
+
+    Tool-time denials are necessary but insufficient: an allowed build script or
+    provider-specific tool can still mutate a protected file indirectly. The
+    final committed diff must therefore be explained by successful, recorded
+    source mutations in the harness ledger.
+    """
+    if mutation_policy is None:
+        return None
+    try:
+        changed = {
+            f"frontend/{path}"
+            for path in _git_output(
+                frontend_dir, "diff", "--name-only", f"{baseline_commit}..HEAD", "--"
+            ).splitlines()
+            if path
+        }
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return f"Minimal-path final diff validation failed: {exc}."
+    code_changed = {
+        path for path in changed
+        if Path(path).suffix.lower() in {
+            ".html", ".htm", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx",
+            ".vue", ".svelte", ".json", ".json5", ".svg", ".qml", ".ets",
+            ".wxml", ".wxss",
+        }
+    }
+    unsupported_asset_changes = sorted(changed - code_changed)
+    unexplained = sorted(code_changed - mutation_policy.touched_paths)
+    guarded_shared_paths = set(mutation_policy.guarded_shared_regions)
+    protected = sorted(
+        code_changed & (
+            mutation_policy.protected_paths
+            | mutation_policy.off_target_paths
+            | (mutation_policy.cross_route_shared_paths - guarded_shared_paths)
+        )
+    )
+    if protected:
+        return (
+            "Committed Edit changed protected multi-page source: "
+            + ", ".join(protected)
+            + ". Restore those files exactly; only target-route source may change."
+        )
+    for path in sorted(code_changed & guarded_shared_paths):
+        frontend_relative = Path(path).relative_to("frontend").as_posix()
+        try:
+            before = subprocess.run(
+                ["git", "show", f"{baseline_commit}:{frontend_relative}"],
+                cwd=frontend_dir,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout
+            after = (frontend_dir / frontend_relative).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            return f"Guarded shared-source final validation failed for {path}: {exc}."
+        region_error = mutation_policy.validate_guarded_shared_file(
+            path, before=before, after=after
+        )
+        if region_error:
+            return region_error
+    if unsupported_asset_changes:
+        return (
+            "Committed Edit changed non-code assets that are outside the current portable "
+            "patch contract: " + ", ".join(unsupported_asset_changes) + ". Preserve existing "
+            "assets and use supplied images as references; asset mutation needs an explicit "
+            "resource-manifest contract."
+        )
+    if unexplained:
+        return (
+            "Committed source changes bypassed the harness minimal-path ledger: "
+            + ", ".join(unexplained)
+            + ". Restore them or apply the intended exact patch through the selected path."
         )
     return None
 
@@ -410,7 +697,40 @@ def _validate_edit_scope(
     unknown = sorted(set(roots) - valid_roots)
     if unknown:
         return "Forward edit scope contains unknown baseline roots: " + ", ".join(unknown)
-    if baseline.get("version") == 3:
+    if baseline.get("version") == 4:
+        if baseline.get("stable") is not True:
+            return "Semantic edit baseline is unstable; source mutation is blocked."
+        fragments = payload.get("allowed_fragment_keys")
+        if not isinstance(fragments, list) or not all(
+            isinstance(item, str) for item in fragments
+        ):
+            return "Semantic edit scope must contain a string list `allowed_fragment_keys`."
+        valid_fragments = {
+            str(item["key"])
+            for item in baseline.get("fragments", [])
+            if isinstance(item, dict) and item.get("key")
+        }
+        unknown_fragments = sorted(set(fragments) - valid_fragments)
+        if unknown_fragments:
+            return "Semantic edit scope contains unknown baseline fragments: " + ", ".join(
+                unknown_fragments
+            )
+        expected_new = payload.get("expected_new_fragments")
+        if not isinstance(expected_new, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("route"), str)
+            or not isinstance(item.get("selector"), str)
+            or not item.get("selector")
+            or not isinstance(item.get("max_count"), int)
+            or isinstance(item.get("max_count"), bool)
+            or not 1 <= item.get("max_count") <= 50
+            for item in expected_new
+        ):
+            return (
+                "Semantic edit scope `expected_new_fragments` must use explicit "
+                "route/selector contracts with max_count in 1..50."
+            )
+    if baseline.get("version") in {3, 4}:
         target_routes = payload.get("target_routes")
         protected_routes = payload.get("protected_routes")
         if (
@@ -438,6 +758,25 @@ def _validate_edit_scope(
             counts[route] = counts.get(route, 0) + 1
         if any(count > 2 for count in counts.values()):
             return "Multi-route edit scope may declare at most two roots per target route."
+        if baseline.get("version") == 4:
+            fragment_routes = {
+                str(item.get("key")): str(item.get("route", "/"))
+                for item in baseline.get("fragments", [])
+                if isinstance(item, dict) and item.get("key")
+            }
+            fragment_counts: dict[str, int] = {}
+            for fragment in payload.get("allowed_fragment_keys", []):
+                route = fragment_routes.get(fragment, "")
+                if not route or route not in target_set or route in protected_set:
+                    return "Multi-route edit scope may only allow fragments owned by target routes."
+                fragment_counts[route] = fragment_counts.get(route, 0) + 1
+            for contract in payload.get("expected_new_fragments", []):
+                route = str(contract.get("route", ""))
+                if not route or route not in target_set or route in protected_set:
+                    return "Multi-route edit scope may only expect fragments on target routes."
+                fragment_counts[route] = fragment_counts.get(route, 0) + 1
+            if any(count > 4 for count in fragment_counts.values()):
+                return "Multi-route edit scope may declare at most four fragments per target route."
     elif len(roots) > 2:
         return "Forward edit scope may declare at most two distinct root keys."
     if not isinstance(payload.get("allow_new_roots", False), bool):
@@ -465,26 +804,56 @@ def _is_scope_contract_only_repair(grades: dict[str, Any]) -> bool:
 def _make_generator_stop_hook(
     frontend_dir: Path, baseline_commit: str, mode: GeneratorMode, workdir: Path, round_num: int,
     target_profile: dict[str, Any] | None = None, scope_contract_only: bool = False,
+    mutation_policy: MinimalPathPolicy | None = None,
 ):
     async def _hook(_input: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
         error = _validate_generator_runnable_files(frontend_dir, workdir)
         if error is None:
+            error = _validate_no_external_runtime_dependencies(
+                frontend_dir, baseline_commit=baseline_commit
+            )
+        if error is None:
             error = validate_target_submission(frontend_dir, target_profile)
         if error is None and not scope_contract_only:
             error = _validate_generator_commits(frontend_dir, baseline_commit, mode)
+        if error is None and not scope_contract_only:
+            error = _validate_minimal_path_final_diff(
+                frontend_dir, baseline_commit, mutation_policy
+            )
         if error is None:
             is_forward = (workdir / "seed_manifest.json").is_file()
             repair_baseline = workdir / ".harness" / repair_baseline_name(round_num)
             error = _validate_edit_scope(
                 workdir,
                 round_num,
-                required=(is_forward or (mode == "repair" and repair_baseline.is_file())),
+                required=(
+                    is_forward
+                    or mutation_policy is not None
+                    or (mode == "repair" and repair_baseline.is_file())
+                ),
                 baseline_filename=(
-                    None if is_forward else repair_baseline_name(round_num)
+                    None
+                    if is_forward or mutation_policy is not None
+                    else repair_baseline_name(round_num)
                 ),
             )
         if error is None and mode == "repair":
-            error = _validate_repair_scope(frontend_dir, baseline_commit)
+            max_files = (
+                mutation_policy.max_touched_files
+                if mutation_policy is not None
+                else _MAX_REPAIR_FILES
+            )
+            max_changed_lines = (
+                mutation_policy.max_patch_lines * max_files
+                if mutation_policy is not None
+                else _MAX_REPAIR_CHANGED_LINES
+            )
+            error = _validate_repair_scope(
+                frontend_dir,
+                baseline_commit,
+                max_files=max_files,
+                max_changed_lines=max_changed_lines,
+            )
         if error:
             return {"decision": "block", "reason": error, "stopReason": error}
         return {"continue_": True}
@@ -615,9 +984,17 @@ def _build_generator_prompt(
     has_repair_frame = mode == "repair" and repair_frame_path.is_file()
     minimal_path_ref = f".harness/{plan_name(round_num)}"
     minimal_path_owned = (file_comm.dir / plan_name(round_num)).is_file()
+    trajectory_role = (
+        "repair"
+        if mode == "repair"
+        else "incremental_edit"
+        if minimal_path_owned
+        else "generate_root"
+    )
     feature_ids = ", ".join(sprint_context.get("feature_ids", []))
     common_lines = [
         f"Mode: {mode}\n",
+        f"Trajectory Role: {trajectory_role}\n",
         f"Round: {round_num}\n"
         f"Sprint: {sprint_num}\n"
         f"Sprint Title: {sprint_context.get('title')}\n"
@@ -628,7 +1005,7 @@ def _build_generator_prompt(
         common_lines.extend([
             "\nInterrupted-attempt recovery:\n",
             "- A prior invocation for this exact sprint already left intended uncommitted changes in `frontend/`.\n",
-            "- FIRST inspect `git -C frontend diff --stat` and the targeted diff. Do not reread whole source files, restart the design, or reopen earlier accepted sprint scope.\n",
+            "- FIRST inspect `git -C frontend status --short`. New Generate files are untracked, so `git -C frontend diff --stat` alone can falsely report no changes. Then inspect only the targeted tracked diff or the exact untracked files named by status. Do not reread whole source files, restart the design, or reopen earlier accepted sprint scope.\n",
             "- Verify the targeted diff against `.harness/ui_verification_plan.json`. If a required selector or behavior is missing, finish only that missing work with a focused patch before validation; do not restart the design or read unrelated source.\n",
             "- Once the action contract is complete, keep only changes needed for this sprint; validate them, update the required harness artifacts, and make the required atomic commit.\n",
         ])
@@ -641,15 +1018,18 @@ def _build_generator_prompt(
     if minimal_path_owned:
         common_lines.extend([
             "\nHarness-owned minimal-path channel:\n",
+            "- This round extends an accepted product checkpoint and is a natural incremental Edit "
+            "inside the parent Generate trajectory, even when the low-level generator mode is `generate`.\n",
             f"- FIRST read `{minimal_path_ref}`. The harness already materialized "
             f"`.harness/edit_scope_round_{round_num}.json` and a live minimal-path state; do not "
             "create, copy, or edit those harness-owned artifacts.\n",
             "- Inspect only `source_change_cone.initial_paths` first. The tool layer requires a "
             "successful read of that exact file before it accepts an exact patch.\n",
             "- Treat `route_scope.target_routes` as the only page owners in scope. "
-            "`cross_route_shared_paths` are closed because they also affect non-target pages; "
-            "`off_target_paths` are closed outright. A shared file opens only when every owning "
-            "route is targeted by this sprint.\n",
+            "`off_target_paths` are closed outright. A cross-route shared file is closed unless "
+            "`source_change_cone.guarded_shared_regions` names an exact target-route object, "
+            "class, or function; any admitted patch must stay wholly inside it. A shared file "
+            "also opens normally when every owning route is targeted by this sprint.\n",
             "- After every successful source mutation, run the smallest applicable syntax, diff, "
             "build, or test validation. Only then can a path connected by a recorded dependency "
             "edge be unlocked; protected and unplanned new source paths remain rejected.\n",
@@ -658,6 +1038,12 @@ def _build_generator_prompt(
             "- Existing source overwrites are rejected. Use exact, unique patches within the plan's "
             "line and touched-file budgets. Reads, applied mutations, validation transitions, denials, "
             "and dependency widening are recorded in the minimal-path ledger.\n",
+            "- If `source_change_cone.route_isolation_strategy.status` is `recommended`, follow it "
+            "as the preferred path: patch only its `entry_path` to load the "
+            "`planned_companion_path` and, when present, `planned_style_path`; run a focused "
+            "validation to unlock those dependencies, then create the small route-local files. "
+            "Reuse the accepted page's persistence "
+            "protocol, but do not wrap or rewrite an accepted page script to make the new route run.\n",
             "- This is an execution policy enforced by the harness. The later counterfactual "
             "certificate remains an independent final check.\n",
         ])
@@ -761,6 +1147,11 @@ def _build_generator_prompt(
                 else []
             ),
             ".harness/ui_verification_plan.json",
+            *(
+                [f".harness/repair_packet_round_{feedback_round}.json"]
+                if (file_comm.dir / f"repair_packet_round_{feedback_round}.json").is_file()
+                else []
+            ),
             # Design-stage files are not duplicated in the repair prompt and
             # must remain available when a visual/regression repair depends on
             # their placement or responsive contract.
@@ -828,6 +1219,9 @@ def _build_generator_prompt(
             f"{target_guidance}\n"
             "## Previous evaluation findings\n\n"
             f"{failures_text}\n\n"
+            f"The harness-owned `.harness/repair_packet_round_{feedback_round}.json` is the "
+            "bounded failure handoff when present. Use its failed checks, allowed source paths, "
+            "and dynamic budgets; do not reopen unrelated project exploration.\n\n"
             "## Your task\n"
             "Address every failure above. Do not stop until each one is fixed. "
             "There is no self-report file; the next evaluation round verifies your work.\n"
@@ -878,6 +1272,8 @@ def _build_generator_prompt(
         "Use paths relative to the workdir when calling tools; do not use absolute paths.\n"
         "For Bash, command chains and pipelines are allowed when each segment stays inside the workdir.\n"
         "For every planner-authored UI action, implement the exact stable selector specified in `.harness/ui_verification_plan.json`; these selectors are part of the acceptance contract, not optional test metadata.\n"
+        "For every check with a non-empty `fixtures` list, materialize those exact literals in the owning route's initial content before implementing the action flow; fixtures are executable data dependencies, not suggestions.\n"
+        "Keep the frontend portable and offline: do not load remote fonts, scripts, stylesheets, media, iframes, or API/WebSocket/EventSource URLs. Ordinary external anchor links are allowed; runtime dependencies must be local.\n"
         "Do not use background execution, redirection, or command substitution such as `&`, `>`, `<`, `$(`, or backticks.\n"
         "For package-manager and build commands, target `frontend/` explicitly with "
         "`npm --prefix frontend ...` or `cd frontend && ...`; never run `npm run build` from the workdir root.\n"
@@ -973,16 +1369,26 @@ async def run_generator(
             frontend_dir, file_comm, workdir, round_num, mode,
         )
         if checkpoint is not None:
+            recovered_usage = _trace_usage_totals(
+                RoundArtifacts(file_comm, round_num).trace_path("generator")
+            )
             logger.info(
                 "[bold green]Generator[/] checkpointed trace-proven interrupted model work at %s; no new model call made.",
                 checkpoint[:12],
             )
             return AgentRunStats(
-                cost_usd=0.0,
+                cost_usd=float(recovered_usage["estimated_cost_usd"]),
                 duration_ms=0,
                 duration_api_ms=0,
-                token_usage={},
-                usage={"recovery": "harness_checkpoint", "precheckpoint_model_cost": "unknown"},
+                token_usage={
+                    "input_tokens": int(recovered_usage["input_tokens"]),
+                    "output_tokens": int(recovered_usage["output_tokens"]),
+                },
+                usage={
+                    "recovery": "harness_checkpoint",
+                    "precheckpoint_model_cost": "recovered_from_append_only_trace",
+                    **recovered_usage,
+                },
                 model_usage={},
             )
 
@@ -1018,6 +1424,14 @@ async def run_generator(
         resume_uncommitted_work=resume_uncommitted_work,
         recovered_commit=recovered_commit,
     )
+    input_context = task_input_prompt_context(workdir)
+    if input_context:
+        user_msg += (
+            "\n\n" + input_context +
+            "\nUse attached reference images as user requirements for the target surface only. "
+            "Do not restyle protected routes or unrelated components to make the whole project "
+            "match a reference intended for one page.\n"
+        )
     target_profile = file_comm.read_target_profile()
     prior_grades = file_comm.read_grades(round_num - 1) if mode == "repair" else None
     scope_contract_only = isinstance(prior_grades, dict) and _is_scope_contract_only_repair(prior_grades)
@@ -1038,9 +1452,11 @@ async def run_generator(
         stop_hooks=[_make_generator_stop_hook(
             frontend_dir, baseline_commit, mode, workdir, round_num, target_profile,
             scope_contract_only=scope_contract_only,
+            mutation_policy=mutation_policy,
         )],
         trace_path=RoundArtifacts(file_comm, round_num).trace_path("generator"),
         mutation_policy=mutation_policy,
+        image_paths=task_input_image_paths(workdir),
     )
 
     _validate_generator_outputs(file_comm, workdir, (result.result or "").strip())

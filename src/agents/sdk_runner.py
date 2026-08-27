@@ -25,6 +25,7 @@ from claude_agent_sdk.types import (
 )
 from src.config import HarnessConfig
 from src.orchestration.pricing import estimate_cost_usd
+from src.orchestration.task_inputs import anthropic_user_content
 from src.utils.bash_policy import (
     validate_bash_command,
     validate_bash_command_readonly,
@@ -328,13 +329,16 @@ def build_agent_run_stats(
     )
 
 
-async def _single_prompt_stream(prompt: str):
+async def _single_prompt_stream(prompt: str, image_paths: list[Path] | None = None):
+    content: str | list[dict[str, Any]] = prompt
+    if image_paths:
+        content = anthropic_user_content(prompt, image_paths)
     yield {
         "type": "user",
         "session_id": "",
         "message": {
             "role": "user",
-            "content": prompt,
+            "content": content,
         },
         "parent_tool_use_id": None,
     }
@@ -636,6 +640,7 @@ async def run_sdk_agent(
     stop_hooks: list[HookCallback] | None = None,
     trace_path: Path | None = None,
     mutation_policy: Any | None = None,
+    image_paths: list[Path] | None = None,
 ) -> tuple[ResultMessage, float, str, list[Any]]:
     """运行单个 SDK agent，并统一收集文本、权限拒绝与成本信息。"""
     runtime = config.agent_runtime.strip().lower()
@@ -661,6 +666,7 @@ async def run_sdk_agent(
             stop_hooks=stop_hooks,
             trace_path=trace_path,
             mutation_policy=mutation_policy,
+            image_paths=image_paths,
         )
     trace_writer = SdkTraceWriter(trace_path) if trace_path else None
     http_trace_path = trace_path.with_suffix(".http.jsonl") if trace_path else None
@@ -695,6 +701,7 @@ async def run_sdk_agent(
                     "allow_playwright": allow_playwright,
                     "allowed_tools": options.allowed_tools,
                     "prompt": prompt,
+                    "image_paths": [str(path) for path in (image_paths or [])],
                     "upstream_base_url": upstream_base_url,
                     "http_trace_path": str(http_trace_path) if http_trace_path else None,
                     "proxy_base_url": anthropic_base_url_override,
@@ -709,7 +716,9 @@ async def run_sdk_agent(
         # 版本检查分支泄漏 CancelledError，导致 generator/build 被误判失败。
         # 版本要求已由依赖与本地 CLI 管理，这里跳过该额外检查，避免连接前中断。
         with _temporary_env_var(_CLAUDE_SDK_SKIP_VERSION_CHECK, "1"):
-            stream = query(prompt=_single_prompt_stream(prompt), options=options)
+            stream = query(
+                prompt=_single_prompt_stream(prompt, image_paths), options=options
+            )
             try:
                 async for message in stream:
                     if trace_writer:

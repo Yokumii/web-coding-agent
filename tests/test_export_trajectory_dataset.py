@@ -5,9 +5,14 @@ import subprocess
 from pathlib import Path
 
 from scripts.export_trajectory_dataset import (
+    _accepted_tape_replay_passed,
     _minimal_path_provenance,
+    _resolved_round_commits,
+    _strict_mutation_evidence_passed,
+    append_jsonl_records,
     apply_patches,
     export_run,
+    to_v2_records,
 )
 
 
@@ -23,6 +28,168 @@ def _commit(frontend: Path, subject: str, content: str) -> None:
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload))
+
+
+def _write_strict_acceptance(
+    harness: Path,
+    accepted: list[tuple[int, int]],
+    *,
+    mutation_kinds: dict[int, str] | None = None,
+    write_certificates: bool = True,
+) -> None:
+    tape_lines = []
+    for round_num, sprint_num in accepted:
+        check = {
+            "id": f"UI-{round_num:03d}",
+            "route": "/",
+            "actions": [
+                {"action": "assert_visible", "selector": "main"},
+                {"action": "assert_count", "selector": "main", "count": 1},
+            ],
+        }
+        _write_json(
+            harness / f"browser_evidence_round_{round_num}.json",
+            {"checks": [{"check_id": check["id"], "status": "ok"}]},
+        )
+        tape_lines.append(
+            json.dumps(
+                {
+                    "schema_version": "accepted-tape-v1",
+                    "status": "ok",
+                    "sprint": sprint_num,
+                    "round": round_num,
+                    "checks": [check],
+                    "evidence_ref": f".harness/browser_evidence_round_{round_num}.json",
+                }
+            )
+        )
+    (harness / "accepted_tapes.jsonl").write_text("\n".join(tape_lines) + "\n")
+
+    accepted_checks = [json.loads(line) for line in tape_lines]
+    for round_num, sprint_num in accepted:
+        prior = [
+            check
+            for record in accepted_checks
+            if int(record["sprint"]) < sprint_num
+            for check in record["checks"]
+        ]
+        if prior:
+            _write_json(
+                harness / f"accepted_tape_replay_round_{round_num}.json",
+                {
+                    "checks": [
+                        {"check_id": check["id"], "status": "ok"}
+                        for check in prior
+                    ]
+                },
+            )
+
+    if not mutation_kinds:
+        return
+    _write_json(harness / "minimality_policy.json", {"enabled": True})
+    for round_num, kind in mutation_kinds.items():
+        sprint_num = next(sprint for current_round, sprint in accepted if current_round == round_num)
+        baseline_name = f"edit_dom_source_sprint_{sprint_num}.json"
+        _write_json(
+            harness / baseline_name,
+            {"version": 4, "stable": True, "roots": [], "fragments": []},
+        )
+        _write_json(
+            harness / f"minimal_path_plan_round_{round_num}.json",
+            {
+                "schema_version": "minimal-path-plan-v3",
+                "owner": "harness",
+                "status": "ready",
+                "source_change_cone": {},
+                "dom_change_cone": {},
+                "route_scope": {},
+            },
+        )
+        _write_json(
+            harness / f"edit_scope_round_{round_num}.json",
+            {
+                "schema_version": "edit-scope-v4",
+                "owner": "harness",
+                "baseline": f".harness/{baseline_name}",
+                "allowed_fragment_keys": [],
+                "expected_new_fragments": [],
+            },
+        )
+        (harness / f"minimal_path_ledger_round_{round_num}.jsonl").write_text(
+            '{"decision":"applied","path":"frontend/index.html"}\n'
+            '{"decision":"validation_pass"}\n'
+        )
+        if write_certificates:
+            _write_json(
+                harness / f"minimality_round_{round_num}_{kind}.json",
+                {"status": "certified"},
+            )
+
+
+def _write_runtime_failure(harness: Path, round_num: int) -> None:
+    _write_json(
+        harness / f"browser_evidence_round_{round_num}.json",
+        {"checks": [{"check_id": f"UI-{round_num:03d}", "status": "action_failed"}]},
+    )
+
+
+def test_round_commit_resolution_prefers_build_provenance_over_commit_position(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    harness = tmp_path / ".harness"
+    frontend.mkdir()
+    harness.mkdir()
+    _git(frontend, "init", "-b", "main")
+    _git(frontend, "config", "user.name", "test")
+    _git(frontend, "config", "user.email", "test@example.com")
+    _commit(frontend, "feat: sprint one", "<main>first</main>")
+    _commit(frontend, "fix: sprint one config", "<main>accepted first</main>")
+    sprint_one = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=frontend,
+        text=True,
+        check=True,
+        capture_output=True,
+    ).stdout.strip()
+    _commit(frontend, "feat: sprint two", "<main>accepted second</main>")
+    sprint_two = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=frontend,
+        text=True,
+        check=True,
+        capture_output=True,
+    ).stdout.strip()
+    _write_json(
+        harness / "round_build_map.json",
+        {
+            "2": {
+                "round": 2,
+                "source_commit": sprint_one,
+                "destination_commit": sprint_two,
+            }
+        },
+    )
+
+    resolved = _resolved_round_commits(
+        harness=harness, frontend=frontend, grade_rounds={1, 2}
+    )
+
+    assert resolved == {1: sprint_one, 2: sprint_two}
+
+
+def test_later_checkpoint_requires_prior_accepted_tape_replay(tmp_path: Path):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    _write_strict_acceptance(harness, [(1, 1), (2, 2)])
+
+    assert _accepted_tape_replay_passed(
+        harness, round_num=2, sprint_num=2
+    ) is True
+    (harness / "accepted_tape_replay_round_2.json").unlink()
+    assert _accepted_tape_replay_passed(
+        harness, round_num=2, sprint_num=2
+    ) is False
 
 
 def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
@@ -112,6 +279,71 @@ def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
     assert provenance["cross_route_shared_paths"] == ["frontend/src/Shell.jsx"]
 
 
+def test_evidence_only_checkpoint_reuses_last_matching_mutation_ledger(tmp_path: Path):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    _write_json(harness / "minimality_policy.json", {"enabled": True})
+    _write_json(
+        harness / "minimality_round_9_edit.json",
+        {"status": "certified"},
+    )
+    for round_num in (6, 9):
+        baseline_name = f"repair_dom_source_round_{round_num}.json"
+        _write_json(
+            harness / baseline_name,
+            {"version": 4, "stable": True, "roots": [], "fragments": []},
+        )
+        _write_json(
+            harness / f"minimal_path_plan_round_{round_num}.json",
+            {
+                "schema_version": "minimal-path-plan-v3",
+                "owner": "harness",
+                "status": "ready",
+                "source_change_cone": {"initial_paths": ["frontend/library.js"]},
+                "dom_change_cone": {},
+                "route_scope": {},
+            },
+        )
+        _write_json(
+            harness / f"edit_scope_round_{round_num}.json",
+            {
+                "schema_version": "edit-scope-v4",
+                "owner": "harness",
+                "baseline": f".harness/{baseline_name}",
+                "allowed_fragment_keys": [],
+                "expected_new_fragments": [],
+            },
+        )
+    (harness / "minimal_path_ledger_round_6.jsonl").write_text(
+        '{"decision":"applied","path":"frontend/library.js"}\n'
+        '{"decision":"validation_pass"}\n'
+    )
+    _write_json(
+        harness / "round_build_map.json",
+        {
+            "6": {
+                "round": 6,
+                "sprint": 2,
+                "source_commit": "broken",
+                "destination_commit": "accepted",
+            },
+            "9": {
+                "round": 9,
+                "sprint": 2,
+                "source_commit": "accepted",
+                "destination_commit": "accepted",
+            },
+        },
+    )
+
+    assert _strict_mutation_evidence_passed(harness, 9, "edit") is True
+    provenance = _minimal_path_provenance(harness, 9)
+    assert provenance["mutation_round"] == 6
+    assert provenance["evidence_round"] == 9
+    assert provenance["plan_artifact"] == ".harness/minimal_path_plan_round_6.json"
+    assert provenance["touched_paths"] == ["frontend/library.js"]
+
+
 def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path):
     run_dir = tmp_path / "natural_case"
     frontend = run_dir / "frontend"
@@ -156,12 +388,26 @@ def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path)
             "round": round_num,
             "screenshots": [f".harness/{screenshot.name}"],
         })
+    _write_strict_acceptance(
+        harness,
+        [(2, 1), (3, 2)],
+        mutation_kinds={2: "repair", 3: "edit"},
+    )
+    _write_runtime_failure(harness, 1)
 
     records = export_run(run_dir)
 
     assert [record["task"] for record in records] == [
-        "text-generation", "text-generation", "text-editing", "text-repair"
+        "text-editing", "text-repair", "text-generation", "text-generation", "text-generation"
     ]
+    generation = next(
+        record for record in records
+        if record["quality"].get("trajectory_role") == "complete_generate"
+    )
+    assert generation["instance_id"] == "natural_case__complete_generate"
+    assert generation["reference"]["dst_code"][0]["code"] == "<main>checkpoint two</main>"
+    assert generation["quality"]["trajectory_role"] == "complete_generate"
+    assert generation["quality"]["accepted_sprints"] == [1, 2]
     edit = next(record for record in records if record["task"] == "text-editing")
     assert edit["instruction"]["src_code"][0]["code"] == "<main>checkpoint one</main>"
     assert edit["reference"]["dst_code"][0]["code"] == "<main>checkpoint two</main>"
@@ -172,6 +418,37 @@ def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path)
     assert repair["instruction"]["src_code"][0]["code"] == "<main>broken</main>"
     assert len(repair["images"]["src_screenshot"]) == 1
     assert repair["quality"]["same_sprint_recovery"] is True
+
+
+def test_export_run_does_not_publish_partial_generate_mainline(tmp_path: Path):
+    run_dir = tmp_path / "partial_generate"
+    frontend = run_dir / "frontend"
+    harness = run_dir / ".harness"
+    frontend.mkdir(parents=True)
+    harness.mkdir()
+    _git(frontend, "init", "-b", "main")
+    _git(frontend, "config", "user.name", "test")
+    _git(frontend, "config", "user.email", "test@example.com")
+    _commit(frontend, "feat: sprint one", "<main>only checkpoint one</main>")
+    _write_json(harness / "sprint_plan.json", {"total_sprints": 2, "sprints": [
+        {"number": 1, "title": "Foundation", "goal": "Build foundation", "deliverables": []},
+        {"number": 2, "title": "Search", "goal": "Add search", "deliverables": []},
+    ]})
+    _write_json(harness / "feature_list.json", {"features": [
+        {"id": "F1", "name": "Home", "sprint": 1},
+        {"id": "F2", "name": "Search", "sprint": 2},
+    ]})
+    _write_json(harness / "grade_round_1.json", {
+        "round": 1, "sprint": 1, "overall_passed": True,
+        "mode_recommendation": "generate_next_sprint",
+    })
+    _write_strict_acceptance(harness, [(1, 1)], mutation_kinds={1: "edit"})
+
+    records = export_run(run_dir)
+    assert [record["quality"]["trajectory_role"] for record in records] == [
+        "checkpoint_generate"
+    ]
+    assert records[0]["quality"]["checkpoint_index"] == 1
 
 
 def test_export_run_treats_accepted_seed_baseline_as_first_forward_edit(tmp_path: Path):
@@ -196,11 +473,50 @@ def test_export_run_treats_accepted_seed_baseline_as_first_forward_edit(tmp_path
             "critical": True, "status": "pass", "notes": "Clicked the reading-aid control and observed its panel."
         }],
     })
+    _write_strict_acceptance(harness, [(1, 1)], mutation_kinds={1: "edit"})
 
     records = export_run(run_dir)
 
     assert [record["task"] for record in records] == ["text-editing"]
     assert records[0]["trajectory"]["source_commit"] == baseline
+
+
+def test_user_image_input_flows_into_image_edit_v2(tmp_path: Path):
+    from src.orchestration.task_inputs import stage_task_inputs
+
+    run_dir = tmp_path / "image_forward_case"
+    frontend = run_dir / "frontend"
+    harness = run_dir / ".harness"
+    frontend.mkdir(parents=True); harness.mkdir()
+    _git(frontend, "init", "-b", "main")
+    _git(frontend, "config", "user.name", "test"); _git(frontend, "config", "user.email", "test@example.com")
+    _commit(frontend, "chore: accepted forward-edit baseline", "<main>before</main>")
+    baseline = subprocess.run(["git", "rev-parse", "HEAD"], cwd=frontend, text=True, check=True, capture_output=True).stdout.strip()
+    _commit(frontend, "feat: match reference", "<main>after</main>")
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(b"\x89PNG\r\n\x1a\nreference")
+    stage_task_inputs(run_dir, [reference])
+    _write_json(run_dir / "seed_manifest.json", {"baseline_commit": baseline})
+    _write_json(harness / "sprint_plan.json", {"sprints": [{"number": 1, "title": "Reference", "goal": "Match reference", "deliverables": []}]})
+    _write_json(harness / "feature_list.json", {"features": [{"id": "F1", "name": "Reference layout", "description": "Match the supplied image.", "sprint": 1}]})
+    _write_json(harness / "grade_round_1.json", {
+        "round": 1, "sprint": 1, "overall_passed": True,
+        "target_exit_criteria_results": [{"critical": True, "passed": True, "notes": "Observed reference layout."}],
+        "ui_checks": [{"critical": True, "status": "pass", "notes": "Observed reference layout."}],
+    })
+    _write_strict_acceptance(
+        harness,
+        [(1, 1)],
+        mutation_kinds={1: "edit"},
+    )
+
+    records = export_run(run_dir)
+    converted = to_v2_records(records)
+
+    assert len(converted["image-edit.v2"]) == 1
+    staged = converted["image-edit.v2"][0]["input_images"]
+    assert len(staged) == 1
+    assert Path(staged[0]).is_file()
 
 
 def test_new_policy_excludes_forward_edit_without_certified_minimality(tmp_path: Path):
@@ -222,6 +538,12 @@ def test_new_policy_excludes_forward_edit_without_certified_minimality(tmp_path:
         "ui_checks": [{"critical": True, "status": "pass", "notes": "Observed aid."}],
         "target_exit_criteria_results": [{"critical": True, "passed": True, "notes": "Observed aid."}],
     })
+    _write_strict_acceptance(
+        harness,
+        [(1, 1)],
+        mutation_kinds={1: "edit"},
+        write_certificates=False,
+    )
 
     assert export_run(run_dir) == []
 
@@ -257,6 +579,11 @@ def test_export_run_aggregates_consecutive_forward_sprints(tmp_path: Path):
             "target_exit_criteria_results": [{"critical": True, "passed": True, "notes": "Observed control behavior."}],
             "ui_checks": [{"critical": True, "status": "pass", "notes": "Observed control behavior."}],
         })
+    _write_strict_acceptance(
+        harness,
+        [(1, 1), (2, 2)],
+        mutation_kinds={1: "edit", 2: "edit"},
+    )
 
     records = export_run(run_dir)
 
@@ -334,6 +661,70 @@ def test_make_patches_uses_local_context_instead_of_whole_file():
     assert apply_patches(src, patches) == dst
 
 
+def test_make_patches_uses_explicit_create_file_operation():
+    from scripts.export_trajectory_dataset import (
+        _quality_tier,
+        apply_patches,
+        make_patches,
+        to_v2_records,
+    )
+
+    src = [{"path": "app.js", "code": "keep\n"}]
+    dst = [
+        {"path": "app.js", "code": "keep\n"},
+        {"path": "catalog.js", "code": "export const catalog = [];\n"},
+    ]
+
+    patches = make_patches(src, dst, "Catalog")
+
+    assert patches == [
+        {
+            "path": "catalog.js",
+            "operation": "create_file",
+            "content": "export const catalog = [];\n",
+            "task_type": "Catalog",
+        }
+    ]
+    assert apply_patches(src, patches) == dst
+    tier, reasons = _quality_tier("text-editing", patches, ["Catalog"])
+    assert tier == "natural_trajectory"
+    assert reasons == ["explicit_file_creation_requires_native_schema"]
+    record = {
+        "instance_id": "native__new_file",
+        "task": "text-editing",
+        "task_type": ["Catalog"],
+        "description": "Add a catalog module.",
+        "instruction": {"src_code": src},
+        "label_modified_files": patches,
+        "images": {"src_screenshot": [], "dst_screenshot": []},
+        "trajectory": {"source_commit": "abc", "destination_commit": "def"},
+        "quality": {},
+    }
+    assert to_v2_records([record])["text-edit.v2"] == []
+
+
+def test_export_output_is_append_only_and_resume_idempotent(tmp_path: Path):
+    path = tmp_path / "records.jsonl"
+    first = {"instance_id": "a", "status": "ok"}
+    second = {"instance_id": "b", "status": "ok"}
+
+    assert append_jsonl_records(path, [first]) == 1
+    assert append_jsonl_records(path, [first, second]) == 1
+
+    assert [json.loads(line)["instance_id"] for line in path.read_text().splitlines()] == [
+        "a",
+        "b",
+    ]
+
+
+def test_export_output_deduplicates_same_batch(tmp_path: Path):
+    path = tmp_path / "records.jsonl"
+    duplicate = {"instance_id": "same", "status": "ok"}
+
+    assert append_jsonl_records(path, [duplicate, duplicate]) == 1
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_export_run_excludes_unverified_evaluator_failure(tmp_path: Path):
     run_dir = tmp_path / "uncertain_case"
     frontend = run_dir / "frontend"
@@ -358,10 +749,13 @@ def test_export_run_excludes_unverified_evaluator_failure(tmp_path: Path):
     _write_json(harness / "grade_round_2.json", {
         "round": 2, "sprint": 1, "overall_passed": True,
     })
+    _write_strict_acceptance(harness, [(2, 1)])
 
     records = export_run(run_dir)
 
-    assert [record["task"] for record in records] == ["text-generation"]
+    assert [record["quality"]["trajectory_role"] for record in records] == [
+        "checkpoint_generate", "complete_generate"
+    ]
 
 
 def test_visual_failure_with_concrete_review_is_real_evidence():
@@ -406,10 +800,13 @@ def test_export_run_excludes_infrastructure_failure(tmp_path: Path):
     _write_json(harness / "grade_round_2.json", {
         "round": 2, "sprint": 1, "overall_passed": True,
     })
+    _write_strict_acceptance(harness, [(2, 1)])
 
     records = export_run(run_dir)
 
-    assert [record["task"] for record in records] == ["text-generation"]
+    assert [record["quality"]["trajectory_role"] for record in records] == [
+        "checkpoint_generate", "complete_generate"
+    ]
 
 
 def test_v2_repair_contract_hides_diagnosis_and_requires_paired_images():
