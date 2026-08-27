@@ -348,6 +348,7 @@ def _check_action_contracts(verification_plan: dict[str, Any]) -> None:
                     "fill",
                     "key_press",
                     "select_option",
+                    "set_storage_value",
                     "set_input_files",
                 }:
                     state_producing = True

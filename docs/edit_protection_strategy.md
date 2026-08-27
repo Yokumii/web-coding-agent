@@ -45,8 +45,10 @@ contract and semantic anchors into a source change cone. Exact selector/token
 matches define local source hotspots, while typed action/category fields route
 interaction checks toward behavior source and visual checks toward style source.
 Static import, stylesheet, and script-link relationships are traversable in both
-directions, but only one ranked initial path is open at first. The same progressive
-controller runs in the native OpenAI executor and Claude SDK pre/post-tool hooks:
+directions. A single-route Edit starts from one ranked path; a coherent multi-route Edit
+starts from one ranked entry per target route so one page cannot accidentally monopolize
+the mutation budget. The same progressive controller runs in the native OpenAI executor
+and Claude SDK pre/post-tool hooks:
 
 For multi-page/multi-file projects, navigation links do not count as source imports.
 The controller first assigns each route an entry and transitive source ownership, then
@@ -61,6 +63,8 @@ mechanical ownership supports static HTML entries, concrete conventional
 `app/**/page.*` and `pages/**` routes, and explicit literal React Router component
 mappings. Parameterized filesystem routes stay closed until a concrete ownership
 mapping is available; the harness does not baseline a synthetic `:id` URL.
+Literal vanilla `registerRoute('/path', handler)` mappings are also recognized as bounded
+hash-router routes (`/#/path`). Arbitrary computed routes remain closed.
 
 Explicit `--target-route` values are a run-wide authorization ceiling. They do not open
 all listed pages in every Sprint. Each Sprint opens only routes covered by its executable
@@ -82,6 +86,19 @@ explicit ceiling blocks before source mutation.
 - the final committed code diff must be explained by successful mutation entries in the
   ledger; indirect changes to a protected/off-target source or outside a guarded shared
   region fail the stop gate.
+
+For stateful target routes, a named shared Store/State object or class may receive
+`additive_target_members`: additions must use identifiers tied to target routes, selectors,
+or check IDs, while existing identifiers cannot be removed or replaced. This is a lexical,
+fail-closed online guard; target behavior and protected-state preservation still require
+real browser evidence. The default touched-file ceiling is six so a coherent two-route
+Edit can update two page modules, two route-local views, and a guarded shared store without
+forcing unrelated Sprint splitting.
+
+The source plan also records a repository-native design-token inventory: CSS custom
+properties, their definition paths, and use counts. Generator guidance prefers existing
+tokens. A global stylesheet remains protected unless a later selector-aware guard can
+prove that a change is target-scoped.
 
 User reference images and bounded text/source inputs are staged with SHA-256 provenance in
 `task_inputs.json`. Images are native multimodal blocks for planning and implementation,
@@ -120,7 +137,10 @@ full replay. Explicitly replaced or withdrawn requirements remain in lineage but
 gating the current state.
 
 Evidence routing is DOM/ARIA/internal-state first. Typed property, attribute, ARIA,
-focus, storage, console, URL and DOM assertions are deterministic. Screenshot/vision is
+focus, storage, console, URL, bounded hash, computed-style and DOM assertions are
+deterministic. Bounded `set_storage_value` steps establish repeatable local/sessionStorage
+fixtures before reload, so multi-state Edit checks do not depend on whatever seed state
+happened to ship. Screenshot/vision is
 reserved for required visual changes, visual-category conditional checks, or image
 inputs; behavior-only Edit does not pay for pixel review. Reproduced deterministic
 failures bypass the paid semantic evaluator and go directly into the Repair packet.

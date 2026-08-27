@@ -1054,6 +1054,269 @@ def test_shared_file_opens_only_the_named_target_route_region(tmp_path: Path):
     assert "cannot be overwritten" in overwrite_denial
 
 
+def test_vanilla_hash_router_maps_view_to_source_and_protects_siblings(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    (frontend / "src" / "views").mkdir(parents=True)
+    (frontend / "index.html").write_text(
+        '<main id="main-content"></main><script type="module" src="src/app.js"></script>\n'
+    )
+    (frontend / "src" / "app.js").write_text(
+        "import { registerRoute } from './router.js';\n"
+        "import { renderReport } from './views/report.js';\n"
+        "import { renderBoard } from './views/board.js';\n"
+        "registerRoute('/report', renderReport);\n"
+        "registerRoute('/board', renderBoard);\n"
+    )
+    (frontend / "src" / "router.js").write_text("export function registerRoute() {}\n")
+    (frontend / "src" / "views" / "report.js").write_text(
+        "export function renderReport() { return 'report'; }\n"
+    )
+    (frontend / "src" / "views" / "board.js").write_text(
+        "export function renderBoard() { return 'board'; }\n"
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(
+        json.dumps({"requested_target_routes": ["/#/report"]})
+    )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "REPORT-PAGE",
+                                "route": "/#/report",
+                                "category": "interaction",
+                                "actions": [
+                                    {
+                                        "action": "assert_visible",
+                                        "selector": "#report-pagination",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=40,
+        max_touched_files=6,
+    )
+
+    assert plan["route_scope"]["target_routes"] == ["/#/report"]
+    assert plan["route_scope"]["protected_routes"] == ["/#/board"]
+    assert "frontend/src/views/report.js" in plan["route_scope"]["route_local_paths"]
+    assert "frontend/src/views/board.js" in plan["route_scope"]["off_target_paths"]
+
+
+def test_plan_indexes_existing_css_tokens_for_design_system_guidance(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<link rel="stylesheet" href="styles.css"><main id="panel">Panel</main>\n'
+    )
+    (frontend / "styles.css").write_text(
+        ":root { --color-primary: #245; --space-3: 0.75rem; }\n"
+        "#panel { color: var(--color-primary); padding: var(--space-3); }\n"
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "PANEL",
+                                "route": "/",
+                                "category": "visual",
+                                "actions": [
+                                    {"action": "assert_visible", "selector": "#panel"}
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=40,
+        max_touched_files=3,
+    )
+
+    assert plan["design_system_context"]["status"] == "tokens_found"
+    assert plan["design_system_context"]["css_custom_properties"] == [
+        {
+            "name": "--color-primary",
+            "defined_in": ["frontend/styles.css"],
+            "usage_count": 1,
+        },
+        {
+            "name": "--space-3",
+            "defined_in": ["frontend/styles.css"],
+            "usage_count": 1,
+        },
+    ]
+
+
+def test_shared_state_container_allows_only_target_named_additions(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    (frontend / "js").mkdir(parents=True)
+    for page, script in (
+        ("index.html", "dashboard.js"),
+        ("report.html", "report.js"),
+        ("staff.html", "staff.js"),
+    ):
+        (frontend / page).write_text(
+            f'<main id="{Path(page).stem}"></main>'
+            '<script type="module" src="js/store.js"></script>'
+            f'<script type="module" src="js/{script}"></script>\n'
+        )
+        (frontend / "js" / script).write_text(
+            "import {} from './store.js';\n"
+            f"document.querySelector('#{Path(page).stem}');\n"
+        )
+    store_before = (
+        "const INITIAL_STATE = {\n"
+        "  logs: [],\n"
+        "  activeProgramId: null\n"
+        "};\n"
+        "class Store {\n"
+        "  clearLogs() { this.state.logs = []; this.save(); }\n"
+        "  save() {}\n"
+        "}\n"
+    )
+    (frontend / "js" / "store.js").write_text(store_before)
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(
+        json.dumps(
+            {"requested_target_routes": ["/", "/report.html"]}
+        )
+    )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "DASHBOARD-PAGE",
+                                "route": "/",
+                                "category": "state",
+                                "actions": [
+                                    {
+                                        "action": "assert_text",
+                                        "selector": "#dashboardPageInfo",
+                                        "value": "Page 1",
+                                        "match": "contains",
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "REPORT-PAGE",
+                                "route": "/report.html",
+                                "category": "persistence",
+                                "actions": [
+                                    {
+                                        "action": "assert_text",
+                                        "selector": "#reportPageInfo",
+                                        "value": "Page 1",
+                                        "match": "contains",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=60,
+        max_touched_files=6,
+    )
+    contracts = plan["source_change_cone"]["guarded_shared_regions"]
+    assert {
+        item["symbol"] for item in contracts if item.get("mutation_mode") == "additive_target_members"
+    } == {"INITIAL_STATE", "Store"}
+    assert plan["source_change_cone"]["initial_paths"] == [
+        "frontend/index.html",
+        "frontend/report.html",
+    ]
+    assert "frontend/js/store.js" in plan["source_change_cone"]["local_paths"]
+
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    target_additions = store_before.replace(
+        "  activeProgramId: null\n",
+        "  activeProgramId: null,\n"
+        "  dashboardPage: 1,\n"
+        "  reportPage: 1,\n"
+        "  pageSize: 4\n",
+    ).replace(
+        "  save() {}\n",
+        "  setDashboardPage(page) { this.state.dashboardPage = page; this.save(); }\n"
+        "  setReportPage(page) { this.state.reportPage = page; this.save(); }\n"
+        "  save() {}\n",
+    )
+    assert (
+        policy.validate_guarded_shared_file(
+            "frontend/js/store.js", before=store_before, after=target_additions
+        )
+        is None
+    )
+    unrelated = target_additions.replace(
+        "  pageSize: 4\n", "  pageSize: 4,\n  adminMode: true\n"
+    )
+    assert "target-named" in str(
+        policy.validate_guarded_shared_file(
+            "frontend/js/store.js", before=store_before, after=unrelated
+        )
+    )
+    unrelated_route = target_additions.replace(
+        "  pageSize: 4\n", "  pageSize: 4,\n  staffPage: 1\n"
+    )
+    assert "target-named" in str(
+        policy.validate_guarded_shared_file(
+            "frontend/js/store.js", before=store_before, after=unrelated_route
+        )
+    )
+    destructive = target_additions.replace("logs: []", "logs: ['rewritten']")
+    destructive_error = str(
+        policy.validate_guarded_shared_file(
+            "frontend/js/store.js", before=store_before, after=destructive
+        )
+    )
+    assert "target-named" in destructive_error or "existing identifiers" in destructive_error
+
+
 def test_react_router_edit_protects_component_shared_with_other_route(tmp_path: Path):
     frontend = tmp_path / "frontend"
     (frontend / "src" / "pages").mkdir(parents=True)

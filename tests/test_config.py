@@ -86,3 +86,9 @@ def test_edit_round_budget_defaults_to_ten(monkeypatch):
     monkeypatch.delenv("EDIT_MAX_ROUNDS", raising=False)
 
     assert HarnessConfig().edit_max_rounds == 10
+
+
+def test_multi_page_edit_file_budget_defaults_to_six(monkeypatch):
+    monkeypatch.delenv("MINIMAL_PATH_MAX_TOUCHED_FILES", raising=False)
+
+    assert HarnessConfig().minimal_path_max_touched_files == 6

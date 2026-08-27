@@ -26,9 +26,13 @@ def test_action_settle_ms_is_explicit_and_bounded():
     assert _action_settle_ms({"action": "evaluate", "settle_ms": 250}, "evaluate") == 0
 
 
-def test_same_origin_route_url_rejects_hash_router_path_until_it_can_be_owned():
-    with pytest.raises(ValueError, match="unsafe browser route"):
+def test_same_origin_route_url_accepts_only_bounded_hash_router_paths():
+    assert (
         _same_origin_route_url("http://127.0.0.1:3000/preview", "/#/catalog")
+        == "http://127.0.0.1:3000/#/catalog"
+    )
+    with pytest.raises(ValueError, match="unsafe browser route"):
+        _same_origin_route_url("http://127.0.0.1:3000/preview", "/#https://evil.test")
 
 
 @pytest.mark.anyio
@@ -295,6 +299,78 @@ async def test_browser_evidence_executes_typed_dom_aria_and_console_assertions(
     assert result["checks"][-1]["evidence_route"] == [
         "real_browser", "ax_semantics", "internal_state", "dom"
     ]
+
+
+@pytest.mark.anyio
+async def test_browser_evidence_executes_hash_storage_fixture_and_computed_style(
+    tmp_path: Path,
+):
+    async def page(_request):
+        return web.Response(
+            text="""
+            <style>#panel { display: none; }</style>
+            <a id="report-link" href="#/report">Report</a>
+            <section id="panel">Report panel</section>
+            <output id="stored"></output>
+            <script>
+              function render() {
+                if (location.hash === '#/report') panel.style.display = 'block';
+                stored.textContent = localStorage.getItem('fixture') || '';
+              }
+              addEventListener('hashchange', render);
+              render();
+            </script>
+            """,
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/", page)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        result = await collect_browser_evidence(
+            app_url=f"http://127.0.0.1:{port}",
+            checks=[
+                {
+                    "id": "HASH-STATE",
+                    "route": "/#/report",
+                    "actions": [
+                        {
+                            "action": "set_storage_value",
+                            "storage": "local",
+                            "key": "fixture",
+                            "value": {"page": 2},
+                            "encoding": "json",
+                        },
+                        {"action": "reload"},
+                        {"action": "assert_hash", "value": "#/report"},
+                        {
+                            "action": "assert_computed_style",
+                            "selector": "#panel",
+                            "property": "display",
+                            "value": "block",
+                        },
+                        {
+                            "action": "assert_text",
+                            "selector": "#stored",
+                            "value": '"page":2',
+                            "match": "contains",
+                        },
+                    ],
+                }
+            ],
+            output_path=tmp_path / "hash-state-style.json",
+            headless=True,
+        )
+    finally:
+        await runner.cleanup()
+
+    assert [item["status"] for item in result["checks"]] == ["ok"]
+    assert "rendered_style" in result["checks"][0]["evidence_route"]
 
 
 @pytest.mark.anyio

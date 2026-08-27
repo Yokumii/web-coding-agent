@@ -1025,6 +1025,9 @@ def _build_generator_prompt(
             "create, copy, or edit those harness-owned artifacts.\n",
             "- Inspect only `source_change_cone.initial_paths` first. The tool layer requires a "
             "successful read of that exact file before it accepts an exact patch.\n",
+            "- Read `design_system_context` in the same plan. Reuse its existing CSS custom "
+            "properties for target-local styling before introducing literal visual values or "
+            "new tokens. This is guidance; browser evidence still decides behavior and state.\n",
             "- Treat `route_scope.target_routes` as the only page owners in scope. "
             "`off_target_paths` are closed outright. A cross-route shared file is closed unless "
             "`source_change_cone.guarded_shared_regions` names an exact target-route object, "

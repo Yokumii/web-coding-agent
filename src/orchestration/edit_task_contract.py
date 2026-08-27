@@ -21,15 +21,25 @@ def normalize_target_routes(routes: Iterable[str]) -> list[str]:
         route = str(raw).strip()
         parsed = urlsplit(route)
         segments = parsed.path.replace("\\", "/").split("/")
+        fragment_segments = parsed.fragment.split("/")
+        fragment_ok = not parsed.fragment or (
+            parsed.fragment.startswith("/")
+            and "\\" not in parsed.fragment
+            and "://" not in parsed.fragment
+            and "?" not in parsed.fragment
+            and all(segment not in {".", ".."} for segment in fragment_segments)
+        )
         if (
             not route.startswith("/") or route.startswith("//") or "\\" in route
-            or parsed.scheme or parsed.netloc or parsed.query or parsed.fragment
+            or parsed.scheme or parsed.netloc or parsed.query or not fragment_ok
             or any(segment in {".", ".."} for segment in segments)
         ):
             raise EditTaskContractError(
-                f"target route must be one same-origin pathname without query/fragment: {route!r}"
+                f"target route must be one same-origin pathname or bounded hash-router path: {route!r}"
             )
-        normalized = "/" if route == "/" else route.rstrip("/")
+        path = "/" if parsed.path == "/" else parsed.path.rstrip("/")
+        fragment = parsed.fragment.rstrip("/")
+        normalized = path + (f"#{fragment}" if fragment else "")
         if normalized not in output:
             output.append(normalized)
     return output

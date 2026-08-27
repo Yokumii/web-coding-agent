@@ -43,7 +43,16 @@ appearance review, but pixels alone never prove preservation or minimality.
 When several pages intentionally share one source file, protect it at two levels:
 keep the file closed by default, and open only a mechanically identified named
 target-route object/class/function. An exact patch must fit entirely inside that
-region; sibling route modules and whole-file replacement remain closed.
+region; sibling route modules and whole-file replacement remain closed. A coherent
+multi-route Edit receives one inspected initial entry per target route. Shared Store/State
+containers may receive only target-named additive members; existing members and
+unrelated identifiers remain protected. Literal hash-router ownership is allowed only
+when its same-origin route and source mapping are statically bounded.
+
+The source plan should inventory existing design tokens and tell the model to reuse them,
+but token discovery never opens a protected global stylesheet. Stateful checks should
+establish bounded storage fixtures, and behavior/appearance checks should prefer typed
+DOM, hash, ARIA, property, storage, and computed-style assertions before screenshots.
 
 Unsupported routes, unstable baselines, missing assertions, unavailable scope
 evidence, and inconclusive minimality are infrastructure/data-quality failures.

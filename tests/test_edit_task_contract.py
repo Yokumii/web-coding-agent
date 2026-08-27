@@ -8,8 +8,15 @@ import pytest
 
 from src.orchestration.edit_task_contract import (
     EditTaskContractError,
+    normalize_target_routes,
     prepare_edit_task_contract,
 )
+
+
+def test_hash_router_target_route_is_normalized_without_opening_external_urls():
+    assert normalize_target_routes(["/#/report", "/#/report/"]) == ["/#/report"]
+    with pytest.raises(EditTaskContractError, match="same-origin"):
+        normalize_target_routes(["https://example.com/#/report"])
 
 
 def test_explicit_edit_mode_freezes_existing_frontend_without_replacing_it(tmp_path: Path):

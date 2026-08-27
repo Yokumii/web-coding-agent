@@ -187,8 +187,9 @@ Each check must include:
 - For an explicit Edit, `requirement_id` and non-empty `impact_tags` linking the
   check to the requirement and affected component/state responsibility.
 - `route`: the exact same-origin browser pathname where this check starts,
-  such as `/`, `/catalog`, or `/settings.html`. Never write a full URL,
-  protocol-relative URL, query string, fragment, or parent-directory segment.
+  such as `/`, `/catalog`, or `/settings.html`. A statically owned hash-router
+  view may use the bounded form `/#/report`. Never write a full URL,
+  protocol-relative URL, query string, arbitrary fragment, or parent-directory segment.
 - `fixtures`: normally omitted or an empty array. For a filter/search over
   pre-existing static content, list every exact title/label literal used by the
   actions. These literals become generator obligations. Never invent a filter
@@ -196,9 +197,10 @@ Each check must include:
   the same check creates through a form submission.
 - `actions`: an ordered, executable browser contract for this check. Each item
   is an object with `action` (`set_viewport`, `click`, `hover`, `drag_and_drop`,
-  `fill`, `select_option`, `set_input_files`, `key_press`, `reload`, `scroll`, `wait_for`,
+  `fill`, `select_option`, `set_storage_value`, `set_input_files`, `key_press`, `reload`, `scroll`, `wait_for`,
   `emulate_media`, `assert_form_valid`, `assert_visible`, `assert_hidden`,
-  `assert_text`, `assert_value`, `assert_count`, `assert_url`, `assert_attribute`,
+  `assert_text`, `assert_value`, `assert_count`, `assert_url`, `assert_hash`,
+  `assert_computed_style`, `assert_attribute`,
   `assert_aria`, `assert_property`, `assert_focus`, `assert_storage_value`, or
   `assert_no_console_errors`) plus only the fields that
   action needs. Use `fill` (not
@@ -224,6 +226,9 @@ Each check must include:
   `files`; each file has only `name`, `mime_type`, and short text `content`.
   Never provide a filesystem path. Use `emulate_media` with `media` (`screen`
   or `print`) and/or `color_scheme` for print and theme contracts.
+  Use `set_storage_value` only to load a bounded fixture already grounded in the
+  accepted Seed/source or task input, then reload before asserting behavior. It accepts
+  `storage`, `key`, `value`, and `encoding` (`json` or `string`) and is not an assertion.
   If the next action depends on debounced, animated, or delayed DOM state created by the
   current action, set `settle_ms` on the state-producing action (normally 100-500ms). For
   example, a `fill` followed by Escape to close an opened autocomplete must wait until the
@@ -265,7 +270,8 @@ Every authored check MUST contain 1 to 4 related typed assertions and MUST end
 with a typed assertion. Model-authored JavaScript (`evaluate`) is forbidden. Use the dedicated
 interaction action first, then finish with the narrowest observable assertion:
 `assert_visible`/`assert_hidden` for presence, `assert_text` with `match` set to
-`exact` or `contains`, `assert_value`, `assert_count`, `assert_url`,
+`exact` or `contains`, `assert_value`, `assert_count`, `assert_url`, `assert_hash`,
+`assert_computed_style`,
 `assert_attribute`, `assert_aria` (only `role`, `accessible_name`, or an
 `aria-*` attribute), `assert_focus`, `assert_storage_value`, or
 `assert_no_console_errors`. A click without a final typed state assertion is
@@ -279,6 +285,12 @@ Typed assertion fields are exact and closed:
 - `assert_value`: `selector`, `value`
 - `assert_count`: `selector`, integer `count`
 - `assert_url`: `value`, optional `match` (`exact` or `contains`)
+- `assert_hash`: bounded `value` such as `#/report`, optional `match`
+  (`exact` or `contains`)
+- `assert_computed_style`: `selector`, `property`, `value`, optional `match`.
+  Use only stable state/layout properties from the closed allowlist, such as
+  `display`, `visibility`, `opacity`, `position`, `overflow-x`, or `pointer-events`;
+  never use it as a color or pixel-perfect design score.
 - `assert_attribute`: `selector`, `name`, `value` (exact comparison only)
 - `assert_property`: `selector`, `name`, `value`; `name` is limited to bounded
   form/dialog state such as `checked`, `disabled`, `selected`, `selectedIndex`, or `value`
@@ -289,8 +301,8 @@ Typed assertion fields are exact and closed:
   JSON array/object and the contract verifies one literal inside it.
 - `assert_no_console_errors`: no additional fields
 
-For new contracts, `assert_url` values must describe owned pathnames and cannot
-contain `#` fragments or hash-router state. When `key_press` uses `Tab`, its
+For new contracts, `assert_url` values describe owned pathnames and remain fragment-free;
+use `assert_hash` for a statically owned hash-router view. When `key_press` uses `Tab`, its
 starting selector is required and the following
 `assert_focus` must name the destination selector; Tab cannot leave focus on
 the same starting element.

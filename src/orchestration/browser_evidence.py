@@ -49,8 +49,16 @@ def _evidence_route(actions: list[dict[str, Any]]) -> list[str]:
     kinds = {str(item.get("action", "")) for item in actions if isinstance(item, dict)}
     if kinds & {"assert_aria", "assert_focus"}:
         routes.append("ax_semantics")
-    if kinds & {"assert_property", "assert_storage_value", "assert_url", "assert_value"}:
+    if kinds & {
+        "assert_hash",
+        "assert_property",
+        "assert_storage_value",
+        "assert_url",
+        "assert_value",
+    }:
         routes.append("internal_state")
+    if "assert_computed_style" in kinds:
+        routes.append("rendered_style")
     if kinds & TYPED_ASSERTION_ACTIONS:
         routes.append("dom")
     return routes
@@ -98,12 +106,24 @@ async def _execute_typed_assertion(
         actual = await locator.count()
         expected = int(step["count"])
         ok = actual == expected
+    elif action == "assert_computed_style":
+        property_name = str(step["property"])
+        actual = await locator.evaluate(
+            "(element, propertyName) => "
+            "getComputedStyle(element).getPropertyValue(propertyName).trim()",
+            property_name,
+        )
+        ok = _matches(actual, expected, str(step.get("match", "exact")))
     elif action == "assert_property":
         name = str(step["name"])
         actual = await locator.evaluate("(element, key) => element[key]", name)
         ok = actual == expected
     elif action == "assert_url":
         actual = urlsplit(page.url).path if str(expected).startswith("/") else page.url
+        ok = _matches(actual, expected, str(step.get("match", "exact")))
+    elif action == "assert_hash":
+        fragment = urlsplit(page.url).fragment
+        actual = f"#{fragment}" if fragment else ""
         ok = _matches(actual, expected, str(step.get("match", "exact")))
     elif action == "assert_attribute":
         actual = await locator.get_attribute(str(step["name"]))
@@ -145,6 +165,14 @@ def _same_origin_route_url(app_url: str, route: str) -> str:
     base = urlsplit(app_url)
     target = urlsplit(route)
     segments = target.path.replace("\\", "/").split("/")
+    fragment_segments = target.fragment.split("/")
+    fragment_ok = not target.fragment or (
+        target.fragment.startswith("/")
+        and "\\" not in target.fragment
+        and "://" not in target.fragment
+        and "?" not in target.fragment
+        and all(segment not in {".", ".."} for segment in fragment_segments)
+    )
     if (
         base.scheme not in {"http", "https"}
         or not base.netloc
@@ -154,7 +182,7 @@ def _same_origin_route_url(app_url: str, route: str) -> str:
         or target.scheme
         or target.netloc
         or target.query
-        or target.fragment
+        or not fragment_ok
         or any(segment in {".", ".."} for segment in segments)
     ):
         raise ValueError(f"unsafe browser route: {route!r}")
@@ -303,6 +331,28 @@ async def collect_browser_evidence(
                             elif action == "select_option":
                                 await page.select_option(str(step["selector"]), str(step["value"]))
                                 result["output"] = "selected"
+                            elif action == "set_storage_value":
+                                encoding = str(step.get("encoding", "string"))
+                                encoded = (
+                                    json.dumps(
+                                        step.get("value"),
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    )
+                                    if encoding == "json"
+                                    else str(step.get("value", ""))
+                                )
+                                await page.evaluate(
+                                    "([kind, key, value]) => "
+                                    "(kind === 'local' ? localStorage : sessionStorage)"
+                                    ".setItem(key, value)",
+                                    [str(step["storage"]), str(step["key"]), encoded],
+                                )
+                                result["output"] = {
+                                    "storage": str(step["storage"]),
+                                    "key": str(step["key"]),
+                                    "encoded_bytes": len(encoded.encode("utf-8")),
+                                }
                             elif action == "set_input_files":
                                 payloads = [
                                     {

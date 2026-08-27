@@ -1,6 +1,7 @@
 """Typed, bounded browser action contracts shared by planning and execution."""
 from __future__ import annotations
 
+import json
 from pathlib import PurePath
 from typing import Any
 
@@ -10,7 +11,9 @@ TYPED_ASSERTION_ACTIONS = frozenset(
         "assert_aria",
         "assert_attribute",
         "assert_count",
+        "assert_computed_style",
         "assert_focus",
+        "assert_hash",
         "assert_hidden",
         "assert_property",
         "assert_no_console_errors",
@@ -42,6 +45,7 @@ SUPPORTED_UI_ACTIONS = frozenset(
         "reload",
         "scroll",
         "select_option",
+        "set_storage_value",
         "set_input_files",
         "set_viewport",
         "wait_for",
@@ -52,7 +56,9 @@ _ACTION_FIELDS = {
     "assert_aria": {"selector", "attribute", "value"},
     "assert_attribute": {"selector", "name", "value"},
     "assert_count": {"selector", "count"},
+    "assert_computed_style": {"selector", "property", "value", "match"},
     "assert_focus": {"selector"},
+    "assert_hash": {"value", "match"},
     "assert_form_valid": {"selector"},
     "assert_hidden": {"selector"},
     "assert_property": {"selector", "name", "value"},
@@ -72,10 +78,25 @@ _ACTION_FIELDS = {
     "reload": set(),
     "scroll": {"y"},
     "select_option": {"selector", "value"},
+    "set_storage_value": {"storage", "key", "value", "encoding"},
     "set_input_files": {"selector", "files"},
     "set_viewport": {"width", "height"},
     "wait_for": {"selector", "state", "timeout_ms"},
 }
+
+_COMPUTED_STYLE_PROPERTIES = frozenset(
+    {
+        "display",
+        "visibility",
+        "opacity",
+        "position",
+        "overflow",
+        "overflow-x",
+        "overflow-y",
+        "pointer-events",
+        "z-index",
+    }
+)
 
 
 class ActionContractError(ValueError):
@@ -120,6 +141,7 @@ def validate_ui_action(step: dict[str, Any]) -> None:
         "assert_aria",
         "assert_attribute",
         "assert_count",
+        "assert_computed_style",
         "assert_focus",
         "assert_form_valid",
         "assert_hidden",
@@ -149,6 +171,19 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             raise ActionContractError("assert_attribute requires scalar value")
     elif action == "assert_count":
         _bounded_int(step, "count", action, minimum=0, maximum=10_000)
+    elif action == "assert_computed_style":
+        property_name = _non_empty_string(step, "property", action).lower()
+        if property_name not in _COMPUTED_STYLE_PROPERTIES:
+            raise ActionContractError(
+                "assert_computed_style computed style property must be one of: "
+                + ", ".join(sorted(_COMPUTED_STYLE_PROPERTIES))
+            )
+        if not isinstance(step.get("value"), (str, int, float)):
+            raise ActionContractError("assert_computed_style requires scalar value")
+        if step.get("match", "exact") not in {"exact", "contains"}:
+            raise ActionContractError(
+                "assert_computed_style match must be exact or contains"
+            )
     elif action == "assert_property":
         name = _non_empty_string(step, "name", action)
         if name not in {
@@ -178,12 +213,25 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             raise ActionContractError(
                 "assert_storage_value match must be exact or contains"
             )
-    elif action in {"assert_text", "assert_url"}:
+    elif action in {"assert_text", "assert_url", "assert_hash"}:
         if action == "assert_url":
             expected_url = _non_empty_string(step, "value", action)
             if "#" in expected_url:
                 raise ActionContractError(
                     "assert_url fragments are unsupported for new contracts; use an owned pathname route"
+                )
+        elif action == "assert_hash":
+            expected_hash = _non_empty_string(step, "value", action)
+            segments = expected_hash.removeprefix("#").split("/")
+            if (
+                not expected_hash.startswith("#/")
+                or "\\" in expected_hash
+                or "?" in expected_hash
+                or "://" in expected_hash
+                or any(segment in {".", ".."} for segment in segments)
+            ):
+                raise ActionContractError(
+                    "assert_hash value must be one bounded hash-router path such as '#/report'"
                 )
         elif not isinstance(step.get("value"), (str, int, float)):
             raise ActionContractError("assert_text requires scalar value")
@@ -221,6 +269,31 @@ def validate_ui_action(step: dict[str, Any]) -> None:
     elif action in {"fill", "select_option"}:
         if "value" not in step or not isinstance(step["value"], (str, int, float)):
             raise ActionContractError(f"{action} requires scalar value")
+    elif action == "set_storage_value":
+        if step.get("storage") not in {"local", "session"}:
+            raise ActionContractError("set_storage_value storage must be local or session")
+        _non_empty_string(step, "key", action)
+        if "value" not in step:
+            raise ActionContractError("set_storage_value requires value")
+        encoding = step.get("encoding", "string")
+        if encoding not in {"json", "string"}:
+            raise ActionContractError(
+                "set_storage_value encoding must be json or string"
+            )
+        try:
+            encoded = (
+                json.dumps(step.get("value"), ensure_ascii=False, separators=(",", ":"))
+                if encoding == "json"
+                else str(step.get("value", ""))
+            )
+        except (TypeError, ValueError) as exc:
+            raise ActionContractError(
+                "set_storage_value value must be JSON serializable"
+            ) from exc
+        if len(encoded.encode("utf-8")) > 32_768:
+            raise ActionContractError(
+                "set_storage_value value exceeds the 32768-byte budget"
+            )
     elif action == "key_press":
         key = _non_empty_string(step, "key", action)
         if "selector" in step:

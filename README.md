@@ -70,8 +70,9 @@ What is implemented:
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with cumulative planner/generator/evaluator caps plus a hard total-budget cap; append-only trace usage from failed or interrupted attempts is carried into a resumed phase instead of resetting its spend to zero
 - Incremental-Edit DOM contract guard: explicit Edit freezes a verified seed, while Sprint two and later in a Generate run freeze the previous accepted checkpoint. Each semantic frame is sampled twice and unstable routes fail closed. The v4 contract opens at most four deepest target fragments per route while preserving sibling fragments, ARIA state, focusability, and every protected route. This is independent of screenshot/pixel scoring.
-- Harness-owned progressive minimal-path guidance: each executable UI check names an exact same-origin route. Static HTML pages, concrete filesystem routes, and explicit literal React Router mappings are converted into page ownership and import/link dependency cones. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine; route-local files are preferred, off-target files remain closed, and a cross-route shared source opens only when a named target-route object/class/function is mechanically isolated. Every patch must remain wholly inside that region, whole-file overwrite stays denied, and actual tool outcomes are appended to a ledger.
-- Typed WebCompass browser contracts: the full 40-type 0805 Edit taxonomy has an explicit action-capability profile. New plans cannot author arbitrary browser JavaScript or hash-router URL state: each flow ends in a bounded group of one to four related DOM/text/value/count/pathname/attribute/ARIA/focus/storage/console assertions. Tab checks require a deterministic starting selector, and initial empty-state checks must precede state-producing flows on their route. Real Chromium also supports hover, right-click, drag-and-drop, in-memory file upload, asynchronous locator waits, reload, and print/color-scheme emulation. Historical `evaluate` contracts remain replayable but are not formal-export evidence.
+- Harness-owned progressive minimal-path guidance: each executable UI check names an exact same-origin route. Static HTML pages, concrete filesystem routes, explicit literal React Router mappings, and literal vanilla `registerRoute()` hash routes are converted into page ownership and import/link dependency cones. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine. A coherent multi-route Edit starts from one ranked entry per target route; route-local files are preferred, off-target files remain closed, and a cross-route shared source opens only when a named target-route object/class/function is mechanically isolated. Target-named additive members may be added to a mechanically isolated shared store/state container, while existing members and unrelated identifiers remain byte/identifier protected. Every patch stays inside its admitted region, whole-file overwrite stays denied, and actual tool outcomes are appended to a ledger.
+- Repository-native design guidance: the minimal-path plan inventories CSS custom properties, their definition files, and usage counts. The Generator is instructed to reuse those tokens before inventing literal colors, spacing, radii, typography, or timing values. Discovery does not itself authorize a protected global stylesheet.
+- Typed WebCompass browser contracts: the full 40-type 0805 Edit taxonomy has an explicit action-capability profile. New plans cannot author arbitrary browser JavaScript. Bounded hash-router routes and `assert_hash` are supported; `set_storage_value` establishes deterministic local/session-storage fixtures, and `assert_computed_style` checks a small allowlist of rendered properties without screenshot comparison. Each flow ends in one to four related DOM/text/value/count/pathname/hash/computed-style/attribute/ARIA/focus/storage/console assertions. Tab checks require a deterministic starting selector, and initial empty-state checks must precede state-producing flows on their route. Real Chromium also supports hover, right-click, drag-and-drop, in-memory file upload, asynchronous locator waits, reload, viewport changes, and print/color-scheme emulation. Historical `evaluate` contracts remain replayable but are not formal-export evidence.
 - Accepted checkpoint tapes: passing typed flows are appended with requirement/impact metadata. Normal Edit validation replays impacted checks plus one critical sentinel per protected route; every fifth accepted Edit and legacy metadata trigger a full replay. `scripts/recover_accepted_tapes.py` reconstructs a missing tape only from immutable passing browser evidence. A lost accepted interaction is a real regression; malformed or over-budget tape banks are infrastructure failures.
 - Complete seed context for one-shot AIR task generation: up to 48 source files / 140K characters are included without truncation. Larger projects fail closed and must use the tool-reading harness path; partial context is never advertised as `all_files_included`.
 - Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. Target-local style atoms require an accepted target-route visual review because the functional oracle cannot judge CSS appearance. If only evidence policy changes, a later round keeps the source byte-identical and reuses the last matching applied-and-validated mutation ledger rather than paying the Generator to touch code again. New-policy exports require `certified` evidence with exact source/destination provenance.
@@ -166,7 +167,7 @@ MINIMALITY_MAX_ATOMS=12             # broader diffs are inconclusive, not accept
 MINIMALITY_ORACLE_TIMEOUT_SECONDS=240
 MINIMAL_PATH_GUIDANCE_ENABLED=true  # pre-edit and in-edit execution policy
 MINIMAL_PATH_MAX_PATCH_LINES=120    # per exact mutation, not an acceptance proof
-MINIMAL_PATH_MAX_TOUCHED_FILES=3    # local/dependency change-cone budget
+MINIMAL_PATH_MAX_TOUCHED_FILES=6    # coherent multi-route local/dependency budget
 PLANNER_BUDGET_USD=2                # cumulative phase caps
 GENERATOR_BUDGET_USD=80
 EVALUATOR_BUDGET_USD=10             # evaluator + visual review
@@ -295,8 +296,9 @@ harness-owned `.harness/edit_scope_round_N.json`, for example:
 ```
 
 The model cannot edit the policy, live-state, or ledger artifacts. The plan initially
-exposes only `source_change_cone.initial_paths` (normally one path). That exact file must
-be successfully read before an exact unique patch is admitted. After each real mutation,
+exposes only `source_change_cone.initial_paths` (normally one path, or one ranked entry
+for each target route in a coherent multi-route Edit). Those entries must be inspected
+before the exact unique patch sequence is attempted. After each real mutation,
 the controller requires a syntax/diff/build/test checkpoint before an import/link neighbor
 can open; a successful checkpoint after the latest mutation is required before commit.
 Whole-file overwrite, unrelated or unplanned new source paths, broad patches, and
@@ -311,7 +313,9 @@ JavaScript/TypeScript file, the plan may also contain
 `source_change_cone.guarded_shared_regions`. The harness derives an exact named
 object/class/function from the literal target route (for example
 `/discovery.html` → `Discovery`) and recomputes its balanced source boundary before each
-patch. Sibling page modules in the same file and whole-file replacement remain denied.
+patch. A shared state object/class may receive only additive members whose identifiers
+are tied to target routes or checks; existing identifiers cannot be removed. Sibling
+page modules, unscoped store additions, and whole-file replacement remain denied.
 
 The contract permits changes inside at most two named baseline surfaces per target route.
 Each multi-page snapshot prefixes roots with their route; removal or semantic change of
@@ -702,6 +706,19 @@ routes four exact ground-truth patches through minimal-path authorization, recor
 first failed Edit, creates a zero-cost deterministic Repair packet, applies one bounded
 Repair, and reruns DOM/ARIA/property/storage plus protected-route browser sentinels.
 Each invocation writes a new append-only run folder under `logs/edit_first_20260828/`.
+
+Run the five-case, zero-LLM Edit matrix (single-page, inline state fixture, shared-file,
+coherent two-route/five-file, and hash-router cases):
+
+```bash
+uv run python scripts/validate_webcompass_edit_matrix.py
+```
+
+The matrix keeps accepted, rejected candidate, and infrastructure-error outcomes
+separate. It also exercises protected-route sentinels, target-named shared-state
+additions, computed-style evidence, and a real counterfactual `non_minimal` certificate.
+See [`docs/edit_harness_external_ideas_and_real_matrix_20260828.md`](docs/edit_harness_external_ideas_and_real_matrix_20260828.md)
+for the dated evidence and remaining gaps.
 
 ## License
 

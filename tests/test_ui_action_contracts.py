@@ -33,6 +33,65 @@ def test_new_url_assertions_reject_hash_router_state():
         )
 
 
+def test_hash_assertions_and_storage_fixtures_are_bounded():
+    validate_ui_action(
+        {"action": "assert_hash", "value": "#/library", "match": "exact"}
+    )
+    validate_ui_action(
+        {
+            "action": "set_storage_value",
+            "storage": "local",
+            "key": "catalog_state",
+            "value": {"page": 2, "filters": ["open"]},
+            "encoding": "json",
+        }
+    )
+    with pytest.raises(ActionContractError, match="hash-router path"):
+        validate_ui_action(
+            {"action": "assert_hash", "value": "https://example.com/#/library"}
+        )
+    with pytest.raises(ActionContractError, match="32768-byte"):
+        validate_ui_action(
+            {
+                "action": "set_storage_value",
+                "storage": "local",
+                "key": "oversized",
+                "value": "x" * 40_000,
+                "encoding": "string",
+            }
+        )
+    with pytest.raises(ActionContractError, match="requires value"):
+        validate_ui_action(
+            {
+                "action": "set_storage_value",
+                "storage": "session",
+                "key": "missing",
+                "encoding": "json",
+            }
+        )
+
+
+def test_computed_style_assertion_has_a_closed_property_allowlist():
+    validate_ui_action(
+        {
+            "action": "assert_computed_style",
+            "selector": "#drawer",
+            "property": "display",
+            "value": "none",
+            "match": "exact",
+        }
+    )
+    with pytest.raises(ActionContractError, match="computed style property"):
+        validate_ui_action(
+            {
+                "action": "assert_computed_style",
+                "selector": "#drawer",
+                "property": "background-image",
+                "value": "anything",
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "step",
     [
@@ -42,6 +101,14 @@ def test_new_url_assertions_reject_hash_router_state():
         {"action": "assert_value", "selector": "#query", "value": "atlas"},
         {"action": "assert_count", "selector": ".result", "count": 3},
         {"action": "assert_url", "value": "/settings", "match": "contains"},
+        {"action": "assert_hash", "value": "#/settings", "match": "exact"},
+        {
+            "action": "assert_computed_style",
+            "selector": "#panel",
+            "property": "visibility",
+            "value": "visible",
+            "match": "exact",
+        },
         {"action": "assert_attribute", "selector": "#save", "name": "data-state", "value": "done"},
         {"action": "assert_property", "selector": "#done", "name": "checked", "value": True},
         {"action": "assert_aria", "selector": "#toggle", "attribute": "aria-expanded", "value": True},

@@ -12,10 +12,12 @@ boundary rather than a prompt preference.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 
 PLAN_VERSION = "minimal-path-plan-v3"
@@ -101,6 +103,14 @@ _ROUTE_COMPONENT_RE = re.compile(
 _DEFAULT_IMPORT_RE = re.compile(
     r"import\s+([A-Za-z_$][\w$]*)\s+from\s+['\"]([^'\"]+)['\"]"
 )
+_NAMED_IMPORT_RE = re.compile(
+    r"import\s*\{([^}]+)\}\s*from\s*['\"]([^'\"]+)['\"]", re.S
+)
+_REGISTER_ROUTE_RE = re.compile(
+    r"\bregisterRoute\(\s*['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_$][\w$]*)\s*\)"
+)
+_CSS_CUSTOM_PROPERTY_RE = re.compile(r"(--[A-Za-z_][\w-]*)\s*:")
+_CSS_CUSTOM_PROPERTY_USE_RE = re.compile(r"var\(\s*(--[A-Za-z_][\w-]*)")
 _MUTATING_SHELL_RE = re.compile(
     r"(?:^|(?:&&|\|\||;)\s*|\s)(?:cp|install|mkdir|mv|patch|rm|tee|touch|truncate)\s|"
     r"(?:^|\s)(?:npm|pnpm|yarn)\s+(?:add|install|create)\b|"
@@ -216,6 +226,7 @@ def _requested_source_roles(checks: list[dict[str, Any]]) -> set[str]:
         "functionality",
         "interaction",
         "persistence",
+        "state",
     }
     if behavior_categories or (
         actions & INTERACTION_ACTIONS
@@ -421,14 +432,29 @@ def _normalize_route(value: Any) -> str | None:
     route = value.strip()
     if not route or "://" in route or route.startswith("//"):
         return None
-    route = route.split("?", 1)[0].split("#", 1)[0] or "/"
-    if not route.startswith("/"):
-        route = "/" + route
-    parts = [part for part in route.split("/") if part]
+    parsed = urlsplit(route)
+    if parsed.query:
+        return None
+    path = parsed.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    parts = [part for part in path.split("/") if part]
     if any(part in {".", ".."} for part in parts):
         return None
     normalized = "/" + "/".join(parts)
-    return "/" if normalized == "/" else normalized
+    normalized = "/" if normalized == "/" else normalized
+    if not parsed.fragment:
+        return normalized
+    fragment = parsed.fragment.rstrip("/")
+    fragment_parts = [part for part in fragment.split("/") if part]
+    if (
+        not fragment.startswith("/")
+        or "\\" in fragment
+        or "://" in fragment
+        or any(part in {".", ".."} for part in fragment_parts)
+    ):
+        return None
+    return f"{normalized}#{fragment}"
 
 
 def _static_html_route(path: Path, frontend: Path) -> str:
@@ -505,11 +531,25 @@ def _route_entries(
                 target = _resolve_reference(frontend, router, reference)
                 if target is not None:
                     imports[symbol] = _relative_to_workdir(target, workdir)
+            for raw_symbols, reference in _NAMED_IMPORT_RE.findall(content):
+                target = _resolve_reference(frontend, router, reference)
+                if target is None:
+                    continue
+                target_relative = _relative_to_workdir(target, workdir)
+                for raw_symbol in raw_symbols.split(","):
+                    parts = [item.strip() for item in raw_symbol.strip().split(" as ")]
+                    if parts and parts[-1]:
+                        imports[parts[-1]] = target_relative
             for route_raw, symbol in _ROUTE_COMPONENT_RE.findall(content):
                 route = _normalize_route(route_raw)
                 target = imports.get(symbol)
                 if route and target:
                     router_entries.setdefault(route, set()).add(target)
+            for route_raw, symbol in _REGISTER_ROUTE_RE.findall(content):
+                logical = _normalize_route(route_raw)
+                target = imports.get(symbol)
+                if logical and target:
+                    router_entries.setdefault(f"/#{logical}", set()).add(target)
     if router_entries:
         # Explicit router declarations are more authoritative than a Vite
         # index.html shell or filename convention, which otherwise makes every
@@ -703,7 +743,9 @@ def _route_symbol_candidates(route: str) -> list[str]:
     semantics: only exact PascalCase forms of literal route path segments qualify.
     """
 
-    parts = [part for part in route.strip("/").split("/") if part]
+    parsed = urlsplit(route)
+    logical = parsed.fragment if parsed.fragment else parsed.path
+    parts = [part for part in logical.strip("/").split("/") if part]
     if not parts:
         return ["Index"]
     parts[-1] = Path(parts[-1]).stem
@@ -717,6 +759,44 @@ def _route_symbol_candidates(route: str) -> list[str]:
 
     candidates = [pascal(parts[-1]), pascal("-".join(parts))]
     return list(dict.fromkeys(item for item in candidates if item))
+
+
+def _design_system_context(files: list[Path], workdir: Path) -> dict[str, Any]:
+    """Index existing CSS custom properties without interpreting product semantics."""
+
+    definitions: dict[str, set[str]] = {}
+    usage_counts: dict[str, int] = {}
+    style_paths: list[str] = []
+    for path in files:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        relative = _relative_to_workdir(path, workdir)
+        if path.suffix.lower() in STYLE_EXTENSIONS:
+            style_paths.append(relative)
+        for name in _CSS_CUSTOM_PROPERTY_RE.findall(content):
+            definitions.setdefault(name, set()).add(relative)
+        for name in _CSS_CUSTOM_PROPERTY_USE_RE.findall(content):
+            usage_counts[name] = usage_counts.get(name, 0) + 1
+    tokens = [
+        {
+            "name": name,
+            "defined_in": sorted(paths),
+            "usage_count": int(usage_counts.get(name, 0)),
+        }
+        for name, paths in sorted(definitions.items())
+    ][:128]
+    return {
+        "status": "tokens_found" if tokens else "no_css_custom_properties",
+        "css_custom_properties": tokens,
+        "style_source_paths": sorted(set(style_paths)),
+        "guidance": (
+            "Reuse listed custom properties before adding literal colors, spacing, "
+            "radii, typography, or timing values; add a token only when the target "
+            "semantic cannot be expressed by an existing one."
+        ),
+    }
 
 
 def _balanced_brace_end(content: str, opening: int) -> int | None:
@@ -801,6 +881,8 @@ def _named_source_region(content: str, symbol: str) -> dict[str, Any] | None:
     end = _balanced_brace_end(content, opening)
     if opening < 0 or end is None:
         return None
+    if end < len(content) and content[end] == ";":
+        end += 1
     start = match.start()
     prefix = content[:start]
     banner = re.search(
@@ -825,11 +907,49 @@ def _guarded_shared_regions(
     route_scope: dict[str, Any],
     files: list[Path],
     workdir: Path,
+    checks: list[dict[str, Any]],
+    requested_roles: set[str],
 ) -> list[dict[str, Any]]:
     """Open only statically named target-route modules in shared source files."""
 
     by_path = {_relative_to_workdir(path, workdir): path for path in files}
     output: list[dict[str, Any]] = []
+    state_intent = any(
+        str(check.get("category", "")).lower() in {"persistence", "state"}
+        or any(
+            isinstance(action, dict)
+            and action.get("action")
+            in {"assert_storage_value", "set_storage_value"}
+            for action in check.get("actions", [])
+        )
+        for check in checks
+    )
+    scope_terms: set[str] = set()
+    for route in route_scope.get("target_routes") or []:
+        for symbol in _route_symbol_candidates(str(route)):
+            scope_terms.update(_identifier_terms(symbol))
+    for selector in _extract_selectors(checks):
+        scope_terms.update(_identifier_terms(selector))
+    for check in checks:
+        scope_terms.update(_identifier_terms(str(check.get("id", ""))))
+    scope_terms -= {
+        "action",
+        "button",
+        "control",
+        "controls",
+        "data",
+        "info",
+        "initial",
+        "item",
+        "items",
+        "next",
+        "page",
+        "pagination",
+        "prev",
+        "previous",
+        "state",
+        "storage",
+    }
     for relative in route_scope.get("cross_route_shared_paths") or []:
         path = by_path.get(str(relative))
         if path is None or path.suffix.lower() not in BEHAVIOR_EXTENSIONS:
@@ -854,7 +974,108 @@ def _guarded_shared_regions(
                     }
                 )
                 break
+        if state_intent and "behavior" in requested_roles:
+            for symbol in _state_container_symbols(content):
+                region = _named_source_region(content, symbol)
+                if region is None:
+                    continue
+                output.append(
+                    {
+                        "path": str(relative),
+                        "route": "shared-target-state",
+                        "symbol": symbol,
+                        "kind": str(region["kind"]),
+                        "start_line": int(region["start_line"]),
+                        "end_line": int(region["end_line"]),
+                        "mutation_mode": "additive_target_members",
+                        "allowed_terms": sorted(scope_terms),
+                    }
+                )
     return sorted(output, key=lambda item: (item["path"], item["route"], item["symbol"]))
+
+
+def _identifier_terms(value: str) -> set[str]:
+    pieces = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    return {
+        item.lower()
+        for item in re.split(r"[^A-Za-z0-9]+", pieces)
+        if len(item) >= 3
+    }
+
+
+def _state_container_symbols(content: str) -> list[str]:
+    symbols = re.findall(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\{",
+        content,
+    )
+    symbols.extend(re.findall(r"\bclass\s+([A-Za-z_$][\w$]*)\b", content))
+    candidates = {
+        symbol for symbol in symbols if {"state", "store"} & _identifier_terms(symbol)
+    }
+    return sorted(candidates)
+
+
+_ADDITIVE_GENERIC_IDENTIFIERS = {
+    "async",
+    "const",
+    "false",
+    "let",
+    "null",
+    "page",
+    "pagesize",
+    "return",
+    "save",
+    "set",
+    "state",
+    "this",
+    "true",
+    "var",
+}
+
+
+def _validate_additive_target_members(
+    before: str, after: str, allowed_terms: Iterable[str]
+) -> str | None:
+    """Allow additions whose new identifiers are tied to the selected views.
+
+    This is deliberately lexical and fail-closed. It is an online path guard,
+    while browser frames and counterfactual replay remain the acceptance proof.
+    """
+
+    terms = {str(item).lower() for item in allowed_terms if str(item).strip()}
+    matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+    novel: set[str] = set()
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        old_chunk = before[old_start:old_end]
+        new_chunk = after[new_start:new_end]
+        old_ids = set(re.findall(r"[A-Za-z_$][\w$]*", old_chunk))
+        new_ids = set(re.findall(r"[A-Za-z_$][\w$]*", new_chunk))
+        removed = {item for item in old_ids - new_ids if item.lower() not in {"const", "let", "var"}}
+        if removed:
+            return (
+                "Additive shared-state edits cannot remove or replace existing identifiers: "
+                + ", ".join(sorted(removed))
+            )
+        novel.update(item for item in new_ids - old_ids if len(item) >= 3)
+    disallowed = sorted(
+        token
+        for token in novel
+        if token.lower() not in _ADDITIVE_GENERIC_IDENTIFIERS
+        and not any(term in token.lower() for term in terms)
+    )
+    if disallowed:
+        return (
+            "Additive shared-state edits may introduce only target-named members; "
+            "unscoped identifiers: "
+            + ", ".join(disallowed)
+        )
+    if novel and not any(
+        any(term in token.lower() for term in terms) for token in novel
+    ):
+        return "Additive shared-state edit contains no target-named member."
+    return None
 
 
 def discover_page_routes(workdir: Path) -> list[str]:
@@ -1387,6 +1608,8 @@ def ensure_minimal_path_plan(
         route_scope=route_scope,
         files=files,
         workdir=workdir,
+        checks=checks,
+        requested_roles=requested_roles,
     )
     guarded_shared_paths = {
         str(item["path"]) for item in guarded_shared_regions
@@ -1421,7 +1644,32 @@ def ensure_minimal_path_plan(
         initial = sorted(isolation_entries)[:1]
         local = sorted(isolation_entries)
     else:
-        initial = ranked[:1] if ranked else target_entries[:1]
+        if len(route_scope.get("target_routes") or []) > 1:
+            owners = route_scope.get("path_owners") or {}
+            per_route_initial: list[str] = []
+            for route in route_scope.get("target_routes") or []:
+                candidate = next(
+                    (
+                        path
+                        for path in ranked
+                        if route in set(owners.get(path) or [])
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    candidate = next(
+                        (
+                            path
+                            for path in target_entries
+                            if route in set(owners.get(path) or [])
+                        ),
+                        None,
+                    )
+                if candidate and candidate not in per_route_initial:
+                    per_route_initial.append(candidate)
+            initial = per_route_initial or (ranked[:1] if ranked else target_entries[:1])
+        else:
+            initial = ranked[:1] if ranked else target_entries[:1]
         seeds = ranked[:max_touched_files]
         if not seeds:
             seeds = target_entries[:1]
@@ -1523,6 +1771,7 @@ def ensure_minimal_path_plan(
             "priority_source_roles": sorted(priority_roles),
             "failed_check_ids": failed_check_ids,
         },
+        "design_system_context": _design_system_context(files, workdir),
         "dom_change_cone": {
             "baseline": (
                 f".harness/{baseline_path.name}" if baseline_path is not None else None
@@ -1832,6 +2081,20 @@ class MinimalPathPolicy:
                 spans.append((int(region["start"]), int(region["end"])))
         return spans
 
+    def _guarded_contract_for_span(
+        self, relative: str, content: str, start: int, end: int
+    ) -> dict[str, Any] | None:
+        for contract in self.guarded_shared_regions.get(relative, []):
+            region = _named_source_region(content, str(contract.get("symbol", "")))
+            if (
+                region is not None
+                and str(region.get("kind")) == str(contract.get("kind"))
+                and int(region["start"]) <= start
+                and end <= int(region["end"])
+            ):
+                return contract
+        return None
+
     def _guarded_projection(
         self, relative: str, content: str
     ) -> tuple[str | None, str | None]:
@@ -1879,6 +2142,27 @@ class MinimalPathPolicy:
                 f"Committed Edit changed bytes outside the guarded target-route "
                 f"region in {relative}."
             )
+        for contract in self.guarded_shared_regions.get(relative, []):
+            if contract.get("mutation_mode") != "additive_target_members":
+                continue
+            before_region = _named_source_region(
+                before, str(contract.get("symbol", ""))
+            )
+            after_region = _named_source_region(
+                after, str(contract.get("symbol", ""))
+            )
+            if before_region is None or after_region is None:
+                return (
+                    "Additive shared-state region cannot be resolved after the Edit: "
+                    + str(contract.get("symbol", ""))
+                )
+            error = _validate_additive_target_members(
+                before[int(before_region["start"]) : int(before_region["end"])],
+                after[int(after_region["start"]) : int(after_region["end"])],
+                contract.get("allowed_terms") or [],
+            )
+            if error:
+                return error
         return None
 
     def observe_result(
@@ -2128,7 +2412,7 @@ class MinimalPathPolicy:
             )
         if pairs and absolute.is_file():
             content = absolute.read_text(encoding="utf-8", errors="replace")
-            for old, _new in pairs:
+            for old, new in pairs:
                 if not old or content.count(old) != 1:
                     return self._deny(
                         tool,
@@ -2139,8 +2423,10 @@ class MinimalPathPolicy:
                 if guarded_shared:
                     start = content.index(old)
                     end = start + len(old)
-                    spans = self._current_guarded_spans(relative, content)
-                    if not any(left <= start and end <= right for left, right in spans):
+                    contract = self._guarded_contract_for_span(
+                        relative, content, start, end
+                    )
+                    if contract is None:
                         return self._deny(
                             tool,
                             relative,
@@ -2148,6 +2434,17 @@ class MinimalPathPolicy:
                             "guarded target-route region.",
                             patch_lines=patch_lines,
                         )
+                    if contract.get("mutation_mode") == "additive_target_members":
+                        additive_error = _validate_additive_target_members(
+                            old, new, contract.get("allowed_terms") or []
+                        )
+                        if additive_error:
+                            return self._deny(
+                                tool,
+                                relative,
+                                additive_error,
+                                patch_lines=patch_lines,
+                            )
 
         self._record(
             decision="allow",
