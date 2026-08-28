@@ -43,6 +43,28 @@ stops the loop immediately. A failed cycle writes a bounded `repair_packet_round
 containing exact failed checks/regressions, evidence references, allowed source paths,
 and dynamic file/line limits. Missing identifiable evidence blocks the next Repair.
 
+Atomic Edit planning is separate from Generate planning. One model call authors only
+`goal`, exact `source_anchors`, a visual-evidence flag, and one to three ordered typed
+checks. The Harness normalizes stable selector aliases and locally materializes the
+legacy spec/design/feature/Sprint artifacts required by older validators. It does not
+pay the model to restate an accepted product. Ordered actions become implementation
+guidance as well as tests: a later click after `assert_hidden(target)` yields a concrete
+`control_must_not_be_descendant_of_hidden_target` instruction naming both selectors.
+
+When a resolved Edit touches existing files without dependency widening, the native
+executor uses a single exact-patch request for that cycle. `edit_context_round_N.json`
+contains only anchored current-source windows (an outline is included only for a path
+without an anchored window). Patch application is transactional; response/usage is
+persisted before mutation, trailing horizontal whitespace is normalized, and a failed
+diff/syntax/policy gate restores the original files.
+
+Repair starts a new model session. The prompt contains a compact failure packet, newly
+selected windows from the failed current checkpoint, and deterministic selector-level
+directives derived from ordered evidence. For example, `click(control)` followed by a
+failed `assert_hidden(target)` becomes “fix the control handler so it hides the target;
+changing only the target's initial style is insufficient.” No prior model dialogue is
+carried into the Repair call.
+
 Before the generator starts, the harness converts the executable action
 contract and semantic anchors into a source change cone. Exact selector/token
 matches define local source hotspots, while typed action/category fields route

@@ -20,6 +20,7 @@ from src.agents.evaluator import (
 )
 from src.agents.design_stage import run_design_stage
 from src.agents.generator import run_generator
+from src.agents.edit_planner import run_atomic_edit_planner
 from src.agents.planner import run_planner
 from src.agents.sdk_runner import AgentRunStats
 from src.agents.visual_review import (
@@ -55,6 +56,11 @@ from src.orchestration.edit_card import (
     visual_evidence_required,
 )
 from src.orchestration.edit_task_contract import read_edit_task_contract
+from src.orchestration.edit_context import ensure_edit_context
+from src.orchestration.atomic_edit_plan import (
+    normalize_atomic_edit_plan_payload,
+    read_atomic_edit_plan,
+)
 from src.orchestration.repair_packet import write_repair_packet
 from src.orchestration.task_inputs import load_task_input_manifest
 from src.orchestration.ui_action_contracts import TYPED_ASSERTION_ACTIONS
@@ -167,8 +173,15 @@ async def run_planner_phase(ctx: HarnessContext) -> None:
     logger.info("[bold cyan]PHASE 1: PLAN")
     started = time.perf_counter()
     async with _agent_phase_session(ctx, phase_name="planner"):
-        raw_stats = await run_planner(ctx.config, ctx.user_prompt, ctx.file_comm, ctx.workdir)
         edit_contract = read_edit_task_contract(ctx.workdir)
+        if edit_contract is not None:
+            raw_stats = await run_atomic_edit_planner(
+                ctx.config, ctx.user_prompt, ctx.file_comm, ctx.workdir
+            )
+        else:
+            raw_stats = await run_planner(
+                ctx.config, ctx.user_prompt, ctx.file_comm, ctx.workdir
+            )
         if edit_contract is not None:
             materialize_edit_card(
                 harness_dir=ctx.file_comm.dir,
@@ -441,14 +454,27 @@ async def run_build_phase(
         )
         if minimal_path_plan.get("status") == "blocked":
             route_scope = minimal_path_plan.get("route_scope") or {}
+            dom_scope = minimal_path_plan.get("dom_change_cone") or {}
             raise RuntimeError(
                 "Edit task contract is blocked before source mutation: "
                 f"route_status={route_scope.get('status')}, "
                 f"unresolved={route_scope.get('unresolved_routes') or []}, "
                 f"unexpected_checks={route_scope.get('unexpected_check_routes') or []}, "
-                f"missing_checks={route_scope.get('missing_check_routes') or []}. "
+                f"missing_checks={route_scope.get('missing_check_routes') or []}, "
+                f"unresolved_selectors={dom_scope.get('unresolved_fragment_selectors') or []}. "
                 "Correct the planner route contract; do not widen the Edit to another page."
             )
+        atomic_plan = read_atomic_edit_plan(ctx.file_comm.dir) or {}
+        atomic_plan = normalize_atomic_edit_plan_payload(
+            atomic_plan, instruction_delta=ctx.user_prompt
+        )
+        ensure_edit_context(
+            workdir=ctx.workdir,
+            harness_dir=ctx.file_comm.dir,
+            plan=minimal_path_plan,
+            round_num=round_num,
+            source_anchors=list(atomic_plan.get("source_anchors") or []),
+        )
     track_minimality = (
         ctx.config.minimality_guard_enabled
         and (incremental_edit or mode == "repair")

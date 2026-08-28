@@ -74,18 +74,10 @@ def test_browser_screenshot_schema_exposes_distinct_page_positions():
 
 
 @pytest.mark.anyio
-async def test_openai_http_client_retries_a_transient_transport_error(monkeypatch):
+async def test_openai_http_client_never_retries_a_transport_error(monkeypatch):
     import httpx
 
     attempts = 0
-
-    class Response:
-        is_error = False
-        status_code = 200
-        text = ""
-
-        def json(self):
-            return {"choices": []}
 
     class Client:
         async def __aenter__(self):
@@ -97,27 +89,21 @@ async def test_openai_http_client_retries_a_transient_transport_error(monkeypatc
         async def post(self, *args, **kwargs):
             nonlocal attempts
             attempts += 1
-            if attempts == 1:
-                raise httpx.ConnectError("transient proxy failure")
-            return Response()
+            raise httpx.ConnectError("transient proxy failure")
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
-    async def no_sleep(_seconds):
-        return None
-    monkeypatch.setattr("src.agents.openai_runner.asyncio.sleep", no_sleep)
     config = HarnessConfig(openai_base_url="https://example.test/v1", openai_api_key="test-key")
 
-    assert await OpenAIHTTPClient(config, 20).complete(model="qwen-test", messages=[]) == {"choices": []}
-    assert attempts == 2
+    with pytest.raises(httpx.ConnectError, match="transient proxy failure"):
+        await OpenAIHTTPClient(config, 20).complete(model="qwen-test", messages=[])
+    assert attempts == 1
 
 
 @pytest.mark.anyio
-async def test_openai_http_client_uses_slow_backoff_for_qwen_burst_limit(monkeypatch):
+async def test_openai_http_client_never_retries_qwen_burst_limit(monkeypatch):
     import httpx
 
     attempts = 0
-    waits: list[float] = []
-
     class Response:
         def __init__(self, status_code: int, text: str):
             self.status_code = status_code
@@ -138,25 +124,18 @@ async def test_openai_http_client_uses_slow_backoff_for_qwen_burst_limit(monkeyp
         async def post(self, *args, **kwargs):
             nonlocal attempts
             attempts += 1
-            if attempts == 1:
-                return Response(429, '{"code":"limit_burst_rate"}')
-            return Response(200, "")
+            return Response(429, '{"code":"limit_burst_rate"}')
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
-
-    async def record_sleep(seconds):
-        waits.append(seconds)
-
-    monkeypatch.setattr("src.agents.openai_runner.asyncio.sleep", record_sleep)
     config = HarnessConfig(openai_base_url="https://example.test/v1", openai_api_key="test-key")
 
-    assert await OpenAIHTTPClient(config, 20).complete(model="qwen-test", messages=[]) == {"choices": []}
-    assert attempts == 2
-    assert waits == [10]
+    with pytest.raises(httpx.HTTPStatusError, match="429"):
+        await OpenAIHTTPClient(config, 20).complete(model="qwen-test", messages=[])
+    assert attempts == 1
 
 
 @pytest.mark.anyio
-async def test_openai_http_client_stops_retrying_when_total_request_budget_expires(monkeypatch):
+async def test_openai_http_client_uses_one_bounded_request(monkeypatch):
     import httpx
 
     class Client:
@@ -169,17 +148,10 @@ async def test_openai_http_client_stops_retrying_when_total_request_budget_expir
         async def post(self, *args, **kwargs):
             raise httpx.ConnectError("proxy unavailable")
 
-    ticks = [0.0, 0.0, 1.1, 1.1]
-    def fake_monotonic():
-        return ticks.pop(0) if ticks else 1.1
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
-    monkeypatch.setattr("src.agents.openai_runner.time.monotonic", fake_monotonic)
-    async def no_sleep(_seconds):
-        return None
-    monkeypatch.setattr("src.agents.openai_runner.asyncio.sleep", no_sleep)
     config = HarnessConfig(openai_base_url="https://example.test/v1", openai_api_key="test-key")
 
-    with pytest.raises(TimeoutError, match="total request budget"):
+    with pytest.raises(httpx.ConnectError, match="proxy unavailable"):
         await OpenAIHTTPClient(config, 1).complete(model="qwen-test", messages=[])
 
 

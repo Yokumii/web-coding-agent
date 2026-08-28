@@ -6,7 +6,9 @@ This repository is a simple reproduction of the frontend-oriented half of [Anthr
 
 The current implementation is intentionally **frontend-only**:
 
-- `planner` expands a short prompt into an ambitious product spec and a sprint plan
+- `planner` uses the full product/spec/Sprint path for from-zero Generate, but explicit atomic
+  Edit uses a dedicated one-call intent/check planner and derives legacy spec/feature/Sprint
+  compatibility files locally
 - optional `design` runs between planning and build when `design_mode=image-first`, producing design contracts and, when configured, image-backed visual references
 - `generator` builds a browser-based frontend app in `workdir/frontend`, one sprint at a time, in either `generate` or `repair` mode
 - harness-owned Playwright contracts test DOM, ARIA, internal state, navigation, and interaction
@@ -50,6 +52,14 @@ exploration is blocked. The objective includes multi-page, multi-file, and multi
 tasks. Passing unit tests demonstrates mechanical enforcement; real-model quality and
 cost still require separate small-case calibration.
 
+Explicit Edit and Repair no longer inherit the heavy Generate planning/context path.
+The Edit model receives only the atomic goal, ordered typed checks, Harness-derived DOM
+topology constraints, the allowed source cone, and bounded source windows. A failed
+round starts a fresh Repair call with no prior conversation: exact failed actions are
+reduced to selector-level repair directives plus a newly selected current-code window.
+Native OpenAI-compatible atomic edits use one exact-patch request per cycle; complex
+dependency-widening cases retain the bounded tool path.
+
 ## Status
 
 What is implemented:
@@ -77,8 +87,8 @@ What is implemented:
 - Accepted checkpoint tapes: passing typed flows are appended with requirement/impact metadata. Normal Edit validation replays impacted checks plus one critical sentinel per protected route; every fifth accepted Edit and legacy metadata trigger a full replay. `scripts/recover_accepted_tapes.py` reconstructs a missing tape only from immutable passing browser evidence. A lost accepted interaction is a real regression; malformed or over-budget tape banks are infrastructure failures.
 - Complete seed context for one-shot AIR task generation: up to 48 source files / 140K characters are included without truncation. Larger projects fail closed and must use the tool-reading harness path; partial context is never advertised as `all_files_included`.
 - Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. Target-local style atoms require an accepted target-route visual review because the functional oracle cannot judge CSS appearance. If only evidence policy changes, a later round keeps the source byte-identical and reuses the last matching applied-and-validated mutation ledger rather than paying the Generator to touch code again. New-policy exports require `certified` evidence with exact source/destination provenance.
-- First-class Edit execution: `--task-mode edit` freezes a clean existing frontend as the accepted Git baseline. The Planner emits one compact Edit card with exact instruction delta, requirement add/refine/replace/withdraw relations, impact tags, target routes/checks, conflict status, and visual-evidence policy. One coherent multi-page/multi-file Edit remains one Sprint; independent changes are split upstream.
-- Evidence-driven Repair: a reproduced deterministic failure bypasses the paid semantic judge and writes `repair_packet_round_N.json`. The next cycle receives only exact failed checks/regressions, evidence references, allowed source paths, and dynamic file/line budgets. An unidentifiable failure cannot start an open-ended Repair.
+- First-class Edit execution: `--task-mode edit` freezes a clean existing frontend as the accepted Git baseline. A dedicated atomic Planner authors only goal/source anchors/visual policy/typed checks; the Harness derives requirement lineage plus legacy spec/design-token/feature/Sprint views without more model calls. Ordered checks also derive hard DOM topology guidance such as keeping a repeatedly clicked control outside the target it hides. One coherent multi-page/multi-file Edit remains one Sprint; independent changes are split upstream.
+- Evidence-driven short-context Repair: a reproduced deterministic failure bypasses the paid semantic judge and writes `repair_packet_round_N.json`. The next cycle is an independent model call receiving only compact failed action evidence, selector-level derived repair directives, the current allowed source cone, and a fresh bounded source window. An unidentifiable failure cannot start an open-ended Repair.
 - User-supplied multimodal inputs: repeatable `--input` files are content-addressed under `.harness/inputs/`. Bounded text/source inputs are included in task context, while PNG/JPEG/WebP/GIF inputs are sent as native image blocks to Planner and Generator and as labeled references to the visual scorer. They are retained in image-edit v2 exports.
 - A provider-agnostic concurrent batch scheduler with per-case ports/timeouts, append-only status records, successful-case resume, optional verified seed preparation, Edit routes, and multimodal inputs.
 - A human-readable folder exporter layered on the strict trajectory exporter; it never reclassifies tasks from commit/sprint heuristics.
@@ -258,7 +268,11 @@ uv run harness "Add the reference filter only to the catalog page" \
 ```
 
 Edit mode refuses a dirty frontend, records or verifies `seed_manifest.json`, and writes
-`.harness/edit_task_contract.json` and `.harness/edit_card.json`. Multiple
+`.harness/edit_task_contract.json`, `.harness/atomic_edit_plan.json`, and
+`.harness/edit_card.json`. The model-authored atomic plan is deliberately smaller than
+the Generate plan; `.harness/spec.md`, design tokens, feature list, Sprint plan, and UI
+verification compatibility views are deterministically materialized for existing readers.
+Multiple
 `--target-route` values are a run-wide allowlist for the single coherent Edit Sprint;
 independent product changes must be split before entering the harness, and other routes
 remain protected.
@@ -300,7 +314,12 @@ harness-owned `.harness/edit_scope_round_N.json`, for example:
 The model cannot edit the policy, live-state, or ledger artifacts. The plan initially
 exposes only `source_change_cone.initial_paths` (normally one path, or one ranked entry
 for each target route in a coherent multi-route Edit). Those entries must be inspected
-before the exact unique patch sequence is attempted. After each real mutation,
+before the exact unique patch sequence is attempted. For a native atomic existing-file
+Edit with no dependency widening, `.harness/edit_context_round_N.json` supplies bounded
+source windows directly and the model returns exact patches in one request. The Harness
+normalizes harmless provider aliases/line-end whitespace, applies them transactionally,
+records usage before mutation, runs diff/syntax checks, and rolls back on failure.
+After each real mutation,
 the controller requires a syntax/diff/build/test checkpoint before an import/link neighbor
 can open; a successful checkpoint after the latest mutation is required before commit.
 Whole-file overwrite, unrelated or unplanned new source paths, broad patches, and
@@ -752,6 +771,18 @@ separate. It also exercises protected-route sentinels, target-named shared-state
 additions, computed-style evidence, and a real counterfactual `non_minimal` certificate.
 See [`docs/edit_harness_external_ideas_and_real_matrix_20260828.md`](docs/edit_harness_external_ideas_and_real_matrix_20260828.md)
 for the dated evidence and remaining gaps.
+
+Run the one-case real WebCompass full-source-vs-short-context comparison:
+
+```bash
+./scripts/run_webcompass_edit_ab_qwen.sh
+```
+
+The runner performs a cache precheck unless explicitly skipped, makes no paid automatic
+request retries, appends one result per arm, supports reusing completed bare/Harness arms,
+and validates both outputs with the same implementation-agnostic DOM interaction contract.
+See [`docs/webcompass_atomic_edit_ab_20260828.md`](docs/webcompass_atomic_edit_ab_20260828.md)
+for the calibrated case, token/cost boundary, and preserved failure evidence.
 
 ## License
 

@@ -575,7 +575,11 @@ def _planner_trace_written_artifacts(trace_path: Path) -> set[str]:
     try:
         for line in trace_path.read_text(encoding="utf-8").splitlines():
             event = json.loads(line)
-            if event.get("event") == "assistant":
+            if event.get("event") == "atomic_edit_plan":
+                artifact = event.get("artifact")
+                if isinstance(artifact, str):
+                    written.add(Path(artifact).name)
+            elif event.get("event") == "assistant":
                 for call in ((event.get("message") or {}).get("tool_calls") or []):
                     function = call.get("function") if isinstance(call, dict) else None
                     if not isinstance(function, dict) or function.get("name") not in {
@@ -625,11 +629,28 @@ def recover_trace_proven_planner_checkpoint(
 ) -> AgentRunStats | None:
     """Recover a valid, model-written plan after the process died before checkpointing."""
     trace_path = file_comm.dir / "traces" / "planner.jsonl"
-    if not trace_path.is_file() or not _PLANNER_TRACE_ARTIFACTS.issubset(
-        _planner_trace_written_artifacts(trace_path)
-    ):
+    if not trace_path.is_file():
         return None
+    edit_contract = read_edit_task_contract(file_comm.dir.parent)
+    written = _planner_trace_written_artifacts(trace_path)
     try:
+        if edit_contract is not None:
+            from src.orchestration.atomic_edit_plan import (
+                ATOMIC_EDIT_PLAN_NAME,
+                materialize_atomic_edit_compatibility_bundle,
+                read_atomic_edit_plan,
+            )
+
+            plan = read_atomic_edit_plan(file_comm.dir)
+            if plan is None or ATOMIC_EDIT_PLAN_NAME not in written:
+                return None
+            materialize_atomic_edit_compatibility_bundle(
+                file_comm=file_comm,
+                instruction_delta="Recovered atomic Edit",
+                plan=plan,
+            )
+        elif not _PLANNER_TRACE_ARTIFACTS.issubset(written):
+            return None
         _validate_planning_bundle(file_comm, config)
     except (PlannerValidationError, ValidationError, ValueError, OSError):
         return None

@@ -265,6 +265,7 @@ class FileComm:
         self._path("target_profile.json").unlink(missing_ok=True)
         self._path("edit_task_contract.json").unlink(missing_ok=True)
         self._path("edit_card.json").unlink(missing_ok=True)
+        self._path("atomic_edit_plan.json").unlink(missing_ok=True)
         self._unlink_matching(
             *_ROUND_TEXT_PATTERNS,
             *_ROUND_IMAGE_PATTERNS,
@@ -273,6 +274,7 @@ class FileComm:
         )
         for name in ("accepted_tapes.jsonl", "minimality_policy.json", "round_build_map.json"):
             self._path(name).unlink(missing_ok=True)
+        self._unlink_matching("edit_context_round_*.json")
 
         # 通过 schema 注册表删除 JSON 产物。
         for model in ALL_ARTIFACT_MODELS:

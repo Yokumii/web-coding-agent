@@ -2361,7 +2361,34 @@ class MinimalPathPolicy:
         self.max_touched_files = max(1, int(budgets.get("max_touched_files", 3)))
         self.state_path = self.workdir / ".harness" / state_name(self.round_num)
         state = _read_json(self.state_path, {})
-        self.observed_paths: set[str] = set(state.get("observed_paths") or [])
+        context = _read_json(
+            self.workdir / ".harness" / f"edit_context_round_{self.round_num}.json",
+            {},
+        )
+        self.preloaded_regions: dict[str, list[str]] = {}
+        if isinstance(context, dict) and context.get("schema_version") == "edit-context-v1":
+            for item in context.get("source_windows") or []:
+                if isinstance(item, dict) and item.get("path") and item.get("content"):
+                    self.preloaded_regions.setdefault(str(item["path"]), []).append(
+                        str(item["content"])
+                    )
+            for outline in context.get("source_outlines") or []:
+                if not isinstance(outline, dict) or not outline.get("path"):
+                    continue
+                for entry in outline.get("entries") or []:
+                    if isinstance(entry, dict) and entry.get("content"):
+                        self.preloaded_regions.setdefault(str(outline["path"]), []).append(
+                            str(entry["content"])
+                        )
+        historical_observed = set(state.get("observed_paths") or [])
+        self.tool_observed_paths: set[str] = set(
+            state.get("tool_observed_paths") or historical_observed
+        )
+        self.observed_paths: set[str] = (
+            historical_observed
+            | self.tool_observed_paths
+            | set(self.preloaded_regions)
+        )
         self.touched_paths: set[str] = set(state.get("touched_paths") or [])
         self.mutation_revision = int(state.get("mutation_revision") or 0)
         self.validation_attempt_revision = int(
@@ -2457,6 +2484,8 @@ class MinimalPathPolicy:
                 "owner": "harness",
                 "round": self.round_num,
                 "observed_paths": sorted(self.observed_paths),
+                "tool_observed_paths": sorted(self.tool_observed_paths),
+                "preloaded_paths": sorted(self.preloaded_regions),
                 "touched_paths": sorted(self.touched_paths),
                 "mutation_revision": self.mutation_revision,
                 "validation_attempt_revision": self.validation_attempt_revision,
@@ -2699,6 +2728,7 @@ class MinimalPathPolicy:
             _absolute, relative = resolved_path
             if relative.startswith("frontend/"):
                 self.observed_paths.add(relative)
+                self.tool_observed_paths.add(relative)
                 self._record(
                     decision="observe",
                     tool=tool,
@@ -2807,6 +2837,7 @@ class MinimalPathPolicy:
         owned_artifacts = {
             f".harness/{plan_name(self.round_num)}",
             f".harness/edit_scope_round_{self.round_num}.json",
+            f".harness/edit_context_round_{self.round_num}.json",
             f".harness/{ledger_name(self.round_num)}",
             f".harness/{state_name(self.round_num)}",
         }
@@ -2914,6 +2945,21 @@ class MinimalPathPolicy:
             )
 
         pairs = self._patch_pairs(tool, tool_input)
+        if (
+            pairs
+            and absolute.exists()
+            and relative in self.preloaded_regions
+            and relative not in self.tool_observed_paths
+        ):
+            snippets = self.preloaded_regions[relative]
+            unseen = [old for old, _new in pairs if not old or not any(old in snippet for snippet in snippets)]
+            if unseen:
+                return self._deny(
+                    tool,
+                    relative,
+                    "Exact patch text falls outside the Harness-preloaded source window. "
+                    "Read only the focused missing line range before widening the patch.",
+                )
         patch_lines = sum(
             max(len(old.splitlines()) or 1, len(new.splitlines()) or 1)
             for old, new in pairs

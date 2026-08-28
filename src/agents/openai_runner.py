@@ -200,55 +200,27 @@ class OpenAIHTTPClient:
         # opt-in environment switch without coupling generic OpenAI providers to it.
         if os.getenv("OPENAI_ENABLE_THINKING") == "0" and str(payload.get("model", "")).lower().startswith("qwen"):
             payload["enable_thinking"] = False
-        # The request budget is end-to-end.  In particular, do not let five
-        # individually timed-out proxy retries turn a 120s calibration request
-        # into a ten-minute cost/control failure.
-        deadline = time.monotonic() + self.timeout
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout),
             verify=os.getenv("SSL_NO_VERIFY") != "1",
             trust_env=True,
         ) as client:
-            for attempt in range(5):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"chat completion exhausted its {self.timeout:.0f}s total request budget"
-                    )
-                try:
-                    response = await client.post(
-                        base + "/chat/completions",
-                        headers={"Authorization": f"Bearer {key}"},
-                        json=payload,
-                        timeout=httpx.Timeout(remaining),
-                    )
-                except httpx.TransportError:
-                    # SOCKS/office-network connections occasionally fail before
-                    # an HTTP response exists. Treat this exactly like a 5xx:
-                    # retry the same idempotent chat request with bounded backoff.
-                    if attempt < 4:
-                        await asyncio.sleep(min(2 ** (attempt + 1), 16, max(0, deadline - time.monotonic())))
-                        continue
-                    raise
-                body = response.text[:2000]
-                provider_throttled = (
-                    "MPE-429" in body
-                    or "Throttling.BurstRate" in body
-                    or "limit_burst_rate" in body
+            # Paid requests are single-attempt. Transport errors, throttling,
+            # and provider failures must never cause an implicit duplicate call.
+            response = await client.post(
+                base + "/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json=payload,
+                timeout=httpx.Timeout(self.timeout),
+            )
+            body = response.text[:2000]
+            if response.is_error:
+                raise httpx.HTTPStatusError(
+                    f"{response.status_code} from chat completions: {body}",
+                    request=response.request,
+                    response=response,
                 )
-                retryable = response.status_code == 429 or response.status_code >= 500 or provider_throttled
-                if response.is_error and retryable and attempt < 4:
-                    delay = min(10 * (2 ** attempt), 60) if provider_throttled else min(2 ** (attempt + 1), 16)
-                    await asyncio.sleep(min(delay, max(0, deadline - time.monotonic())))
-                    continue
-                if response.is_error:
-                    raise httpx.HTTPStatusError(
-                        f"{response.status_code} from chat completions: {body}",
-                        request=response.request,
-                        response=response,
-                    )
-                return response.json()
-            raise RuntimeError("unreachable chat completion retry state")
+            return response.json()
 
 
 async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path, model: str,

@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from src.orchestration.minimality_runtime import (
+    _preservation_contract_passed,
     browser_target_outcome,
     certify_commit_pair,
     certify_round_minimality,
@@ -115,6 +116,26 @@ def test_browser_target_outcome_rejects_click_only_contract():
 
     assert outcome.status == "infrastructure_error"
     assert outcome.evidence["reason"] == "target_contract_has_no_assertion"
+
+
+def test_source_missing_target_additions_still_passes_preservation_dimension():
+    assert _preservation_contract_passed(
+        {
+            "passed": False,
+            "violations": [
+                {"fragment": "/::#new-toggle", "kind": "expected_addition_missing"}
+            ],
+        }
+    ) is True
+    assert _preservation_contract_passed(
+        {
+            "passed": False,
+            "violations": [
+                {"fragment": "/::#new-toggle", "kind": "expected_addition_missing"},
+                {"fragment": "/::main", "kind": "semantic_changed"},
+            ],
+        }
+    ) is False
 
 
 def test_visual_review_covers_style_atom_missing_from_functional_oracle(

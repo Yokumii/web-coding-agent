@@ -29,7 +29,7 @@ export EVALUATOR_VISION_ENDPOINT_TYPE="openai"
 # request must become an explicit infrastructure failure instead of consuming
 # the remainder of a calibration case.
 export EVALUATOR_VISION_TIMEOUT_SECONDS="${EVALUATOR_VISION_TIMEOUT_SECONDS:-120}"
-export EVALUATOR_VISION_MAX_RETRIES="${EVALUATOR_VISION_MAX_RETRIES:-1}"
+export EVALUATOR_VISION_MAX_RETRIES="${EVALUATOR_VISION_MAX_RETRIES:-0}"
 export PLAYWRIGHT_HEADLESS="1"
 # Calibration cases must fail explicitly rather than leaving an unavailable API
 # request alive for fifteen minutes. Callers may raise these limits for a

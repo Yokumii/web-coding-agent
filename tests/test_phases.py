@@ -460,6 +460,42 @@ async def test_run_planner_phase_survives_delayed_cancellation(monkeypatch, tmp_
 
 
 @pytest.mark.anyio
+async def test_run_planner_phase_uses_dedicated_atomic_path_for_edit(
+    monkeypatch, tmp_path: Path
+):
+    ctx = _make_ctx(tmp_path)
+    (ctx.file_comm.dir / "edit_task_contract.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "edit-task-contract-v1",
+                "task_mode": "edit",
+                "requested_target_routes": ["/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    async def fake_atomic(config, user_prompt, file_comm, workdir):
+        del config, user_prompt, file_comm, workdir
+        calls.append("atomic")
+        return _stats(0.01)
+
+    async def forbidden_general(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("explicit Edit must not use the full Generate planner")
+
+    monkeypatch.setattr("src.orchestration.phases.run_atomic_edit_planner", fake_atomic)
+    monkeypatch.setattr("src.orchestration.phases.run_planner", forbidden_general)
+    monkeypatch.setattr("src.orchestration.phases.materialize_edit_card", lambda **_: None)
+
+    await run_planner_phase(ctx)
+
+    assert calls == ["atomic"]
+    assert ctx.file_comm.read_state()["last_completed_phase"] == "plan"
+
+
+@pytest.mark.anyio
 async def test_run_build_phase_does_not_auto_commit(monkeypatch, tmp_path: Path):
     ctx = _make_ctx(tmp_path)
     parent_task: asyncio.Task | None = None

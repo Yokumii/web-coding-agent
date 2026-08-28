@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import re
 import subprocess
+import time
 from typing import Any, Literal
 
 from src.agents._shared import expose_local_claude_skills
@@ -13,9 +14,11 @@ from src.agents.sdk_runner import (
     build_agent_run_stats,
     run_sdk_agent,
 )
+from src.agents.openai_runner import OpenAIHTTPClient
 from src.config import HarnessConfig
 from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.edit_dom_guard import repair_baseline_name
+from src.orchestration.edit_context import read_edit_context, render_edit_context
 from src.orchestration.file_comm import FileComm
 from src.orchestration.git_journal import ensure_repo
 from src.orchestration.minimal_path_guidance import MinimalPathPolicy, plan_name
@@ -26,12 +29,17 @@ from src.orchestration.target_profile import (
     validate_target_submission,
 )
 from src.orchestration.task_inputs import (
+    openai_user_content,
     task_input_image_paths,
     task_input_prompt_context,
 )
+from src.orchestration.pricing import estimate_cost_usd
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
+from src.prompts.edit import EDIT_SYSTEM_PROMPT
+from src.prompts.repair import REPAIR_SYSTEM_PROMPT
 from src.prompts.grading import criterion_threshold
 from src.utils.logger import get_logger
+from src.utils.llm_json import extract_json_object
 
 logger = get_logger(__name__)
 
@@ -46,6 +54,327 @@ _GENERATE_REQUIRED_READS = (
 _MAX_REPAIR_FILES = 4
 _MAX_REPAIR_CHANGED_LINES = 1000
 _REMOTE_URL_RE = re.compile(r"https?://[^\s'\"<>),]+", re.IGNORECASE)
+
+
+def _native_openai_runtime(config: HarnessConfig) -> bool:
+    runtime = config.agent_runtime.strip().lower()
+    model = config.generator_model.strip().lower()
+    return runtime == "openai" or (
+        runtime == "auto"
+        and model.startswith(("deepseek", "qwen", "gpt-", "o1", "o3", "o4"))
+    )
+
+
+def _normalize_atomic_patch_response(payload: dict[str, Any]) -> list[dict[str, str]]:
+    def _strip_trailing_horizontal_whitespace(value: str) -> str:
+        return re.sub(r"(?m)[ \t]+(?=\r?$)", "", value)
+
+    patches: list[dict[str, str]] = []
+    for item in payload.get("patches") or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().replace("\\", "/")
+        if path and not path.startswith("frontend/"):
+            path = f"frontend/{path}"
+        patches.append(
+            {
+                "path": path,
+                "old_text": str(item.get("old_text", item.get("search", ""))),
+                "new_text": _strip_trailing_horizontal_whitespace(
+                    str(item.get("new_text", item.get("replace", "")))
+                ),
+            }
+        )
+    if not patches:
+        raise ValueError("atomic Edit executor returned no exact patches")
+    return patches
+
+
+def _control_topology_invariants(
+    checks: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Derive concrete DOM placement constraints from ordered browser actions."""
+    output: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for check in checks:
+        route = str(check.get("route") or "/")
+        actions = [item for item in check.get("actions") or [] if isinstance(item, dict)]
+        for index, action in enumerate(actions):
+            if action.get("action") != "assert_hidden" or not action.get("selector"):
+                continue
+            target = str(action["selector"])
+            for later in actions[index + 1 :]:
+                if (
+                    later.get("action") == "assert_visible"
+                    and later.get("selector") == target
+                ):
+                    break
+                if later.get("action") != "click" or not later.get("selector"):
+                    continue
+                control = str(later["selector"])
+                key = (route, control, target)
+                if key in seen:
+                    continue
+                seen.add(key)
+                output.append(
+                    {
+                        "route": route,
+                        "control_selector": control,
+                        "hidden_target_selector": target,
+                        "constraint": "control_must_not_be_descendant_of_hidden_target",
+                    }
+                )
+    return output
+
+
+def _render_control_topology_directives(
+    invariants: list[dict[str, str]],
+) -> str:
+    if not invariants:
+        return "(none)"
+    return "\n".join(
+        "- HARD: insert {control} before the opening element for {target}, as a sibling; "
+        "never place {control} between that target's opening and closing tags. Toggle the "
+        "visibility of {target} itself, while {control} remains visible.".format(
+            control=item["control_selector"],
+            target=item["hidden_target_selector"],
+        )
+        for item in invariants
+    )
+
+
+def _render_failed_action_directives(
+    repair_packet: dict[str, Any], checks: list[dict[str, Any]]
+) -> str:
+    checks_by_id = {str(item.get("id")): item for item in checks}
+    directives: list[str] = []
+    for failure in repair_packet.get("failed_checks") or []:
+        if not isinstance(failure, dict):
+            continue
+        check = checks_by_id.get(str(failure.get("check_id"))) or {}
+        actions = [item for item in check.get("actions") or [] if isinstance(item, dict)]
+        steps = [item for item in failure.get("steps") or [] if isinstance(item, dict)]
+        for index, step in enumerate(steps):
+            if step.get("ok") is not False or index >= len(actions):
+                continue
+            action = actions[index]
+            kind = str(action.get("action") or step.get("action") or "")
+            target = str(action.get("selector") or "")
+            preceding_control = next(
+                (
+                    str(actions[prior].get("selector"))
+                    for prior in range(index - 1, -1, -1)
+                    if actions[prior].get("action") == "click"
+                    and actions[prior].get("selector")
+                ),
+                "",
+            )
+            if kind == "assert_hidden" and target and preceding_control:
+                directives.append(
+                    f"- HARD: clicking {preceding_control} left {target} visible. "
+                    f"Fix {preceding_control}'s event handler so it hides {target}. "
+                    f"Do not only change {target}'s initial style."
+                )
+            elif kind == "assert_visible" and target and preceding_control:
+                directives.append(
+                    f"- HARD: clicking {preceding_control} left {target} hidden. "
+                    f"Fix {preceding_control}'s event handler so it shows {target}."
+                )
+            elif kind == "click" and target:
+                directives.append(
+                    f"- HARD: {target} was not actionable at its required click step; "
+                    "keep it visible, enabled, and outside any element hidden earlier in the check."
+                )
+    return "\n".join(dict.fromkeys(directives)) or "(no additional derived directive)"
+
+
+def _atomic_executor_eligible(
+    *, config: HarnessConfig, workdir: Path, round_num: int
+) -> bool:
+    if not _native_openai_runtime(config):
+        return False
+    context = read_edit_context(workdir / ".harness", round_num)
+    plan_path = workdir / ".harness" / plan_name(round_num)
+    if not context or not plan_path.is_file():
+        return False
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    cone = plan.get("source_change_cone") or {}
+    return not (cone.get("planned_new_paths") or cone.get("dependency_paths"))
+
+
+async def _run_atomic_patch_executor(
+    *,
+    config: HarnessConfig,
+    file_comm: FileComm,
+    workdir: Path,
+    round_num: int,
+    mode: GeneratorMode,
+    prompt: str,
+    baseline_commit: str,
+    mutation_policy: MinimalPathPolicy,
+) -> AgentRunStats:
+    """One model request proposes exact patches; the Harness applies them transactionally."""
+    trace_path = RoundArtifacts(file_comm, round_num).trace_path("generator")
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    system_prompt = (
+        (REPAIR_SYSTEM_PROMPT if mode == "repair" else EDIT_SYSTEM_PROMPT)
+        + "\nReturn JSON only as {\"patches\":[{\"path\":...,\"search\":...,\"replace\":...}]}. "
+        "Use only exact source text visible in the supplied windows. Do not describe commands or return full files."
+    )
+    content: str | list[dict[str, Any]] = prompt
+    images = task_input_image_paths(workdir)
+    if images:
+        content = openai_user_content(prompt, images)
+    client = OpenAIHTTPClient(config, config.agent_request_timeout_seconds)
+    started = time.monotonic()
+    response = await client.complete(
+        model=config.generator_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        temperature=0,
+        max_tokens=4096,
+    )
+    message = (response.get("choices") or [{}])[0].get("message") or {}
+    raw = str(message.get("content") or "")
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    frontend = workdir / "frontend"
+    originals: dict[Path, str] = {}
+    changed_paths: list[str] = []
+    with trace_path.open("a", encoding="utf-8") as trace:
+        trace.write(json.dumps({
+            "event": "run_start",
+            "model": config.generator_model,
+            "phase": "atomic_edit_executor",
+            "prompt": prompt,
+            "image_paths": [str(path) for path in images],
+        }, ensure_ascii=False) + "\n")
+        trace.write(json.dumps({
+            "event": "assistant_response",
+            "content": raw,
+        }, ensure_ascii=False) + "\n")
+        trace.write(json.dumps({
+            "event": "usage",
+            "request_usage": usage,
+            "attempt_usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "cumulative_usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "estimated_cost_usd": estimate_cost_usd(config.generator_model, usage),
+        }, ensure_ascii=False) + "\n")
+        trace.flush()
+        patches = _normalize_atomic_patch_response(extract_json_object(raw))
+        try:
+            for patch in patches:
+                relative = patch["path"]
+                target = (workdir / relative).resolve()
+                try:
+                    target.relative_to(workdir.resolve())
+                except ValueError as exc:
+                    raise ValueError(f"atomic patch escapes workdir: {relative}") from exc
+                if not target.is_file():
+                    raise ValueError(f"atomic patch targets missing source: {relative}")
+                tool_input = {
+                    "path": relative,
+                    "old_text": patch["old_text"],
+                    "new_text": patch["new_text"],
+                }
+                denial = mutation_policy.check("apply_patch", tool_input)
+                if denial:
+                    raise ValueError(denial)
+                current = target.read_text(encoding="utf-8")
+                if not patch["old_text"] or current.count(patch["old_text"]) != 1:
+                    raise ValueError(f"atomic patch is not unique in {relative}")
+                originals.setdefault(target, current)
+                target.write_text(
+                    current.replace(patch["old_text"], patch["new_text"], 1),
+                    encoding="utf-8",
+                )
+                mutation_policy.observe_result(
+                    "apply_patch", tool_input, ok=True, output="applied"
+                )
+                changed_paths.append(relative.removeprefix("frontend/"))
+                trace.write(json.dumps({
+                    "event": "tool",
+                    "name": "apply_patch",
+                    "ok": True,
+                    "path": relative,
+                }, ensure_ascii=False) + "\n")
+                trace.flush()
+            diff_check = subprocess.run(
+                ["git", "diff", "--check"],
+                cwd=frontend,
+                text=True,
+                capture_output=True,
+            )
+            mutation_policy.observe_validation(
+                ok=diff_check.returncode == 0,
+                output=diff_check.stdout + diff_check.stderr,
+                tool="git diff --check",
+            )
+            if diff_check.returncode != 0:
+                raise RuntimeError(diff_check.stdout + diff_check.stderr)
+            for path in sorted(set(changed_paths)):
+                if Path(path).suffix.lower() in {".js", ".mjs", ".cjs"}:
+                    syntax = subprocess.run(
+                        ["node", "--check", path],
+                        cwd=frontend,
+                        text=True,
+                        capture_output=True,
+                    )
+                    if syntax.returncode != 0:
+                        raise RuntimeError(syntax.stdout + syntax.stderr)
+            subprocess.run(
+                ["git", "add", "--", *sorted(set(changed_paths))],
+                cwd=frontend,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            prefix = "fix" if mode == "repair" else "feat"
+            commit = subprocess.run(
+                [
+                    "git", "-c", "commit.gpgsign=false", "commit", "-m",
+                    f"{prefix}(atomic-edit): apply scoped frontend transition",
+                ],
+                cwd=frontend,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            trace.write(json.dumps({
+                "event": "tool",
+                "name": "run_command",
+                "ok": True,
+                "output": commit.stdout.strip(),
+            }, ensure_ascii=False) + "\n")
+        except Exception:
+            for target, original in originals.items():
+                target.write_text(original, encoding="utf-8")
+            if changed_paths:
+                subprocess.run(
+                    ["git", "reset", "--quiet", "HEAD", "--", *sorted(set(changed_paths))],
+                    cwd=frontend,
+                    text=True,
+                    capture_output=True,
+                )
+            raise
+        trace.flush()
+    file_comm.write_build_log(
+        f"# Atomic {mode.title()}\n\nRound: {round_num}\nPatches: {len(patches)}\n"
+    )
+    file_comm.append_progress_entry(
+        f"## Round {round_num}\n\nApplied {len(patches)} model-authored exact patches in one bounded request."
+    )
+    return AgentRunStats(
+        cost_usd=estimate_cost_usd(config.generator_model, usage),
+        duration_ms=int((time.monotonic() - started) * 1000),
+        duration_api_ms=None,
+        token_usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
+        usage=usage,
+        model_usage={},
+    )
 
 
 class _ExternalRuntimeResourceParser(HTMLParser):
@@ -984,6 +1313,148 @@ def _build_generator_prompt(
     has_repair_frame = mode == "repair" and repair_frame_path.is_file()
     minimal_path_ref = f".harness/{plan_name(round_num)}"
     minimal_path_owned = (file_comm.dir / plan_name(round_num)).is_file()
+    edit_context = read_edit_context(file_comm.dir, round_num)
+    if mode == "generate" and is_forward_edit and minimal_path_owned and edit_context:
+        plan = json.loads(
+            (file_comm.dir / plan_name(round_num)).read_text(encoding="utf-8")
+        )
+        checks = []
+        verification_plan = file_comm.read_ui_verification_plan() or {}
+        for sprint in verification_plan.get("sprints") or []:
+            if int(sprint.get("sprint") or 0) == sprint_num:
+                checks.extend(sprint.get("checks") or [])
+        compact_checks = [
+            {
+                "id": item.get("id"),
+                "route": item.get("route") or "/",
+                "actions": item.get("actions") or [],
+            }
+            for item in checks
+        ]
+        topology_invariants = _control_topology_invariants(compact_checks)
+        compact_scope = {
+            "target_routes": (plan.get("route_scope") or {}).get("target_routes") or [],
+            "initial_paths": (plan.get("source_change_cone") or {}).get("initial_paths") or [],
+            "max_patch_lines": (plan.get("budgets") or {}).get("max_patch_lines"),
+            "max_touched_files": (plan.get("budgets") or {}).get("max_touched_files"),
+        }
+        dependencies = (plan.get("source_change_cone") or {}).get("dependency_paths") or []
+        guarded = (plan.get("source_change_cone") or {}).get("guarded_shared_regions") or []
+        if dependencies:
+            compact_scope["dependency_paths"] = dependencies
+        if guarded:
+            compact_scope["guarded_shared_regions"] = guarded
+        return (
+            "Mode: edit\nTrajectory Role: incremental_edit\n"
+            f"Round: {round_num}\nSprint: {sprint_num}\n"
+            f"Goal: {sprint_context.get('goal')}\n"
+            "\n## Target browser checks\n\n"
+            + json.dumps(compact_checks, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n## Hard DOM topology invariants\n\n"
+            + json.dumps(topology_invariants, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+            + _render_control_topology_directives(topology_invariants)
+            + "\n\n## Allowed source cone\n\n"
+            + json.dumps(compact_scope, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n"
+            + render_edit_context(edit_context)
+            + "\n\nDo not read planning artifacts: their complete relevant content is above. "
+            "Make the smallest exact patch inside the shown source; do not read the whole file. "
+            "If a control is clicked again after another selector is asserted hidden, the control "
+            "must remain outside that hidden target so the later click stays actionable."
+        )
+    if mode == "repair" and minimal_path_owned and edit_context:
+        if not isinstance(prior_grades, dict):
+            raise RuntimeError(
+                f"Generator repair mode requires grade_round_{round_num - 1}.json"
+            )
+        plan = json.loads(
+            (file_comm.dir / plan_name(round_num)).read_text(encoding="utf-8")
+        )
+        repair_packet_path = file_comm.dir / f"repair_packet_round_{round_num - 1}.json"
+        repair_packet = (
+            json.loads(repair_packet_path.read_text(encoding="utf-8"))
+            if repair_packet_path.is_file()
+            else {}
+        )
+        compact_packet = {
+            "failed_checks": [
+                {
+                    "check_id": item.get("check_id"),
+                    "route": item.get("route") or "/",
+                    "steps": [
+                        {
+                            key: (
+                                str(step.get(key) or "")[:400]
+                                if key == "error"
+                                else step.get(key)
+                            )
+                            for key in ("action", "ok", "output", "error")
+                            if step.get(key) is not None
+                        }
+                        for step in item.get("steps") or []
+                        if isinstance(step, dict)
+                    ],
+                }
+                for item in repair_packet.get("failed_checks") or []
+                if isinstance(item, dict)
+            ],
+            "bugs": repair_packet.get("bugs") or [],
+            "required_actions": repair_packet.get("required_actions") or [],
+            "allowed_source_paths": repair_packet.get("allowed_source_paths") or [],
+        }
+        checks = []
+        verification_plan = file_comm.read_ui_verification_plan() or {}
+        for sprint in verification_plan.get("sprints") or []:
+            if int(sprint.get("sprint") or 0) == sprint_num:
+                checks.extend(sprint.get("checks") or [])
+        compact_checks = [
+            {
+                "id": item.get("id"),
+                "route": item.get("route") or "/",
+                "actions": item.get("actions") or [],
+            }
+            for item in checks
+        ]
+        topology_invariants = _control_topology_invariants(compact_checks)
+        failure_directives = _render_failed_action_directives(
+            repair_packet, compact_checks
+        )
+        compact_scope = {
+            "target_routes": (plan.get("route_scope") or {}).get("target_routes") or [],
+            "initial_paths": (plan.get("source_change_cone") or {}).get("initial_paths") or [],
+            "max_patch_lines": (plan.get("budgets") or {}).get("max_patch_lines"),
+            "max_touched_files": (plan.get("budgets") or {}).get("max_touched_files"),
+        }
+        dependencies = (plan.get("source_change_cone") or {}).get("dependency_paths") or []
+        guarded = (plan.get("source_change_cone") or {}).get("guarded_shared_regions") or []
+        if dependencies:
+            compact_scope["dependency_paths"] = dependencies
+        if guarded:
+            compact_scope["guarded_shared_regions"] = guarded
+        return (
+            f"Mode: repair\nTrajectory Role: repair\nRound: {round_num}\nSprint: {sprint_num}\n"
+            f"Goal: {sprint_context.get('goal')}\n\n"
+            "## Reproduced failure packet\n\n"
+            + json.dumps(compact_packet, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n## Derived repair directives\n\n"
+            + failure_directives
+            + "\n\n## Target browser checks\n\n"
+            + json.dumps(compact_checks, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n## Hard DOM topology invariants\n\n"
+            + json.dumps(topology_invariants, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+            + _render_control_topology_directives(topology_invariants)
+            + "\n\n## Allowed source cone\n\n"
+            + json.dumps(compact_scope, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n"
+            + render_edit_context(edit_context)
+            + "\n\nThe code above is already inspected for exact patches inside the shown windows. "
+            "Do not reread planning, grade, or shown code. "
+            "If a required patch is outside a shown window, read only that focused missing range. "
+            "Make one exact minimal patch, run the smallest validation, and create one atomic fix commit. "
+            "The next Harness evaluation verifies the result; do not self-report success or add new features."
+        )
     trajectory_role = (
         "repair"
         if mode == "repair"
@@ -1023,8 +1494,9 @@ def _build_generator_prompt(
             f"- FIRST read `{minimal_path_ref}`. The harness already materialized "
             f"`.harness/edit_scope_round_{round_num}.json` and a live minimal-path state; do not "
             "create, copy, or edit those harness-owned artifacts.\n",
-            "- Inspect only `source_change_cone.initial_paths` first. The tool layer requires a "
-            "successful read of that exact file before it accepts an exact patch.\n",
+            "- The Harness-selected source window below is already inspected. Exact patches wholly "
+            "inside it do not need another source read; inspect only a focused missing line range "
+            "when the required patch falls outside the preloaded window.\n",
             "- Read `design_system_context` in the same plan. Reuse its existing CSS custom "
             "properties for target-local styling before introducing literal visual values or "
             "new tokens. This is guidance; browser evidence still decides behavior and state.\n",
@@ -1057,6 +1529,7 @@ def _build_generator_prompt(
             "protocol, but do not wrap or rewrite an accepted page script to make the new route run.\n",
             "- This is an execution policy enforced by the harness. The later counterfactual "
             "certificate remains an independent final check.\n",
+            "\n" + render_edit_context(edit_context) + "\n" if edit_context else "",
         ])
     if is_forward_edit and not minimal_path_owned:
         try:
@@ -1451,13 +1924,49 @@ async def run_generator(
         if config.minimal_path_guidance_enabled
         else None
     )
+    if mutation_policy is not None and _atomic_executor_eligible(
+        config=config, workdir=workdir, round_num=round_num
+    ):
+        stats = await _run_atomic_patch_executor(
+            config=config,
+            file_comm=file_comm,
+            workdir=workdir,
+            round_num=round_num,
+            mode=mode,
+            prompt=user_msg,
+            baseline_commit=baseline_commit,
+            mutation_policy=mutation_policy,
+        )
+        completion_gate = _make_generator_stop_hook(
+            frontend_dir,
+            baseline_commit,
+            mode,
+            workdir,
+            round_num,
+            target_profile,
+            scope_contract_only=scope_contract_only,
+            mutation_policy=mutation_policy,
+        )
+        gate_result = await completion_gate(None, None, None)
+        if gate_result.get("decision") == "block":
+            raise RuntimeError(str(gate_result.get("reason") or "atomic Edit validation failed"))
+        _validate_generator_outputs(file_comm, workdir, "atomic Edit applied")
+        return stats
 
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
         prompt=user_msg,
         config=config,
         workdir=workdir,
         model=config.generator_model,
-        system_prompt=GENERATOR_SYSTEM_PROMPT,
+        system_prompt=(
+            REPAIR_SYSTEM_PROMPT
+            if mode == "repair" and read_edit_context(file_comm.dir, round_num)
+            else EDIT_SYSTEM_PROMPT
+            if mode == "generate"
+            and (workdir / "seed_manifest.json").is_file()
+            and read_edit_context(file_comm.dir, round_num)
+            else GENERATOR_SYSTEM_PROMPT
+        ),
         max_turns=config.generator_max_turns,
         allow_bash=True,
         stop_hooks=[_make_generator_stop_hook(

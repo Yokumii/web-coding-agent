@@ -6,11 +6,16 @@ import pytest
 from claude_agent_sdk.types import ResultMessage
 
 from src.agents.generator import (
+    _control_topology_invariants,
+    _atomic_executor_eligible,
     _build_generator_prompt,
     _checkpoint_interrupted_model_work,
     _describe_failures,
     _is_scope_contract_only_repair,
     _is_harness_checkpoint_for_round,
+    _normalize_atomic_patch_response,
+    _render_control_topology_directives,
+    _render_failed_action_directives,
     _validate_generator_commits,
     _validate_no_external_runtime_dependencies,
     _validate_minimal_path_final_diff,
@@ -740,6 +745,148 @@ def test_generator_system_prompt_limits_validation_and_git_workflow():
     assert "You own the Git history and decide when to commit" not in prompt
 
 
+def test_atomic_executor_normalizes_existing_file_exact_patches():
+    assert _normalize_atomic_patch_response(
+        {
+            "patches": [
+                {
+                    "path": "index.html",
+                    "search": "<h2>Before</h2>",
+                    "replace": "<h2>After</h2>",
+                }
+            ]
+        }
+    ) == [
+        {
+            "path": "frontend/index.html",
+            "old_text": "<h2>Before</h2>",
+            "new_text": "<h2>After</h2>",
+        }
+    ]
+
+
+def test_atomic_executor_removes_whitespace_only_lines_from_replacement():
+    patches = _normalize_atomic_patch_response(
+        {
+            "patches": [
+                {
+                    "path": "index.html",
+                    "search": "<div>Before</div>",
+                    "replace": "<div>After</div>\n    \n\t\n<p>Done</p>",
+                }
+            ]
+        }
+    )
+
+    assert patches[0]["new_text"] == "<div>After</div>\n\n\n<p>Done</p>"
+
+
+def test_atomic_executor_removes_trailing_horizontal_whitespace_from_code_lines():
+    patches = _normalize_atomic_patch_response(
+        {
+            "patches": [
+                {
+                    "path": "index.html",
+                    "search": "<button>Before</button>",
+                    "replace": "<button   \n  type=\"button\" \t\n>After</button>",
+                }
+            ]
+        }
+    )
+
+    assert patches[0]["new_text"] == (
+        "<button\n  type=\"button\"\n>After</button>"
+    )
+
+
+def test_hidden_target_contract_derives_concrete_control_placement_invariant():
+    checks = [
+        {
+            "id": "toggle",
+            "route": "/",
+            "actions": [
+                {"action": "click", "selector": "#control"},
+                {"action": "assert_hidden", "selector": "#target"},
+                {"action": "click", "selector": "#control"},
+                {"action": "assert_visible", "selector": "#target"},
+            ],
+        }
+    ]
+
+    assert _control_topology_invariants(checks) == [
+        {
+            "route": "/",
+            "control_selector": "#control",
+            "hidden_target_selector": "#target",
+            "constraint": "control_must_not_be_descendant_of_hidden_target",
+        }
+    ]
+    directives = _render_control_topology_directives(
+        _control_topology_invariants(checks)
+    )
+    assert "insert #control before the opening element for #target" in directives
+    assert "never place #control between that target's opening and closing tags" in directives
+
+
+def test_repair_packet_derives_selector_level_handler_instruction():
+    checks = [
+        {
+            "id": "toggle",
+            "actions": [
+                {"action": "click", "selector": "#control"},
+                {"action": "assert_hidden", "selector": "#target"},
+            ],
+        }
+    ]
+    packet = {
+        "failed_checks": [
+            {
+                "check_id": "toggle",
+                "steps": [
+                    {"action": "click", "ok": True},
+                    {"action": "assert_hidden", "ok": False},
+                ],
+            }
+        ]
+    }
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "clicking #control left #target visible" in directives
+    assert "Fix #control's event handler" in directives
+    assert "Do not only change #target's initial style" in directives
+
+
+def test_atomic_executor_requires_native_runtime_and_no_dependency_widening(
+    tmp_path: Path,
+):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_context_round_1.json").write_text(
+        '{"schema_version":"edit-context-v1","source_windows":[]}',
+        encoding="utf-8",
+    )
+    (harness / "minimal_path_plan_round_1.json").write_text(
+        '{"source_change_cone":{"dependency_paths":[],"planned_new_paths":[]}}',
+        encoding="utf-8",
+    )
+
+    assert _atomic_executor_eligible(
+        config=HarnessConfig(agent_runtime="openai", generator_model="qwen-test"),
+        workdir=tmp_path,
+        round_num=1,
+    ) is True
+    (harness / "minimal_path_plan_round_1.json").write_text(
+        '{"source_change_cone":{"dependency_paths":["frontend/app.js"],"planned_new_paths":[]}}',
+        encoding="utf-8",
+    )
+    assert _atomic_executor_eligible(
+        config=HarnessConfig(agent_runtime="openai", generator_model="qwen-test"),
+        workdir=tmp_path,
+        round_num=1,
+    ) is False
+
+
 @pytest.mark.anyio
 async def test_generator_generate_mode_reads_previous_feedback_when_present(
     monkeypatch, tmp_path: Path
@@ -1091,6 +1238,90 @@ def test_repair_prompt_reads_non_minimal_certificate_artifact(tmp_path: Path):
     assert "failed source did not render" in prompt
 
 
+def test_minimal_path_repair_uses_independent_preloaded_short_context(tmp_path: Path):
+    import json
+
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_grades(
+        1,
+        {
+            "round": 1,
+            "sprint": 1,
+            "criteria": {},
+            "overall_passed": False,
+            "bugs_found": ["The save button leaves the status text unchanged."],
+            "repair_instructions": ["Update the status text after save."],
+        },
+    )
+    (file_comm.dir / "minimal_path_plan_round_2.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "minimal-path-plan-v4",
+                "round": 2,
+                "route_scope": {"target_routes": ["/settings.html"]},
+                "source_change_cone": {
+                    "initial_paths": ["frontend/settings.js"],
+                    "dependency_paths": [],
+                    "guarded_shared_regions": [],
+                },
+                "budgets": {"max_patch_lines": 20, "max_touched_files": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (file_comm.dir / "repair_packet_round_1.json").write_text(
+        json.dumps({"status": "repairable", "failed_checks": ["UI-SAVE"]}),
+        encoding="utf-8",
+    )
+    (file_comm.dir / "edit_context_round_2.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "edit-context-v1",
+                "round": 2,
+                "source_windows": [
+                    {
+                        "path": "frontend/settings.js",
+                        "start_line": 10,
+                        "end_line": 12,
+                        "content": "save.addEventListener('click', () => status.textContent = 'Old');\n",
+                    }
+                ],
+                "exposure": {
+                    "full_source_chars": 10000,
+                    "exposed_source_chars": 70,
+                    "ratio": 0.007,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prompt = _build_generator_prompt(
+        mode="repair",
+        file_comm=file_comm,
+        round_num=2,
+        sprint_num=1,
+        sprint_context={
+            "title": "Save status",
+            "feature_ids": ["F001"],
+            "goal": "Repair status feedback",
+            "deliverables": [],
+            "exit_criteria": [],
+        },
+        accepted_sprints={"accepted": []},
+    )
+
+    assert "Harness-selected source context" in prompt
+    assert "save.addEventListener" in prompt
+    assert "0.7%" in prompt
+    assert "Do not reread planning, grade, or shown code" in prompt
+    assert "### Failed criteria" not in prompt
+    assert '"task":' not in prompt
+    assert "Required minimal reads:" not in prompt
+    assert "pending asynchronous work" not in prompt
+
+
 def test_non_forward_repair_prompt_uses_failed_source_semantic_frame(tmp_path: Path):
     import json
 
@@ -1175,6 +1406,76 @@ def test_forward_prompt_consumes_harness_owned_minimal_path_plan(tmp_path: Path)
     assert "planned_companion_path" in prompt
     assert "do not wrap or rewrite an accepted page script" in prompt
     assert "write `.harness/edit_scope_round_1.json`" not in prompt
+
+
+def test_explicit_edit_uses_compact_preloaded_implementation_prompt(tmp_path: Path):
+    import json
+
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    (tmp_path / "seed_manifest.json").write_text("{}", encoding="utf-8")
+    (file_comm.dir / "minimal_path_plan_round_1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "minimal-path-plan-v3",
+                "round": 1,
+                "route_scope": {"target_routes": ["/"]},
+                "source_change_cone": {
+                    "initial_paths": ["frontend/index.html"],
+                    "dependency_paths": [],
+                    "guarded_shared_regions": [],
+                },
+                "budgets": {"max_patch_lines": 20, "max_touched_files": 1},
+                "design_system_context": {"css_custom_properties": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (file_comm.dir / "edit_context_round_1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "edit-context-v1",
+                "source_windows": [],
+                "source_outlines": [
+                    {
+                        "path": "frontend/index.html",
+                        "entries": [{"line": 90, "content": "<h2>Public Transit</h2>"}],
+                    }
+                ],
+                "exposure": {
+                    "full_source_chars": 10000,
+                    "exposed_source_chars": 23,
+                    "ratio": 0.0023,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prompt = _build_generator_prompt(
+        mode="generate",
+        file_comm=file_comm,
+        round_num=1,
+        sprint_num=1,
+        sprint_context={
+            "title": "Transit toggle",
+            "goal": "Toggle Public Transit",
+            "feature_ids": ["EDIT-001"],
+            "deliverables": ["Toggle control"],
+            "exit_criteria": ["Show and hide"],
+        },
+        accepted_sprints={"accepted": []},
+    )
+
+    assert "Mode: edit" in prompt
+    assert "<h2>Public Transit</h2>" in prompt
+    assert "Do not read planning artifacts" in prompt
+    assert "Deliverables:" not in prompt
+    assert "Exit criteria:" not in prompt
+    assert "expected_result" not in prompt
+    assert "existing_css_tokens" not in prompt
+    assert "must remain outside that hidden target" in prompt
+    assert "Required Reads:" not in prompt
 
 
 def test_scope_contract_only_repair_requires_all_product_checks_to_pass():

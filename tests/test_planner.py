@@ -234,6 +234,76 @@ def test_planner_checkpoint_recovery_requires_every_semantic_artifact_in_trace(
     assert recover_trace_proven_planner_checkpoint(file_comm, HarnessConfig()) is None
 
 
+def test_atomic_edit_planner_checkpoint_recovers_from_single_semantic_artifact(
+    tmp_path: Path,
+):
+    from src.orchestration.atomic_edit_plan import write_atomic_edit_plan
+
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "edit_task_contract.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "edit-task-contract-v1",
+                "task_mode": "edit",
+                "requested_target_routes": ["/"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_atomic_edit_plan(
+        file_comm.dir,
+        {
+            "schema_version": "atomic-edit-plan-v1",
+            "title": "Add a status toggle",
+            "goal": "Toggle the visible status panel.",
+            "deliverables": ["A working status toggle."],
+            "exit_criteria": ["Clicking the toggle reveals the status panel."],
+            "requirement_changes": [
+                {
+                    "requirement_id": "REQ-STATUS",
+                    "relation": "add",
+                    "prior_requirement_ids": [],
+                    "rationale": "New requested behavior.",
+                }
+            ],
+            "impact_tags": ["route:/", "status-toggle"],
+            "unresolved_conflicts": [],
+            "visual_evidence": "not_required",
+            "visual_evidence_reason": "DOM visibility and click behavior are sufficient.",
+            "checks": [
+                {
+                    "id": "UI-STATUS",
+                    "task": "Click the status toggle.",
+                    "expected_result": "The status panel is visible.",
+                    "critical": True,
+                    "category": "interaction",
+                    "requirement_id": "REQ-STATUS",
+                    "impact_tags": ["route:/", "status-toggle"],
+                    "route": "/",
+                    "fixtures": [],
+                    "actions": [
+                        {"action": "click", "selector": "#status-toggle"},
+                        {"action": "assert_visible", "selector": "#status-panel"},
+                    ],
+                }
+            ],
+        },
+    )
+    trace = file_comm.dir / "traces" / "planner.jsonl"
+    trace.parent.mkdir(parents=True, exist_ok=True)
+    trace.write_text(
+        '{"event":"atomic_edit_plan","artifact":".harness/atomic_edit_plan.json"}\n'
+        '{"event":"usage","cumulative_usage":{"input_tokens":30,"output_tokens":10}}\n',
+        encoding="utf-8",
+    )
+
+    stats = recover_trace_proven_planner_checkpoint(file_comm, HarnessConfig())
+
+    assert stats is not None
+    assert stats.token_usage == {"input_tokens": 30, "output_tokens": 10}
+    assert file_comm.read_sprint_plan()["total_sprints"] == 1
+
+
 def test_final_project_mode_instruction_requests_natural_complete_roadmap():
     from src.agents.planner import _build_planner_prompt
 

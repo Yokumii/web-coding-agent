@@ -204,6 +204,20 @@ def browser_target_outcome(
     )
 
 
+def _preservation_contract_passed(guard: dict[str, Any] | None) -> bool:
+    """Separate absent target additions from collateral preservation failures."""
+    if guard is None or guard.get("passed") is True:
+        return True
+    violations = guard.get("violations")
+    if not isinstance(violations, list) or not violations:
+        return False
+    target_absence_kinds = {"expected_addition_missing"}
+    return all(
+        isinstance(item, dict) and item.get("kind") in target_absence_kinds
+        for item in violations
+    )
+
+
 class _RealBrowserPatchOracle:
     def __init__(
         self, *, run_dir: Path, frontend: Path, config: HarnessConfig,
@@ -306,7 +320,7 @@ class _RealBrowserPatchOracle:
                             ),
                         )
                         guard = compare_contract(self.baseline, current, self.scope)
-                        preservation = guard.get("passed") is True
+                        preservation = _preservation_contract_passed(guard)
                     outcome = OracleOutcome(
                         status="ok",
                         target_passed=target_outcome.target_passed,

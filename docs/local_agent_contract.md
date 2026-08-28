@@ -68,6 +68,22 @@ functional-pseudo indirection, and unsupported nested at-rule edits fail closed.
 Modern nested selector blocks in guarded shared CSS also fail closed until the selector
 model can prove their resolved scope.
 
+Explicit atomic Edit must use the dedicated short path. Its Planner may author only the
+semantic goal, exact source anchors, visual-evidence policy, and ordered typed browser
+checks. The Harness derives requirement lineage and legacy planning views locally; it
+must not ask the model to rewrite a full product spec, design token document, feature
+list, or multi-Sprint plan for one atomic transition. The implementation call receives
+bounded current-source windows rather than the whole repository whenever the route/source
+cone is resolved. Ordered actions are also guidance: if a control is clicked again after
+a target becomes hidden, the Harness must explicitly tell the model that the control is
+a sibling outside that target.
+
+Each Repair cycle is a fresh short-context call, not continued chat history. It receives
+the current failed source window, exact failed actions, derived selector-level repair
+directives, and the current allowed source cone. It must not receive prior assistant
+reasoning or unrelated accepted source. The default ten-cycle Edit ceiling remains a
+ceiling; acceptance stops immediately.
+
 The source plan should inventory existing design tokens and tell the model to reuse them,
 but token discovery never opens a protected global stylesheet. Stateful checks should
 establish bounded storage fixtures, and behavior/appearance checks should prefer typed
