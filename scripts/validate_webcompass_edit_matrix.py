@@ -5,6 +5,7 @@ import asyncio
 import gzip
 import json
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -38,6 +39,9 @@ class MatrixCase:
     target_checks: tuple[dict[str, Any], ...]
     protected_checks: tuple[dict[str, Any], ...] = ()
     certify_minimality: bool = False
+    patch_variant: str = "ground_truth"
+    css_replacement_overrides: tuple[tuple[str, str], ...] = ()
+    normalize_replacement_whitespace: bool = False
 
 
 def _ticket(index: int) -> dict[str, Any]:
@@ -84,6 +88,15 @@ def _published_card(index: int) -> dict[str, Any]:
             "interviews": True,
             "factCheck": True,
         },
+    }
+
+
+def _shift_log(index: int) -> dict[str, Any]:
+    return {
+        "id": index,
+        "type": "general",
+        "text": f"Shift event {index}",
+        "timestamp": f"0{index}:00 AM",
     }
 
 
@@ -258,6 +271,81 @@ MATRIX_CASES: tuple[MatrixCase, ...] = (
         ),
     ),
     MatrixCase(
+        instance_id="gen14-artifactsbench-ab-2-00164-ce3dab4f11",
+        name="multi-html-log-scoped-css",
+        target_routes=("/log.html",),
+        target_checks=(
+            {
+                "id": "LOG-PAGINATION-SCOPED-STYLE",
+                "route": "/log.html",
+                "category": "state",
+                "actions": [
+                    {
+                        "action": "set_storage_value",
+                        "storage": "local",
+                        "key": "transit_hub_state_v1",
+                        "value": {
+                            "vehicles": [],
+                            "dispatches": [],
+                            "alerts": [],
+                            "logs": [_shift_log(index) for index in range(1, 8)],
+                        },
+                        "encoding": "json",
+                    },
+                    {"action": "reload"},
+                    {
+                        "action": "assert_computed_style",
+                        "selector": "#log-pagination",
+                        "property": "display",
+                        "value": "flex",
+                    },
+                    {
+                        "action": "assert_count",
+                        "selector": "#log-list .log-item",
+                        "count": 5,
+                    },
+                    {"action": "click", "selector": "#next-page"},
+                    {
+                        "action": "assert_text",
+                        "selector": "#page-indicator",
+                        "value": "Page 2 of 2",
+                    },
+                    {
+                        "action": "assert_count",
+                        "selector": "#log-list .log-item",
+                        "count": 2,
+                    },
+                ],
+            },
+        ),
+        protected_checks=(
+            {
+                "id": "LOG-PROTECTED-DASHBOARD",
+                "route": "/index.html",
+                "category": "regression",
+                "actions": [
+                    {"action": "assert_text", "selector": "main h1", "value": "Fleet Overview"},
+                    {"action": "assert_no_console_errors"},
+                ],
+            },
+        ),
+        patch_variant="controlled_target_scoped_css_repair",
+        normalize_replacement_whitespace=True,
+        css_replacement_overrides=(
+            (
+                "styles.css",
+                ".timeline-list { display: flex; flex-direction: column; gap: 1rem; "
+                "max-height: calc(100vh - 200px); overflow-y: auto; padding-right: 0.5rem; }\n"
+                "#log-list { max-height: calc(100vh - 260px); }\n"
+                "#log-pagination.pagination-controls { display: flex; justify-content: center; "
+                "align-items: center; gap: 1rem; padding-top: 1rem; "
+                "border-top: 1px solid var(--border); margin-top: 1rem; }\n"
+                "#log-pagination .page-info { font-weight: 600; color: var(--text-muted); "
+                "font-size: 0.9rem; }",
+            ),
+        ),
+    ),
+    MatrixCase(
         instance_id="gen14-webcompass-wc-5-00404-e13db617c3",
         name="hash-router-report",
         target_routes=("/#/report",),
@@ -339,6 +427,19 @@ def pagination_patches(row: dict[str, Any]) -> list[dict[str, str]]:
         for item in row.get("response") or []
         if isinstance(item, dict) and item.get("task_type") == "Pagination"
     ]
+
+
+def case_patches(row: dict[str, Any], case: MatrixCase) -> list[dict[str, str]]:
+    overrides = dict(case.css_replacement_overrides)
+    output: list[dict[str, str]] = []
+    for source_patch in pagination_patches(row):
+        patch = {key: str(value) for key, value in source_patch.items()}
+        if patch["path"] in overrides:
+            patch["replace"] = overrides[patch["path"]]
+        if case.normalize_replacement_whitespace:
+            patch["replace"] = re.sub(r"[ \t]+(?=\r?$)", "", patch["replace"], flags=re.M)
+        output.append(patch)
+    return output
 
 
 def source_destination_maps(
@@ -539,7 +640,7 @@ async def run_case(
     workdir = case_dir / "workdir"
     materialize_source(row, workdir)
     before_hashes = file_hashes(workdir / "frontend")
-    patches = pagination_patches(row)
+    patches = case_patches(row, case)
     source, destination = source_destination_maps(row, patches)
     prepare_edit_task_contract(workdir, requested_target_routes=case.target_routes)
     harness = workdir / ".harness"
@@ -618,6 +719,7 @@ async def run_case(
         "case": case.name,
         "instance_id": case.instance_id,
         "page_scope": row.get("metadata", {}).get("page_scope"),
+        "patch_variant": case.patch_variant,
         "target_routes": list(case.target_routes),
         "plan_status": plan.get("status"),
         "route_scope": plan.get("route_scope"),

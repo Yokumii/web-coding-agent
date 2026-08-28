@@ -6,6 +6,7 @@ from pathlib import Path
 from src.orchestration.minimal_path_guidance import (
     MinimalPathPolicy,
     _fragment_dom_scope,
+    _validate_target_scoped_css,
     ensure_minimal_path_plan,
 )
 
@@ -1058,8 +1059,10 @@ def test_vanilla_hash_router_maps_view_to_source_and_protects_siblings(tmp_path:
     frontend = tmp_path / "frontend"
     (frontend / "src" / "views").mkdir(parents=True)
     (frontend / "index.html").write_text(
+        '<link rel="stylesheet" href="styles.css">'
         '<main id="main-content"></main><script type="module" src="src/app.js"></script>\n'
     )
+    (frontend / "styles.css").write_text(".page-btn { padding: .5rem; }\n")
     (frontend / "src" / "app.js").write_text(
         "import { registerRoute } from './router.js';\n"
         "import { renderReport } from './views/report.js';\n"
@@ -1092,8 +1095,10 @@ def test_vanilla_hash_router_maps_view_to_source_and_protects_siblings(tmp_path:
                                 "category": "interaction",
                                 "actions": [
                                     {
-                                        "action": "assert_visible",
+                                        "action": "assert_computed_style",
                                         "selector": "#report-pagination",
+                                        "property": "display",
+                                        "value": "flex",
                                     }
                                 ],
                             }
@@ -1118,6 +1123,18 @@ def test_vanilla_hash_router_maps_view_to_source_and_protects_siblings(tmp_path:
     assert plan["route_scope"]["protected_routes"] == ["/#/board"]
     assert "frontend/src/views/report.js" in plan["route_scope"]["route_local_paths"]
     assert "frontend/src/views/board.js" in plan["route_scope"]["off_target_paths"]
+    assert plan["route_scope"]["global_style_paths"] == ["frontend/styles.css"]
+    assert "frontend/styles.css" in plan["route_scope"]["cross_route_shared_paths"]
+    assert plan["source_change_cone"]["initial_paths"] == [
+        "frontend/src/views/report.js"
+    ]
+    assert "frontend/styles.css" in plan["source_change_cone"]["dependency_paths"]
+    css_contract = next(
+        item
+        for item in plan["source_change_cone"]["guarded_shared_regions"]
+        if item.get("mutation_mode") == "target_scoped_css"
+    )
+    assert css_contract["allowed_anchors"] == ["#report-pagination"]
 
 
 def test_plan_indexes_existing_css_tokens_for_design_system_guidance(tmp_path: Path):
@@ -1315,6 +1332,296 @@ def test_shared_state_container_allows_only_target_named_additions(tmp_path: Pat
         )
     )
     assert "target-named" in destructive_error or "existing identifiers" in destructive_error
+
+
+def test_target_scoped_css_requires_every_selector_branch_to_stay_under_anchor():
+    before = ".shared-card { color: var(--text); }\n"
+    assert (
+        _validate_target_scoped_css(
+            before,
+            before
+            + "\n#report-pagination { display: flex; }\n"
+            + "#report-pagination .page-btn:disabled { opacity: .5; }\n",
+            ["#report-pagination"],
+        )
+        is None
+    )
+    generic = _validate_target_scoped_css(
+        before,
+        before + "\n.page-btn { opacity: .5; }\n",
+        ["#report-pagination"],
+    )
+    assert generic is not None and "target-scoped" in generic
+    mixed = _validate_target_scoped_css(
+        before,
+        before + "\n#report-pagination .page-btn, .global-btn { opacity: .5; }\n",
+        ["#report-pagination"],
+    )
+    assert mixed is not None and "target-scoped" in mixed
+    indirect = _validate_target_scoped_css(
+        before,
+        before + "\n:is(#report-pagination, .global-panel) .page-btn { opacity: .5; }\n",
+        ["#report-pagination"],
+    )
+    assert indirect is not None and "target-scoped" in indirect
+    sibling = _validate_target_scoped_css(
+        before,
+        before + "\n#report-pagination + .global-banner { display: none; }\n",
+        ["#report-pagination"],
+    )
+    assert sibling is not None and "target-scoped" in sibling
+    prefix_collision = _validate_target_scoped_css(
+        before,
+        before + "\n#report-pagination-extra { display: none; }\n",
+        ["#report-pagination"],
+    )
+    assert prefix_collision is not None and "target-scoped" in prefix_collision
+    nested_at_rule = _validate_target_scoped_css(
+        before,
+        before
+        + "\n@media (min-width: 40rem) { #report-pagination { display: flex; } }\n",
+        ["#report-pagination"],
+    )
+    assert nested_at_rule is not None and "target-scoped" in nested_at_rule
+    nested_selector_escape = _validate_target_scoped_css(
+        before,
+        before
+        + "\n#report-pagination { & + .global-banner { display: none; } }\n",
+        ["#report-pagination"],
+    )
+    assert nested_selector_escape is not None and "target-scoped" in nested_selector_escape
+
+
+def test_target_scoped_css_accepts_equivalent_quoted_data_anchor():
+    before = ".shared-card { color: var(--text); }\n"
+    after = before + "\n[data-testid='report-panel'] .page-btn { opacity: .5; }\n"
+
+    assert (
+        _validate_target_scoped_css(
+            before,
+            after,
+            ['[data-testid="report-panel"]'],
+        )
+        is None
+    )
+
+
+def test_target_scoped_css_rejects_mixed_global_and_scoped_changes():
+    before = ".shared-card { color: var(--text); }\n"
+    after = (
+        ".shared-card { color: red; }\n"
+        "#report-pagination { display: flex; }\n"
+    )
+
+    error = _validate_target_scoped_css(before, after, ["#report-pagination"])
+
+    assert error is not None and "target-scoped" in error
+
+
+def test_multi_html_shared_css_opens_only_target_anchored_rules(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    pages = {
+        "catalog.html": '<main id="catalog-page"><div id="catalog-pagination"></div></main>',
+        "report.html": '<main id="report-page"><div id="report-summary"></div></main>',
+        "settings.html": '<main id="settings-page"><button class="page-btn">Save</button></main>',
+    }
+    for name, body in pages.items():
+        (frontend / name).write_text(
+            '<link rel="stylesheet" href="styles.css">\n' + body + "\n",
+            encoding="utf-8",
+        )
+    css_before = ":root { --space-2: .5rem; }\n.page-btn { padding: var(--space-2); }\n"
+    (frontend / "styles.css").write_text(css_before, encoding="utf-8")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(
+        json.dumps(
+            {
+                "requested_target_routes": [
+                    "/catalog.html",
+                    "/report.html",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "CATALOG-LAYOUT",
+                                "route": "/catalog.html",
+                                "category": "visual",
+                                "actions": [
+                                    {
+                                        "action": "assert_computed_style",
+                                        "selector": "#catalog-pagination",
+                                        "property": "display",
+                                        "value": "flex",
+                                    }
+                                ],
+                            },
+                            {
+                                "id": "REPORT-LAYOUT",
+                                "route": "/report.html",
+                                "category": "visual",
+                                "actions": [
+                                    {
+                                        "action": "assert_computed_style",
+                                        "selector": "#report-summary",
+                                        "property": "display",
+                                        "value": "grid",
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=40,
+        max_touched_files=3,
+    )
+
+    assert plan["route_scope"]["discovered_routes"] == [
+        "/catalog.html",
+        "/report.html",
+        "/settings.html",
+    ]
+    assert plan["route_scope"]["target_routes"] == [
+        "/catalog.html",
+        "/report.html",
+    ]
+    assert plan["route_scope"]["protected_routes"] == ["/settings.html"]
+    assert "frontend/styles.css" in plan["route_scope"]["cross_route_shared_paths"]
+    css_contract = next(
+        item
+        for item in plan["source_change_cone"]["guarded_shared_regions"]
+        if item.get("mutation_mode") == "target_scoped_css"
+    )
+    assert css_contract["path"] == "frontend/styles.css"
+    assert css_contract["allowed_anchors"] == [
+        "#catalog-pagination",
+        "#report-summary",
+    ]
+    assert plan["source_change_cone"]["initial_paths"] == [
+        "frontend/styles.css"
+    ]
+
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    policy.observe_result(
+        "read_file",
+        {"path": "frontend/styles.css"},
+        ok=True,
+        output=css_before,
+    )
+    safe_after = (
+        css_before
+        + "#catalog-pagination { display: flex; gap: var(--space-2); }\n"
+        + "#report-summary { display: grid; gap: var(--space-2); }\n"
+    )
+    assert (
+        policy.check(
+            "apply_patch",
+            {
+                "path": "frontend/styles.css",
+                "old_text": css_before,
+                "new_text": safe_after,
+            },
+        )
+        is None
+    )
+    generic_denial = policy.check(
+        "apply_patch",
+        {
+            "path": "frontend/styles.css",
+            "old_text": css_before,
+            "new_text": css_before + ".page-btn { opacity: .5; }\n",
+        },
+    )
+    assert generic_denial is not None and "target-scoped" in generic_denial
+    protected_denial = policy.check(
+        "apply_patch",
+        {
+            "path": "frontend/settings.html",
+            "old_text": "Save",
+            "new_text": "Changed",
+        },
+    )
+    assert protected_denial is not None and "outside the target page" in protected_denial
+
+
+def test_shared_css_stays_closed_when_anchor_exists_on_protected_html(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    for name in ("catalog.html", "settings.html"):
+        (frontend / name).write_text(
+            '<link rel="stylesheet" href="styles.css">\n'
+            '<div id="shared-pagination"></div>\n',
+            encoding="utf-8",
+        )
+    (frontend / "styles.css").write_text(".page-btn { padding: .5rem; }\n")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(
+        json.dumps({"requested_target_routes": ["/catalog.html"]})
+    )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "CATALOG-STYLE",
+                                "route": "/catalog.html",
+                                "category": "visual",
+                                "actions": [
+                                    {
+                                        "action": "assert_computed_style",
+                                        "selector": "#shared-pagination",
+                                        "property": "display",
+                                        "value": "flex",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=20,
+        max_touched_files=3,
+    )
+
+    assert not any(
+        item.get("mutation_mode") == "target_scoped_css"
+        for item in plan["source_change_cone"]["guarded_shared_regions"]
+    )
+    assert "frontend/styles.css" in plan["source_change_cone"]["protected_paths"]
 
 
 def test_react_router_edit_protects_component_shared_with_other_route(tmp_path: Path):

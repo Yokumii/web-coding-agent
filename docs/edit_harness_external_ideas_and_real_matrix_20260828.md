@@ -8,7 +8,7 @@
 
 1. 用户提供的 ChatGPT 回答是外部调研线索；本文未逐一联网核验其中产品功能、论文版本或市场定位，不把产品宣传当成当前事实。
 2. “已实现”只指本仓库当前源码和单元测试。
-3. “真实矩阵”指 0805 supplement 中 5 个真实 source/ground-truth Edit 样本在本机 Chromium 和 Git 门禁上的零 LLM 小规模验证；它不是模型端到端能力评测。
+3. “真实矩阵”指 0805 supplement 中 6 个真实 source/ground-truth Edit 样本在本机 Chromium 和 Git 门禁上的零 LLM 小规模验证；它不是模型端到端能力评测。第六例保留真实四 HTML source 与行为补丁，但用明确标注的受控 target-scoped CSS 修复替代原 GT 的通用 CSS，只用于验证门禁，不能自动作为自然 Edit/Repair 数据出口。
 
 ## 用一个例子说清流程
 
@@ -33,6 +33,8 @@
 | 运行时元素到源码定位 | 从用户点中的元素、组件、路由和事件处理器缩小源码搜索空间 | 静态 route/selector/import ownership 已有；运行时 source map/event-listener grounding 尚未实现 |
 | 组件实例与共享定义区分 | “只改这个实例”和“改整个组件系统”应有不同权限 | 目前以路由本地文件、共享文件 named region、受保护路由区分；React instance-level ownership 尚未实现 |
 | 设计系统感知 | 修改应复用既有 token 与组件语言 | 已增加 CSS custom property 清单和 Generator 复用提示；全局 CSS 不因发现 token 而自动放行 |
+| selector-aware CSS ownership | 共享样式只能影响目标实例，不能借通用 class 波及受保护页 | 已实现强 ID/data anchor、每个 selector 分支检查、兄弟逃逸/伪类间接锚定拒绝和 protected-route anchor 冲突检查；at-rule 与现代 CSS nesting 修改 v1 继续关闭 |
+| 多 HTML 页面所有权 | 多个 HTML 入口需要独立授权和回归保护 | 已按精确 pathname 建立入口与传递依赖；导航链接不算源码依赖，共享 CSS/JS 分成 target-shared、cross-route shared 和 off-target |
 | 真实状态与多 viewport 验证 | 不能只看初始桌面页面 | 已支持 storage fixture、reload、viewport/media 和 computed style；状态图覆盖仍有限 |
 | Git diff/分支/恢复 | 每轮修改应可追踪、可撤回、可形成 failure→recovery 谱系 | 现有 checkpoint、Git journal、append-only ledger、Repair packet 和 exporter 已覆盖主要链路 |
 | 低轮次证据驱动修复 | 用精确失败直接修，不重复全项目探索 | 最多 10 轮但通过即停；确定性失败绕过付费语义 judge，形成有界 Repair packet |
@@ -49,10 +51,12 @@
 | 共享 Store 被整文件关闭 | 对可机械定位的 State/Store object/class 增加 `additive_target_members` | 只能增加目标命名成员；删除/替换已有标识符或无关新成员失败 |
 | 默认 3 文件不足以覆盖合理的两页功能 | 默认 touched-file ceiling 调整为 6 | 仍受 route ownership、dependency edge、exact patch 和逐次 validation 约束，不是 6 文件白名单 |
 | 候选代码质量失败被误记成 harness error | 矩阵把 `git diff --check` 等候选失败归为 `rejected` | 真正异常继续记为 `error` |
+| 共享 CSS 只能整文件关闭 | 新增 `target_scoped_css` guarded region；每次 patch 都在 before/after 两侧重新解析完整顶层规则 | 所有 selector 分支必须含目标 ID 或 `data-testid`/`data-page`；通用、混合、相邻兄弟、伪类间接锚点和 at-rule 修改拒绝 |
+| 多 HTML 只被笼统称作“多页” | 每个 HTML pathname 分别拥有自己的入口、脚本与样式传递闭包；每个目标页得到一个最短初始入口 | 非目标 HTML 保持 protected；导航 href 不会错误开放另一页源码 |
 
 ## 真实样本矩阵
 
-数据源：`WebCoding_Data/output/0805_supplement_release_cache/text-edit.jsonl.gz`。最终统一矩阵证据目录：`logs/edit_matrix_20260828/real_edit_matrix_20260828T030530/`；自然 Repair 复核：`logs/edit_first_20260828/webcompass_pagination_20260828T025752/`。更早的同日矩阵属于问题定位过程，不作为下表的最终结果。
+数据源：`WebCoding_Data/output/0805_supplement_release_cache/text-edit.jsonl.gz`。最终统一矩阵证据目录：`logs/edit_matrix_20260828/real_edit_matrix_20260828T115939/`；增加 CSS nesting 拒绝后，最终 CSS 成对复核目录为 `logs/edit_matrix_20260828/real_edit_matrix_20260828T120530/`；自然 Repair 复核：`logs/edit_first_20260828/webcompass_pagination_20260828T120113/`。更早的同日矩阵属于问题定位过程，不作为下表的最终结果。
 
 | 真实 case | 结果 | 发现的问题 | 应采取的处理 |
 | --- | --- | --- | --- |
@@ -60,15 +64,16 @@
 | inline summary | 目标与保护检查通过，候选拒收 | `git diff --check` 发现新增行尾空格 | 作为机械质量失败，不记 harness error，不进入正式出口 |
 | My Tickets | 目标与保护检查通过，`non_minimal` | 6 个 atom 中 `p005` 是与分页无关的 cancel toast；移除后目标/保护仍通过 | 反事实证书拒收原候选，并给出精确冗余 atom |
 | Dashboard + Report | accepted | 原 harness 只开放一个路由入口并卡住第二页和共享 store；修复后 8/8 patches 获准，5 次 Git validation 通过，3 个 browser checks 通过 | 证明多路由初始入口和共享状态定向增量策略在该真实样本上有效 |
-| hash-router Report | 候选拒收 | 行为 DOM 可通过，但 GT 想向全局 CSS 加通用 `.page-btn` 等规则；该文件属于所有页面，且新增行有空格。computed style 复核显示目标视觉属性未生效 | 保持全局 CSS 关闭。后续实现 selector-aware CSS guard 或改成 route-anchored 样式后再接收 |
+| 四 HTML Log | accepted（受控门禁样本） | `index.html`、`dispatch.html`、`log.html`、`roster.html` 共享样式；target-root 的 `#log-pagination ...` 规则获准，首页 sentinel 与分页行为均通过 | 证明多 HTML ownership 与 selector-aware 共享 CSS 可以同时工作；受控 CSS overlay 单独标记，不能冒充自然 GT |
+| hash-router Report | 候选拒收 | 行为 DOM 可通过，但 GT 想向全局 CSS 加通用 `.page-btn` 等规则；该文件属于所有页面，且新增行有空格。computed style 复核显示目标视觉属性未生效 | selector-aware guard 仍拒绝通用 selector；只有改成 `#report-pagination .page-btn` 等 target-rooted rule 才可能进入浏览器验收 |
 
-主矩阵最终为 `ok=1, rejected=4, error=0`，LLM 调用与费用均为 0。这个比例不是“成功率差”，而是 admission gate 在小样本中实际挡住了错误行为、机械瑕疵、全局样式越界和无关功能。它尚不能证明模型在 10 轮内的真实 Edit 产率。
+主矩阵最终为 `ok=2, rejected=4, error=0`，LLM 调用与费用均为 0。这个比例不是模型成功率；矩阵没有调用模型，其中新增 accepted 项是受控门禁案例。结果说明 admission gate 能同时放行目标锚定的共享样式，并挡住错误行为、机械瑕疵、通用全局样式越界和无关功能。它尚不能证明模型在 10 轮内的真实 Edit 产率。
 
-测试证据：定向新增能力测试 43/43 通过；仓库全套为 702 passed、2 skipped。两条 skipped 和 aiohttp deprecation warning 未被本轮变更转化为功能结论。
+测试证据：selector/multi-page/generator/planner 定向测试 124/124 通过；仓库全套为 707 passed、2 skipped。两条 skipped 和 aiohttp deprecation warning 未被本轮变更转化为功能结论。
 
 ## 结合外部建议后，下一步最值得做什么
 
-1. **selector-aware 共享 CSS guard。** 使用 CSS parser 将新增 rule 解析成 selector AST；只有每个 selector 都被目标 route root、稳定 `data-testid` 或目标 fragment 锚定，并且 declaration 使用允许 token 时才开放。先用 hash Report 样本做“通用 `.page-btn` 应拒绝、`#report-pagination .page-btn` 应允许”的成对测试。
+1. **selector-aware CSS v2。** 当前顶层规则保护已实现；下一步需要用成熟 CSS selector AST 覆盖 `@media`/container/layer 嵌套，并把 declaration token 偏离作为独立警告或门禁，仍保留 fail-closed 回归对照。
 2. **运行时元素到源码 ownership。** 在 development build 中记录 DOM 节点对应 React/Vue component、source map、event listener 和加载模块；把静态候选与一次真实点击 trace 取交集。该层只缩小搜索顺序，不能单独授权修改。
 3. **组件实例级保护。** 当同一个 React component 在多个路由复用时，保存 `route + component + stable props/data key`。只改一个实例时优先改调用点/配置；只有任务明确要求全局变化时才开放组件定义。
 4. **状态图而非单状态。** 对 accepted action tape 保存最小状态夹具、动作和后置断言；选择目标状态邻居与一个受保护状态邻居。用 property-based 生成后再 shrink，避免无限枚举。

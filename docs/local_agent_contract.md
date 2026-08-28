@@ -49,6 +49,16 @@ containers may receive only target-named additive members; existing members and
 unrelated identifiers remain protected. Literal hash-router ownership is allowed only
 when its same-origin route and source mapping are statically bounded.
 
+Multiple `.html` files are first-class page entries. The plan must preserve per-pathname
+ownership, keep non-target HTML pages closed, and distinguish navigation links from
+source imports. A stylesheet shared with a protected page may open only through a
+selector-aware contract backed by a target ID or stable `[data-testid]`/`[data-page]`
+anchor that is absent from protected route source. Every changed selector branch must
+remain under that anchor; generic selectors, mixed scoped/global lists, sibling escape,
+functional-pseudo indirection, and unsupported nested at-rule edits fail closed.
+Modern nested selector blocks in guarded shared CSS also fail closed until the selector
+model can prove their resolved scope.
+
 The source plan should inventory existing design tokens and tell the model to reuse them,
 but token discovery never opens a protected global stylesheet. Stateful checks should
 establish bounded storage fixtures, and behavior/appearance checks should prefer typed

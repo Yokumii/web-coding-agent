@@ -70,8 +70,8 @@ What is implemented:
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with cumulative planner/generator/evaluator caps plus a hard total-budget cap; append-only trace usage from failed or interrupted attempts is carried into a resumed phase instead of resetting its spend to zero
 - Incremental-Edit DOM contract guard: explicit Edit freezes a verified seed, while Sprint two and later in a Generate run freeze the previous accepted checkpoint. Each semantic frame is sampled twice and unstable routes fail closed. The v4 contract opens at most four deepest target fragments per route while preserving sibling fragments, ARIA state, focusability, and every protected route. This is independent of screenshot/pixel scoring.
-- Harness-owned progressive minimal-path guidance: each executable UI check names an exact same-origin route. Static HTML pages, concrete filesystem routes, explicit literal React Router mappings, and literal vanilla `registerRoute()` hash routes are converted into page ownership and import/link dependency cones. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine. A coherent multi-route Edit starts from one ranked entry per target route; route-local files are preferred, off-target files remain closed, and a cross-route shared source opens only when a named target-route object/class/function is mechanically isolated. Target-named additive members may be added to a mechanically isolated shared store/state container, while existing members and unrelated identifiers remain byte/identifier protected. Every patch stays inside its admitted region, whole-file overwrite stays denied, and actual tool outcomes are appended to a ledger.
-- Repository-native design guidance: the minimal-path plan inventories CSS custom properties, their definition files, and usage counts. The Generator is instructed to reuse those tokens before inventing literal colors, spacing, radii, typography, or timing values. Discovery does not itself authorize a protected global stylesheet.
+- Harness-owned progressive minimal-path guidance: each executable UI check names an exact same-origin route. Static HTML pages, concrete filesystem routes, explicit literal React Router mappings, and literal vanilla `registerRoute()` hash routes are converted into page ownership and import/link dependency cones. A directory with several HTML entries is treated as a real multi-page sample: every HTML pathname owns its transitive scripts/styles, navigation links do not imply source ownership, and non-target HTML entries remain protected. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine. A coherent multi-route Edit starts from one ranked entry per target route; route-local files are preferred, off-target files remain closed, and a cross-route shared source opens only when a named target-route object/class/function is mechanically isolated. Target-named additive members may be added to a mechanically isolated shared store/state container, while existing members and unrelated identifiers remain byte/identifier protected. Every patch stays inside its admitted region, whole-file overwrite stays denied, and actual tool outcomes are appended to a ledger.
+- Selector-aware shared CSS protection: a stylesheet owned by target and protected pages stays closed unless the action contract supplies a strong target root that is absent from protected page sources. When opened, every modified top-level CSS rule and every comma-separated selector branch must contain an allowed target ID or `[data-testid]`/`[data-page]` anchor. Functional-pseudo indirection, sibling escape, generic selectors, mixed global edits, modern nested blocks, and at-rule edits fail closed. Repository-native token inventory still guides declarations but does not itself grant stylesheet access.
 - Typed WebCompass browser contracts: the full 40-type 0805 Edit taxonomy has an explicit action-capability profile. New plans cannot author arbitrary browser JavaScript. Bounded hash-router routes and `assert_hash` are supported; `set_storage_value` establishes deterministic local/session-storage fixtures, and `assert_computed_style` checks a small allowlist of rendered properties without screenshot comparison. Each flow ends in one to four related DOM/text/value/count/pathname/hash/computed-style/attribute/ARIA/focus/storage/console assertions. Tab checks require a deterministic starting selector, and initial empty-state checks must precede state-producing flows on their route. Real Chromium also supports hover, right-click, drag-and-drop, in-memory file upload, asynchronous locator waits, reload, viewport changes, and print/color-scheme emulation. Historical `evaluate` contracts remain replayable but are not formal-export evidence.
 - Accepted checkpoint tapes: passing typed flows are appended with requirement/impact metadata. Normal Edit validation replays impacted checks plus one critical sentinel per protected route; every fifth accepted Edit and legacy metadata trigger a full replay. `scripts/recover_accepted_tapes.py` reconstructs a missing tape only from immutable passing browser evidence. A lost accepted interaction is a real regression; malformed or over-budget tape banks are infrastructure failures.
 - Complete seed context for one-shot AIR task generation: up to 48 source files / 140K characters are included without truncation. Larger projects fail closed and must use the tool-reading harness path; partial context is never advertised as `all_files_included`.
@@ -316,6 +316,20 @@ object/class/function from the literal target route (for example
 patch. A shared state object/class may receive only additive members whose identifiers
 are tied to target routes or checks; existing identifiers cannot be removed. Sibling
 page modules, unscoped store additions, and whole-file replacement remain denied.
+
+The same field can contain a `mutation_mode: "target_scoped_css"` contract for a
+stylesheet linked by both target and protected HTML entries (or shared across bounded
+hash-router views). The harness first proves that an ID, `[data-testid]`, or `[data-page]`
+anchor comes from the target action contract and does not occur in protected route
+markup/behavior source. It then parses top-level CSS rule boundaries before every exact
+patch. All changed selector branches must remain under an allowed anchor; a rule such as
+`#report-pagination .page-btn` can pass, while `.page-btn`,
+`#report-pagination .page-btn, .global-btn`, and
+`#report-pagination + .global-banner` are rejected. Version 1 deliberately fails closed
+for modifications inside `@media`/other at-rules, modern nested selector blocks, and
+class-only ownership; use a route-local stylesheet for those cases. Browser
+`assert_computed_style` evidence still
+proves the requested rendered state independently of source authorization.
 
 The contract permits changes inside at most two named baseline surfaces per target route.
 Each multi-page snapshot prefixes roots with their route; removal or semantic change of
@@ -707,8 +721,8 @@ first failed Edit, creates a zero-cost deterministic Repair packet, applies one 
 Repair, and reruns DOM/ARIA/property/storage plus protected-route browser sentinels.
 Each invocation writes a new append-only run folder under `logs/edit_first_20260828/`.
 
-Run the five-case, zero-LLM Edit matrix (single-page, inline state fixture, shared-file,
-coherent two-route/five-file, and hash-router cases):
+Run the six-case, zero-LLM Edit matrix (single-page, inline state fixture, shared-file,
+coherent two-route/five-file, hash-router, and four-HTML/shared-CSS cases):
 
 ```bash
 uv run python scripts/validate_webcompass_edit_matrix.py

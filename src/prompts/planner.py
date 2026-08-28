@@ -290,7 +290,10 @@ Typed assertion fields are exact and closed:
 - `assert_computed_style`: `selector`, `property`, `value`, optional `match`.
   Use only stable state/layout properties from the closed allowlist, such as
   `display`, `visibility`, `opacity`, `position`, `overflow-x`, or `pointer-events`;
-  never use it as a color or pixel-perfect design score.
+  never use it as a color or pixel-perfect design score. When the implementation may
+  need to change a stylesheet shared with protected routes, select the exact target
+  surface by an ID or `[data-testid]`/`[data-page]` root. The harness can then permit
+  selectors scoped beneath that root while continuing to reject generic global rules.
 - `assert_attribute`: `selector`, `name`, `value` (exact comparison only)
 - `assert_property`: `selector`, `name`, `value`; `name` is limited to bounded
   form/dialog state such as `checked`, `disabled`, `selected`, `selectedIndex`, or `value`
@@ -325,6 +328,10 @@ prefer bounded assertions against stable control state or text already specified
 feature are allowed; guessed existing content is not.
 
 Checks should be executable browser tasks that validate the current sprint's key functionality.
+For one coherent multi-page Edit, put each target page in the same Sprint but author each
+check with its exact HTML pathname (for example `/catalog.html` and `/report.html`). Include
+at least one narrow accepted-behavior sentinel for each protected page through the replay
+contract; do not treat navigation links between HTML files as source-code dependencies.
 
 {PROGRESS_UPDATE_RULES}
 

@@ -219,6 +219,8 @@ def _requested_source_roles(checks: list[dict[str, Any]]) -> set[str]:
     # multi-page editor toward CSS while leaving interactions unimplemented.
     if categories & {"appearance", "responsive", "style", "visual"}:
         roles.add("style")
+    if "assert_computed_style" in actions:
+        roles.add("style")
     behavior_categories = categories & {
         "accessibility",
         "behavior",
@@ -670,6 +672,25 @@ def _route_scope(
                         if candidate in all_paths:
                             implicit.add(candidate)
         closures[route].update(_dependency_closure(implicit, graph))
+    html_paths = [
+        _relative_to_workdir(path, workdir)
+        for path in files
+        if path.suffix.lower() in {".htm", ".html"}
+    ]
+    global_style_paths: set[str] = set()
+    if len(html_paths) == 1 and len(entries) > 1:
+        # A single SPA shell may be replaced by explicit router entries above.
+        # Stylesheets linked by that shell still execute on every logical route,
+        # so assign only those style dependencies globally without collapsing
+        # every route-local view imported by the app/router into one owner set.
+        global_style_paths = {
+            target
+            for target in graph.get(html_paths[0], set())
+            if Path(target).suffix.lower() in STYLE_EXTENSIONS
+        }
+        global_style_closure = _dependency_closure(global_style_paths, graph)
+        for route in entries:
+            closures[route].update(global_style_closure)
     if len(entries) == 1:
         # With no competing page, unreferenced source remains part of that
         # page's editable project surface for backward compatibility.
@@ -724,6 +745,7 @@ def _route_scope(
         ),
         "planned_new_route_entries": sorted(planned_route_entries.values()),
         "planned_new_routes": sorted(planned_route_entries),
+        "global_style_paths": sorted(global_style_paths),
         "route_local_paths": sorted(route_local),
         "target_shared_paths": sorted(target_shared),
         "cross_route_shared_paths": sorted(cross_shared),
@@ -797,6 +819,369 @@ def _design_system_context(files: list[Path], workdir: Path) -> dict[str, Any]:
             "semantic cannot be expressed by an existing one."
         ),
     }
+
+
+_STRONG_CSS_ID_RE = re.compile(r"#[A-Za-z_][\w-]*")
+_STRONG_CSS_ATTR_RE = re.compile(
+    r"\[(?:data-testid|data-page)\s*=\s*(?:['\"][^'\"]+['\"]|[^\]\s]+)\]",
+    re.I,
+)
+
+
+def _strong_css_anchors(selectors: Iterable[str]) -> list[str]:
+    anchors: set[str] = set()
+    for selector in selectors:
+        value = str(selector)
+        anchors.update(_STRONG_CSS_ID_RE.findall(value))
+        anchors.update(match.group(0) for match in _STRONG_CSS_ATTR_RE.finditer(value))
+    return sorted(anchors)
+
+
+def _css_skip_comment(content: str, index: int) -> int | None:
+    if not content.startswith("/*", index):
+        return index
+    end = content.find("*/", index + 2)
+    return None if end < 0 else end + 2
+
+
+def _css_rule_end(content: str, opening: int) -> int | None:
+    depth = 1
+    index = opening + 1
+    quote: str | None = None
+    while index < len(content):
+        char = content[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if content.startswith("/*", index):
+            comment_end = _css_skip_comment(content, index)
+            if comment_end is None:
+                return None
+            index = comment_end
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
+
+
+def _css_rule_has_nested_block(content: str, opening: int, end: int) -> bool:
+    """Detect CSS nesting without interpreting declarations.
+
+    A shared-sheet rule containing another block is outside the v1 selector
+    model. Rejecting it is safer than assuming that the top-level anchor also
+    scopes nested `&`, `@scope`, or conditional rules.
+    """
+
+    index = opening + 1
+    quote: str | None = None
+    while index < end - 1:
+        char = content[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if content.startswith("/*", index):
+            comment_end = _css_skip_comment(content, index)
+            if comment_end is None or comment_end > end:
+                return True
+            index = comment_end
+            continue
+        if char == "{":
+            return True
+        index += 1
+    return False
+
+
+def _css_top_level_units(content: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Parse bounded top-level CSS rules without interpreting declarations."""
+
+    units: list[dict[str, Any]] = []
+    index = 0
+    while index < len(content):
+        while index < len(content):
+            if content[index].isspace():
+                index += 1
+                continue
+            if content.startswith("/*", index):
+                comment_end = _css_skip_comment(content, index)
+                if comment_end is None:
+                    return [], "unterminated CSS comment"
+                index = comment_end
+                continue
+            break
+        if index >= len(content):
+            break
+        start = index
+        quote: str | None = None
+        paren_depth = 0
+        bracket_depth = 0
+        boundary: str | None = None
+        while index < len(content):
+            char = content[index]
+            if quote is not None:
+                if char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if content.startswith("/*", index):
+                comment_end = _css_skip_comment(content, index)
+                if comment_end is None:
+                    return [], "unterminated CSS comment"
+                index = comment_end
+                continue
+            if char == "(":
+                paren_depth += 1
+            elif char == ")":
+                paren_depth -= 1
+                if paren_depth < 0:
+                    return [], "unbalanced CSS parentheses"
+            elif char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth -= 1
+                if bracket_depth < 0:
+                    return [], "unbalanced CSS brackets"
+            elif paren_depth == 0 and bracket_depth == 0 and char in {"{", ";", "}"}:
+                boundary = char
+                break
+            index += 1
+        if boundary is None:
+            return [], "CSS top-level rule has no terminator"
+        if boundary == "}":
+            return [], "unexpected top-level CSS closing brace"
+        prelude = content[start:index].strip()
+        if not prelude:
+            return [], "CSS rule has an empty selector or at-rule prelude"
+        if boundary == ";":
+            end = index + 1
+            if not prelude.startswith("@"):
+                return [], "only at-rules may terminate with a top-level semicolon"
+            kind = "at_rule"
+        else:
+            opening = index
+            end = _css_rule_end(content, index)
+            if end is None:
+                return [], "unbalanced CSS rule block"
+            kind = "at_rule" if prelude.startswith("@") else "style_rule"
+        units.append(
+            {
+                "kind": kind,
+                "prelude": prelude,
+                "start": start,
+                "end": end,
+                "raw": content[start:end],
+                "has_nested_block": (
+                    boundary == "{" and _css_rule_has_nested_block(content, opening, end)
+                ),
+            }
+        )
+        index = end
+    return units, None
+
+
+def _split_css_selector_list(selector: str) -> list[str] | None:
+    output: list[str] = []
+    start = 0
+    paren_depth = 0
+    bracket_depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(selector):
+        char = selector[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            paren_depth += 1
+        elif char == ")":
+            paren_depth -= 1
+        elif char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth -= 1
+        elif char == "," and paren_depth == 0 and bracket_depth == 0:
+            output.append(selector[start:index].strip())
+            start = index + 1
+        if paren_depth < 0 or bracket_depth < 0:
+            return None
+        index += 1
+    if quote is not None or paren_depth != 0 or bracket_depth != 0:
+        return None
+    output.append(selector[start:].strip())
+    return output if all(output) else None
+
+
+def _selector_parenthesis_depths(selector: str) -> list[int]:
+    depths = [0] * (len(selector) + 1)
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(selector):
+        depths[index] = depth
+        char = selector[index]
+        if quote is not None:
+            if char == "\\":
+                if index + 1 < len(depths):
+                    depths[index + 1] = depth
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        index += 1
+    depths[len(selector)] = depth
+    return depths
+
+
+def _css_anchor_pattern(anchor: str) -> re.Pattern[str] | None:
+    if anchor.startswith("#"):
+        return re.compile(rf"(?<![\w-]){re.escape(anchor)}(?![\w-])")
+    match = re.fullmatch(
+        r"\[(data-testid|data-page)\s*=\s*(['\"]?)([^'\"\]]+)\2\]",
+        anchor,
+        re.I,
+    )
+    if match:
+        name, _quote, value = match.groups()
+        return re.compile(
+            rf"\[\s*{re.escape(name)}\s*=\s*(['\"]?){re.escape(value.strip())}\1\s*\]",
+            re.I,
+        )
+    return None
+
+
+def _selector_branch_is_target_scoped(branch: str, anchors: Iterable[str]) -> bool:
+    depths = _selector_parenthesis_depths(branch)
+    for anchor in anchors:
+        pattern = _css_anchor_pattern(str(anchor))
+        if pattern is None:
+            continue
+        for match in pattern.finditer(branch):
+            if depths[match.start()] != 0:
+                continue
+            suffix = branch[match.end() :]
+            suffix_depths = _selector_parenthesis_depths(suffix)
+            if any(
+                char in {"+", "~"} and suffix_depths[index] == 0
+                for index, char in enumerate(suffix)
+            ):
+                continue
+            return True
+    return False
+
+
+def _css_rule_is_target_scoped(selector: str, anchors: Iterable[str]) -> bool:
+    branches = _split_css_selector_list(selector)
+    return bool(branches) and all(
+        _selector_branch_is_target_scoped(branch, anchors)
+        for branch in branches or []
+    )
+
+
+def _target_scoped_css_spans(
+    content: str, units: list[dict[str, Any]], anchors: Iterable[str]
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for unit in units:
+        if (
+            unit.get("kind") != "style_rule"
+            or unit.get("has_nested_block")
+            or not _css_rule_is_target_scoped(str(unit.get("prelude", "")), anchors)
+        ):
+            continue
+        start = int(unit["start"])
+        end = int(unit["end"])
+        while start > 0 and content[start - 1].isspace():
+            start -= 1
+        while end < len(content) and content[end].isspace():
+            end += 1
+        spans.append((start, end))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _range_is_covered(start: int, end: int, spans: Iterable[tuple[int, int]]) -> bool:
+    return start == end or any(left <= start and end <= right for left, right in spans)
+
+
+def _validate_target_scoped_css(
+    before: str, after: str, allowed_anchors: Iterable[str]
+) -> str | None:
+    """Allow only rule changes whose every selector branch stays under a target anchor."""
+
+    anchors = [str(item) for item in allowed_anchors if str(item).strip()]
+    if not anchors:
+        return "Shared stylesheet has no stable target-scoped selector anchor."
+    before_units, before_error = _css_top_level_units(before)
+    after_units, after_error = _css_top_level_units(after)
+    if before_error or after_error:
+        return "Shared stylesheet could not be parsed safely: " + str(
+            after_error or before_error
+        )
+    before_spans = _target_scoped_css_spans(before, before_units, anchors)
+    after_spans = _target_scoped_css_spans(after, after_units, anchors)
+    changed = False
+    matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changed = True
+        if not _range_is_covered(old_start, old_end, before_spans) or not _range_is_covered(
+            new_start, new_end, after_spans
+        ):
+            return (
+                "Shared CSS edits must change only target-scoped rules, and every selector "
+                "branch must contain one allowed ID/data anchor outside functional pseudo-classes."
+            )
+    if not changed:
+        return "Shared CSS exact patch does not change the stylesheet."
+    return None
 
 
 def _balanced_brace_end(content: str, opening: int) -> int | None:
@@ -902,6 +1287,51 @@ def _named_source_region(content: str, symbol: str) -> dict[str, Any] | None:
     }
 
 
+def _source_contains_css_anchor(content: str, anchor: str) -> bool:
+    if anchor.startswith("#"):
+        value = re.escape(anchor[1:])
+        return bool(re.search(rf"(?<![\w-]){value}(?![\w-])", content))
+    match = re.fullmatch(
+        r"\[(data-testid|data-page)\s*=\s*(['\"]?)([^'\"\]]+)\2\]",
+        anchor,
+        re.I,
+    )
+    if not match:
+        return False
+    name, _quote, value = match.groups()
+    return bool(re.search(rf"(?<![\w-]){re.escape(value.strip())}(?![\w-])", content, re.I))
+
+
+def _target_css_anchors(
+    *,
+    checks: list[dict[str, Any]],
+    route_scope: dict[str, Any],
+    by_path: dict[str, Path],
+) -> list[str]:
+    candidates = _strong_css_anchors(_extract_selectors(checks))
+    protected_routes = set(route_scope.get("protected_routes") or [])
+    owners = route_scope.get("path_owners") or {}
+    output: list[str] = []
+    for anchor in candidates:
+        conflict = False
+        for relative, path_owners in owners.items():
+            if not (set(path_owners or []) & protected_routes):
+                continue
+            path = by_path.get(str(relative))
+            if path is None or path.suffix.lower() in STYLE_EXTENSIONS:
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if _source_contains_css_anchor(content, anchor):
+                conflict = True
+                break
+        if not conflict:
+            output.append(anchor)
+    return sorted(set(output))
+
+
 def _guarded_shared_regions(
     *,
     route_scope: dict[str, Any],
@@ -914,6 +1344,11 @@ def _guarded_shared_regions(
 
     by_path = {_relative_to_workdir(path, workdir): path for path in files}
     output: list[dict[str, Any]] = []
+    css_anchors = _target_css_anchors(
+        checks=checks,
+        route_scope=route_scope,
+        by_path=by_path,
+    )
     state_intent = any(
         str(check.get("category", "")).lower() in {"persistence", "state"}
         or any(
@@ -952,7 +1387,25 @@ def _guarded_shared_regions(
     }
     for relative in route_scope.get("cross_route_shared_paths") or []:
         path = by_path.get(str(relative))
-        if path is None or path.suffix.lower() not in BEHAVIOR_EXTENSIONS:
+        if path is None:
+            continue
+        if path.suffix.lower() in STYLE_EXTENSIONS:
+            if "style" in requested_roles and css_anchors:
+                output.append(
+                    {
+                        "path": str(relative),
+                        "route": "shared-target-style",
+                        "symbol": "stylesheet",
+                        "kind": "css_stylesheet",
+                        "mutation_mode": "target_scoped_css",
+                        "allowed_anchors": css_anchors,
+                        "protected_routes": sorted(
+                            route_scope.get("protected_routes") or []
+                        ),
+                    }
+                )
+            continue
+        if path.suffix.lower() not in BEHAVIOR_EXTENSIONS:
             continue
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
@@ -1614,6 +2067,11 @@ def ensure_minimal_path_plan(
     guarded_shared_paths = {
         str(item["path"]) for item in guarded_shared_regions
     }
+    guarded_style_paths = {
+        str(item["path"])
+        for item in guarded_shared_regions
+        if item.get("mutation_mode") == "target_scoped_css"
+    }
     admissible_paths = (
         set(route_scope["route_local_paths"])
         | set(route_scope["target_shared_paths"])
@@ -1637,6 +2095,21 @@ def ensure_minimal_path_plan(
     }
 
     ranked = [str(item["path"]) for item in hotspots]
+    if requested_roles == {"style"}:
+        ranked = list(dict.fromkeys([*sorted(guarded_style_paths), *ranked]))
+    elif guarded_style_paths:
+        # A mixed behavior/style contract should begin in its best behavior or
+        # markup owner. The guarded global stylesheet remains one validation
+        # edge away instead of monopolizing the first mutation merely because
+        # its selectors have a strong lexical score.
+        ranked = list(
+            dict.fromkeys(
+                [
+                    *(path for path in ranked if path not in guarded_style_paths),
+                    *(path for path in ranked if path in guarded_style_paths),
+                ]
+            )
+        )
     target_entries = list(route_scope["target_page_entries"])
     if isolation_strategy.get("status") == "recommended":
         # The page entry is the first small mutation: connect it to the planned
@@ -1698,6 +2171,9 @@ def ensure_minimal_path_plan(
                 and dependency not in dependencies
             ):
                 dependencies.append(dependency)
+    for shared_style in sorted(guarded_style_paths):
+        if shared_style not in local and shared_style not in dependencies:
+            dependencies.append(shared_style)
     all_paths = [_relative_to_workdir(item, workdir) for item in files]
     protected = sorted(set(all_paths) - set(local) - set(dependencies))
     executable_edges = [
@@ -1728,6 +2204,28 @@ def ensure_minimal_path_plan(
         for path in (item.get("planned_companion_path"), item.get("planned_style_path"))
         if path
     )
+    style_owners = route_scope.get("path_owners") or {}
+    executable_edge_keys = {
+        (str(edge.get("from")), str(edge.get("to")))
+        for edge in executable_edges
+    }
+    for shared_style in sorted(guarded_style_paths):
+        owner_routes = set(style_owners.get(shared_style) or [])
+        for route in route_scope.get("target_routes") or []:
+            if route not in owner_routes:
+                continue
+            for entry_path in (route_scope.get("route_entries") or {}).get(route, []):
+                if entry_path in admissible_paths:
+                    edge_key = (str(entry_path), shared_style)
+                    if edge_key not in executable_edge_keys:
+                        executable_edges.append(
+                            {
+                                "from": str(entry_path),
+                                "to": shared_style,
+                                "kind": "guarded_shared_style",
+                            }
+                        )
+                        executable_edge_keys.add(edge_key)
     fragment_routes = {
         str(item.get("key")): str(item.get("route", "/"))
         for item in baseline.get("fragments", [])
@@ -2131,6 +2629,23 @@ class MinimalPathPolicy:
 
         if relative not in self.guarded_shared_regions:
             return f"No guarded target-route region is authorized for {relative}."
+        contracts = self.guarded_shared_regions.get(relative, [])
+        css_contracts = [
+            item
+            for item in contracts
+            if item.get("mutation_mode") == "target_scoped_css"
+        ]
+        if css_contracts:
+            if len(css_contracts) != len(contracts):
+                return f"Shared stylesheet contracts are ambiguous for {relative}."
+            anchors = sorted(
+                {
+                    str(anchor)
+                    for item in css_contracts
+                    for anchor in item.get("allowed_anchors") or []
+                }
+            )
+            return _validate_target_scoped_css(before, after, anchors)
         before_projection, before_error = self._guarded_projection(relative, before)
         if before_error:
             return before_error
@@ -2306,8 +2821,9 @@ class MinimalPathPolicy:
         if absolute.suffix.lower() not in CODE_EXTENSIONS:
             return None
 
-        guarded_shared = relative in self.cross_route_shared_paths
-        if guarded_shared and relative not in self.guarded_shared_regions:
+        cross_route_shared = relative in self.cross_route_shared_paths
+        guarded_shared = relative in self.guarded_shared_regions
+        if cross_route_shared and not guarded_shared:
             owners = (
                 (self.plan.get("route_scope") or {})
                 .get("path_owners", {})
@@ -2412,8 +2928,14 @@ class MinimalPathPolicy:
             )
         if pairs and absolute.is_file():
             content = absolute.read_text(encoding="utf-8", errors="replace")
+            css_guarded = any(
+                item.get("mutation_mode") == "target_scoped_css"
+                for item in self.guarded_shared_regions.get(relative, [])
+            )
+            css_candidate = content
             for old, new in pairs:
-                if not old or content.count(old) != 1:
+                current_content = css_candidate if css_guarded else content
+                if not old or current_content.count(old) != 1:
                     return self._deny(
                         tool,
                         relative,
@@ -2421,30 +2943,46 @@ class MinimalPathPolicy:
                         patch_lines=patch_lines,
                     )
                 if guarded_shared:
-                    start = content.index(old)
-                    end = start + len(old)
-                    contract = self._guarded_contract_for_span(
-                        relative, content, start, end
-                    )
-                    if contract is None:
-                        return self._deny(
-                            tool,
+                    if css_guarded:
+                        next_content = current_content.replace(old, new, 1)
+                        css_error = self.validate_guarded_shared_file(
                             relative,
-                            "Shared source patches must stay wholly inside one harness-owned "
-                            "guarded target-route region.",
-                            patch_lines=patch_lines,
+                            before=current_content,
+                            after=next_content,
                         )
-                    if contract.get("mutation_mode") == "additive_target_members":
-                        additive_error = _validate_additive_target_members(
-                            old, new, contract.get("allowed_terms") or []
-                        )
-                        if additive_error:
+                        if css_error:
                             return self._deny(
                                 tool,
                                 relative,
-                                additive_error,
+                                css_error,
                                 patch_lines=patch_lines,
                             )
+                        css_candidate = next_content
+                    else:
+                        start = content.index(old)
+                        end = start + len(old)
+                        contract = self._guarded_contract_for_span(
+                            relative, content, start, end
+                        )
+                        if contract is None:
+                            return self._deny(
+                                tool,
+                                relative,
+                                "Shared source patches must stay wholly inside one harness-owned "
+                                "guarded target-route region.",
+                                patch_lines=patch_lines,
+                            )
+                        if contract.get("mutation_mode") == "additive_target_members":
+                            additive_error = _validate_additive_target_members(
+                                old, new, contract.get("allowed_terms") or []
+                            )
+                            if additive_error:
+                                return self._deny(
+                                    tool,
+                                    relative,
+                                    additive_error,
+                                    patch_lines=patch_lines,
+                                )
 
         self._record(
             decision="allow",

@@ -9,9 +9,14 @@ from src.orchestration.ui_action_contracts import validate_ui_action_sequence
 
 
 def test_real_edit_matrix_covers_multi_page_hash_and_minimality_cases():
-    assert len(MATRIX_CASES) == 5
+    assert len(MATRIX_CASES) == 6
     assert any(len(case.target_routes) == 2 for case in MATRIX_CASES)
     assert any("#" in route for case in MATRIX_CASES for route in case.target_routes)
+    assert any(
+        case.name == "multi-html-log-scoped-css"
+        and case.patch_variant == "controlled_target_scoped_css_repair"
+        for case in MATRIX_CASES
+    )
     assert sum(case.certify_minimality for case in MATRIX_CASES) == 1
     for case in MATRIX_CASES:
         for check in (*case.target_checks, *case.protected_checks):

@@ -73,6 +73,21 @@ file is admissible when every owner route is targeted; otherwise only the named 
 target-route region above may open. An unresolved route or a planner check outside the
 explicit ceiling blocks before source mutation.
 
+Multiple static HTML files are first-class route entries rather than one
+undifferentiated folder. Each exact HTML pathname owns the scripts and styles reachable
+through source imports/links; ordinary navigation anchors do not merge page ownership.
+For CSS linked by both target and protected pages, the harness can emit a
+`target_scoped_css` guarded region only when the typed action contract supplies a strong
+target ID or `[data-testid]`/`[data-page]` anchor and that anchor is absent from protected
+route source. Before every exact patch, a fail-closed top-level CSS parser recomputes rule
+boundaries. Every changed rule and comma-separated selector branch must contain an
+allowed anchor outside functional pseudo-classes, without a following `+` or `~` sibling
+escape. Generic rules, mixed global branches, anchor-prefix collisions, edits to unscoped
+existing rules, and changes inside at-rules remain closed. Browser computed-style
+evidence independently checks that the requested rendered property actually took effect.
+Modern nested selector blocks also remain closed because a target-rooted outer rule can
+still use `& + sibling` to escape the intended surface.
+
 - the selected existing source must be successfully read before mutation;
 - overwriting an existing frontend source file is denied;
 - an exact edit must identify one unique source occurrence and stay under the
@@ -97,8 +112,8 @@ forcing unrelated Sprint splitting.
 
 The source plan also records a repository-native design-token inventory: CSS custom
 properties, their definition paths, and use counts. Generator guidance prefers existing
-tokens. A global stylesheet remains protected unless a later selector-aware guard can
-prove that a change is target-scoped.
+tokens. Token discovery alone never opens a global stylesheet; the selector-aware guard
+above grants only target-rooted rule changes.
 
 User reference images and bounded text/source inputs are staged with SHA-256 provenance in
 `task_inputs.json`. Images are native multimodal blocks for planning and implementation,

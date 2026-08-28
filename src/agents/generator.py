@@ -1033,6 +1033,14 @@ def _build_generator_prompt(
             "`source_change_cone.guarded_shared_regions` names an exact target-route object, "
             "class, or function; any admitted patch must stay wholly inside it. A shared file "
             "also opens normally when every owning route is targeted by this sprint.\n",
+            "- A guarded shared stylesheet uses `mutation_mode=target_scoped_css`. Change only "
+            "complete CSS rules whose every comma-separated selector branch contains one of its "
+            "`allowed_anchors`. Keep the anchor outside functional pseudo-classes such as "
+            "`:is()`/`:where()`/`:not()`/`:has()`, and do not escape it with `+` or `~`. Prefer "
+            "an exact target ID or `[data-testid]`/`[data-page]` root; a generic component class "
+            "does not authorize a shared-style change. This guard is fail-closed for edits inside "
+            "at-rules or modern nested selector blocks, so use an already target-local stylesheet "
+            "when responsive nesting is required.\n",
             "- After every successful source mutation, run the smallest applicable syntax, diff, "
             "build, or test validation. Only then can a path connected by a recorded dependency "
             "edge be unlocked; protected and unplanned new source paths remain rejected.\n",
