@@ -33,8 +33,9 @@
 即使这项连贯改动同时涉及多个页面或文件；新的 accepted checkpoint 会成为下一轮 Seed。
 从零任务先得到第一个 accepted checkpoint，之后同样沿 Edit 主线继续。
 
-Generate 和 Repair 从这条历史派生，而不是各跑一套流水线：累计到任一 checkpoint 的
-需求派生 `checkpoint_generate`；累计完整需求到终态派生 `complete_generate`；同一 Edit
+Generate 和 Repair 从这条历史派生，而不是各跑一套流水线：累计到 accepted checkpoint 的
+需求使其成为 `checkpoint_generate` 候选，但不会自动全部物化；累计完整需求到终态派生唯一
+的 `complete_generate`；同一 Edit
 Sprint 中有真实浏览器证据的失败版本到后续恢复派生 `natural_repair`。三者共享 lineage，
 并按角色分开统计。
 
@@ -77,6 +78,7 @@ Sprint 中有真实浏览器证据的失败版本到后续恢复派生 `natural_
 - 通用并发 `scripts/run_batch.py`：独立端口、单 case 超时、逐条 append 状态、成功 case 断点跳过、可选 verified seed、Edit 路由与多模态输入。
 - `scripts/export_run_folders.py`：只消费严格 trajectory exporter 已接受的记录，生成人工可读目录，不再从 commit/Sprint 猜测正式任务类型。
 - 严格 Edit-first 谱系：相邻 accepted checkpoint 是 canonical Edit；`checkpoint_generate` 与 `complete_generate` 是累计需求的派生视图；真实失败到同 Sprint 恢复是 `natural_repair`。正式 Edit/Repair 还必须具备稳定 v4 fragment scope、applied + validated 最小路径 ledger、`certified` 反事实证书、typed accepted tape 与可精确重放 patch；JSONL 只追加且可断点幂等。
+- Generate 显著差异筛选：严格导出保持不可变，`scripts/curate_generate_materiality.py` 另建 release。它保留首个从零 Generate；中间 checkpoint 必须有人类或语义 reviewer 明确确认相对初始及上一条已选 Generate 均有显著差异；终态只保留一个 `complete_generate`，并删除与它同 destination commit 的 checkpoint 视图。代码量阈值只能作为证据，不能自行替代语义判断。
 
 ### Edit 事务、Generate checkpoint 与回归保护
 
@@ -164,6 +166,20 @@ uv run python scripts/export_run_folders.py \
 ```
 
 该工具不覆盖已有目录，也不自行推断 Edit/Repair 标签。
+
+严格导出后，不要把每个 accepted checkpoint 都发布成 Generate。先提供一份
+`generate-materiality-selection-v1` 语义审查，要求候选同时相对初始 Generate 和
+上一条已选 Generate 有显著差异，再创建新的不可变筛选 release：
+
+```bash
+uv run python scripts/curate_generate_materiality.py \
+  --records ./strict-export/records.jsonl \
+  --selection ./generate-materiality-selection.json \
+  --output-dir ./curated-release
+```
+
+输出包含总 `records.jsonl`、按家族拆分的 `generate.jsonl` / `edit.jsonl` /
+`repair.jsonl`，以及记录输入哈希与所有剔除原因的 manifest。原严格导出不会被改写。
 
 ## 环境要求
 
@@ -568,6 +584,7 @@ trace 中的有用信号：
 - `scripts/run_batch.py`：通用并发、可续跑任务调度器
 - `scripts/recover_accepted_tapes.py`：仅凭既有通过证据恢复缺失 tape，并在最终状态真实重放
 - `scripts/export_run_folders.py`：严格 trajectory 记录的人工可读视图
+- `scripts/curate_generate_materiality.py`：带语义审查证据和终态 commit 去重的不可变 Generate 筛选
 - `scripts/validate_webcompass_edit_case.py`：零 LLM 的真实多页 Edit → 失败候选 → 证据驱动 Repair 验证
 
 ## 安全模型

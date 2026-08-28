@@ -32,6 +32,15 @@ Native file creation must use an explicit `create_file` operation with complete
 content. Never encode a new file as an empty search string; schema-specific
 search/replace exports must skip it rather than silently weakening the contract.
 
+An accepted checkpoint is only a Generate candidate, not an automatic Generate record.
+Keep the initial accepted from-zero Generate. An intermediate checkpoint requires an
+explicit human or semantic-review decision that it is materially different from both the
+initial Generate and the previously selected Generate. Keep one terminal
+`complete_generate`, and suppress a checkpoint view with the same destination commit.
+File counts, changed-line thresholds, and code similarity may support the review but may
+not replace semantic materiality judgment. Curation must create a new immutable release
+and preserve the strict export unchanged.
+
 ## Edit safety invariant
 
 For every incremental Edit or Repair, the harness must guide the model toward

@@ -29,10 +29,13 @@ similarity threshold. It does not claim that the new feature works; the normal b
 evaluator still owns that oracle.
 
 The strict exporter publishes adjacent accepted checkpoint transitions as canonical
-Edit records. It derives separately labeled `checkpoint_generate` and
+Edit records. It derives separately labeled `checkpoint_generate` candidates and
 `complete_generate` views from cumulative requirements, and derives Repair only from a
 browser-reproduced failed checkpoint to an accepted checkpoint in the same Sprint. A
-partial roadmap is never relabeled as `complete_generate`.
+partial roadmap is never relabeled as `complete_generate`. A separate immutable
+materiality curator keeps the initial Generate, requires explicit human/semantic review
+for intermediate Generate views, keeps one complete terminal view, and removes a
+terminal checkpoint duplicate with the same destination commit.
 
 Each explicit Edit is exactly one Sprint, including one coherent multi-page/multi-file
 transaction. It receives up to ten build/evaluate cycles by default, but acceptance

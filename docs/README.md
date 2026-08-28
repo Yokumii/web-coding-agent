@@ -11,5 +11,7 @@
   [`0805_harness_capability_audit_20260813.md`](0805_harness_capability_audit_20260813.md).
 - **Dated external-ideas synthesis and real matrix:**
   [`edit_harness_external_ideas_and_real_matrix_20260828.md`](edit_harness_external_ideas_and_real_matrix_20260828.md).
+- **Dated Generate materiality curation and three-family sample:**
+  [`generate_materiality_curation_20260828.md`](generate_materiality_curation_20260828.md).
 
 Current source/config and append-only run evidence take precedence over dated reports.

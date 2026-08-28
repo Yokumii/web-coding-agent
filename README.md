@@ -37,8 +37,9 @@ becomes the next reusable Seed. A from-zero run creates the first accepted check
 then continues through the same Edit path.
 
 The accepted Edit history derives two other data views. Accumulated requirements through
-any accepted checkpoint yield a separately labeled `checkpoint_generate`; accumulated
-full requirements through the terminal checkpoint yield `complete_generate`. A real,
+an accepted checkpoint make it a `checkpoint_generate` candidate; materialization is
+selective rather than automatic. Accumulated full requirements through the terminal
+checkpoint yield one `complete_generate`. A real,
 browser-reproduced failure followed by same-Sprint recovery yields `natural_repair`.
 All records share lineage IDs and are never inferred from filenames or heuristic task
 classifiers.
@@ -82,6 +83,7 @@ What is implemented:
 - A provider-agnostic concurrent batch scheduler with per-case ports/timeouts, append-only status records, successful-case resume, optional verified seed preparation, Edit routes, and multimodal inputs.
 - A human-readable folder exporter layered on the strict trajectory exporter; it never reclassifies tasks from commit/sprint heuristics.
 - Strict Edit-first lineage export: canonical Edit pairs come from adjacent accepted checkpoints; `checkpoint_generate` and `complete_generate` are cumulative derived views; `natural_repair` comes only from reproduced failure to same-Sprint recovery. Formal Edit/Repair export requires v4 stable fragment scope, an applied-and-validated minimal-path ledger, a certified counterfactual certificate, typed accepted tape evidence, and reproducible exact patches. JSONL export is append-only and resume-idempotent.
+- Generate materiality curation: strict exports remain immutable, while `scripts/curate_generate_materiality.py` creates a separate release. It retains the first from-zero Generate, requires an explicit human/semantic-review decision for intermediate checkpoints, keeps one terminal `complete_generate`, and removes any checkpoint view with the same destination commit. Code-size thresholds can be evidence but never decide semantic significance by themselves.
 - Native trajectory records represent new files explicitly as `operation=create_file` plus `content`; they never overload an empty search string. Reverse-compatible WebCompass v2 export remains search/replace-only and skips native file-creation records with an explicit quality limitation.
 
 ## Requirements
@@ -358,9 +360,9 @@ or provider-specific tool even when they bypassed a normal Edit/patch preflight.
 For a from-zero final website, set `FINAL_PROJECT_MODE=1` or pass
 `--final-project-mode`. The planner chooses a natural Sprint count and the harness
 continues until the complete product is accepted. Adjacent accepted checkpoints are the
-canonical Edit history; every accepted checkpoint may yield `checkpoint_generate`, the
-terminal checkpoint yields `complete_generate`, and reproduced failed checkpoints may
-yield Repair. This mode uses the full
+canonical Edit history; accepted checkpoints are selective `checkpoint_generate`
+candidates, the terminal checkpoint yields one `complete_generate`, and reproduced
+failed checkpoints may yield Repair. This mode uses the full
 evaluator by default (`EVALUATOR_MODE=full`).
 
 Design image generation is configured by environment only:
@@ -456,6 +458,22 @@ uv run python scripts/export_run_folders.py \
 
 The folder exporter refuses to overwrite an existing record folder and preserves the
 strict exporter's task label, code snapshots, exact patches, images, and guard evidence.
+
+Do not publish every accepted checkpoint as Generate. After strict export, provide a
+`generate-materiality-selection-v1` review whose passing decisions compare a candidate
+with both the initial and previously selected Generate, then create a new immutable
+curated release:
+
+```bash
+uv run python scripts/curate_generate_materiality.py \
+  --records ./strict-export/records.jsonl \
+  --selection ./generate-materiality-selection.json \
+  --output-dir ./curated-release
+```
+
+The output contains `records.jsonl`, per-family `generate.jsonl` / `edit.jsonl` /
+`repair.jsonl`, and a manifest with the source hash and every exclusion reason. The
+source strict export is never rewritten.
 
 Run with the optional image-first design stage:
 
@@ -677,6 +695,7 @@ The harness currently uses:
 - `scripts/run_batch.py`: generic concurrent, resumable task scheduler
 - `scripts/recover_accepted_tapes.py`: evidence-only recovery and final-state replay of missing accepted tapes
 - `scripts/export_run_folders.py`: human view built only from strict trajectory records
+- `scripts/curate_generate_materiality.py`: immutable post-export Generate selection with semantic-review evidence and terminal-commit deduplication
 - `scripts/validate_webcompass_edit_case.py`: zero-LLM real multi-page Edit → failed candidate → evidence-driven Repair validation
 
 ## Security Model
