@@ -52,6 +52,7 @@ SUPPORTED_UI_ACTIONS = frozenset(
         "emulate_media",
         "evaluate",
         "fill",
+        "go_back",
         "hover",
         "key_press",
         "reload",
@@ -62,6 +63,7 @@ SUPPORTED_UI_ACTIONS = frozenset(
         "set_input_files",
         "set_viewport",
         "wait_for",
+        "wait",
     }
 )
 
@@ -90,6 +92,7 @@ _ACTION_FIELDS = {
     "emulate_media": {"media", "color_scheme"},
     "evaluate": {"expression"},
     "fill": {"selector", "value"},
+    "go_back": set(),
     "hover": {"selector"},
     "key_press": {"selector", "key", "count"},
     "reload": set(),
@@ -100,6 +103,7 @@ _ACTION_FIELDS = {
     "set_input_files": {"selector", "files"},
     "set_viewport": {"width", "height"},
     "wait_for": {"selector", "state", "timeout_ms"},
+    "wait": {"milliseconds"},
 }
 
 _COMPUTED_STYLE_PROPERTIES = frozenset(
@@ -463,6 +467,8 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             )
         if "timeout_ms" in step:
             _bounded_int(step, "timeout_ms", action, minimum=1, maximum=5_000)
+    elif action == "wait":
+        _bounded_int(step, "milliseconds", action, minimum=1, maximum=5_000)
 
 
 def validate_ui_action_sequence(actions: list[dict[str, Any]]) -> None:

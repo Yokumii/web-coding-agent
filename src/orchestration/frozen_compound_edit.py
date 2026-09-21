@@ -134,6 +134,11 @@ def normalize_frozen_compound_plan(
                             and "value" in action
                         ):
                             action["key"] = action.pop("value")
+                        if action.get("action") == "scroll" and "y" not in action:
+                            amount = int(action.pop("amount", 600))
+                            direction = str(action.pop("direction", "down"))
+                            action.pop("selector", None)
+                            action["y"] = 0 if direction == "up" else amount
                         if (
                             action.get("action") == "assert_url"
                             and "#" in str(action.get("value") or "")

@@ -45,6 +45,9 @@ object. Express absence with assert_hidden on a feature-specific selector or ass
 assert_storage_value uses storage=`local` or `session` and must compare an exact value grounded
 in the instruction or earlier actions. Never use `nonempty` as its value or match mode; omit that
 storage assertion when an exact value cannot be known.
+Other supported bounded actions are reload, go_back, scroll with integer y, wait with
+milliseconds up to 5000, wait_for with selector, set_viewport, key_press, hover, and
+drag_and_drop with source_selector and target_selector.
 
 Return JSON only:
 {"subtasks":[{"id":"q1","task_type":"...","instruction":"exact unchanged text",

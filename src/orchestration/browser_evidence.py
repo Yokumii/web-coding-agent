@@ -1048,6 +1048,12 @@ async def collect_browser_evidence(
                                     timeout=15_000,
                                 )
                                 result["output"] = "reloaded"
+                            elif action == "go_back":
+                                await page.go_back(
+                                    wait_until="domcontentloaded",
+                                    timeout=15_000,
+                                )
+                                result["output"] = "went back"
                             elif action == "fill":
                                 await page.fill(str(step["selector"]), str(step["value"]))
                                 result["output"] = "filled"
@@ -1101,6 +1107,9 @@ async def collect_browser_evidence(
                                     timeout=int(step.get("timeout_ms", action_timeout_ms)),
                                 )
                                 result["output"] = str(step.get("state", "visible"))
+                            elif action == "wait":
+                                await page.wait_for_timeout(int(step["milliseconds"]))
+                                result["output"] = f"waited {int(step['milliseconds'])}ms"
                             elif action == "emulate_media":
                                 options: dict[str, Any] = {}
                                 if "media" in step:

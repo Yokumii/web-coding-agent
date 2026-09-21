@@ -212,6 +212,32 @@ def test_plan_splits_url_fragment_assertion_into_path_and_hash():
     ]
 
 
+def test_plan_normalizes_scroll_aliases_and_accepts_bounded_history_wait():
+    tasks = frozen_tasks()
+    payload = raw_plan(tasks)
+    payload["subtasks"][0]["atomic_plan"]["checks"][0]["actions"] = [
+        {"action": "scroll", "selector": "main", "direction": "down", "amount": 600},
+        {"action": "go_back"},
+        {"action": "wait", "milliseconds": 250},
+        {"action": "assert_visible", "selector": "main"},
+    ]
+
+    normalized = normalize_frozen_compound_plan(
+        payload,
+        case_id="case-1",
+        source_code_sha256="abc",
+        planner_model="gpt-5.6-luna",
+        frozen_subtasks=tasks,
+    )
+
+    actions = normalized["subtasks"][0]["atomic_plan"]["checks"][0]["actions"]
+    assert actions[:3] == [
+        {"action": "scroll", "y": 600},
+        {"action": "go_back"},
+        {"action": "wait", "milliseconds": 250},
+    ]
+
+
 def test_frozen_plan_detects_post_plan_mutation(tmp_path):
     tasks = frozen_tasks()
     normalized = normalize_frozen_compound_plan(
