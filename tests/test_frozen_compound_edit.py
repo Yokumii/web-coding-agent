@@ -216,6 +216,7 @@ def test_plan_normalizes_scroll_aliases_and_accepts_bounded_history_wait():
     tasks = frozen_tasks()
     payload = raw_plan(tasks)
     payload["subtasks"][0]["atomic_plan"]["checks"][0]["actions"] = [
+        {"action": "press", "selector": "button", "key": "Enter"},
         {"action": "scroll", "selector": "main", "direction": "down", "amount": 600},
         {"action": "go_back"},
         {"action": "wait", "milliseconds": 250},
@@ -231,7 +232,8 @@ def test_plan_normalizes_scroll_aliases_and_accepts_bounded_history_wait():
     )
 
     actions = normalized["subtasks"][0]["atomic_plan"]["checks"][0]["actions"]
-    assert actions[:3] == [
+    assert actions[:4] == [
+        {"action": "key_press", "selector": "button", "key": "Enter"},
         {"action": "scroll", "y": 600},
         {"action": "go_back"},
         {"action": "wait", "milliseconds": 250},

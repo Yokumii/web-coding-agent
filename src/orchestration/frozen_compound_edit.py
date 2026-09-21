@@ -114,6 +114,8 @@ def normalize_frozen_compound_plan(
             for action in check.get("actions") or []:
                 if not isinstance(action, dict) or action.get("action") != "navigate":
                     if isinstance(action, dict):
+                        if action.get("action") == "press":
+                            action["action"] = "key_press"
                         if action.get("action") == "drag_and_drop":
                             for alias, canonical in (
                                 ("source", "source_selector"),
