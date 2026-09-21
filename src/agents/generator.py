@@ -1266,6 +1266,7 @@ async def _run_atomic_patch_executor(
     trace_path = RoundArtifacts(file_comm, round_num).trace_path("generator")
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     supplied_plan = bool((file_comm.read_state() or {}).get("supplied_atomic_plan"))
+    frozen_compound = config.edit_frozen_compound_mode
     system_prompt = (
         (REPAIR_SYSTEM_PROMPT if mode == "repair" else EDIT_SYSTEM_PROMPT)
         + "\nReturn JSON only. Prefer the compact protocol: "
@@ -1283,7 +1284,20 @@ async def _run_atomic_patch_executor(
         "boundaries. Legacy patches/new_files remain accepted only when the compact protocol "
         "cannot express the change. Do not describe commands."
     )
-    if supplied_plan:
+    if supplied_plan and frozen_compound:
+        system_prompt += (
+            " Frozen compound Edit policy: implement the complete requested behavior in the "
+            "existing project with the smallest coherent exact patch. Browser checks are "
+            "necessary acceptance evidence, not permission to add empty selector-only shells. "
+            "Reuse the original structure, styling, data and behavior; do not broadly rewrite "
+            "or restyle the page. Respect the supplied patch-line and touched-file budgets, and "
+            "never overwrite an existing file. Omit file_sha256/source_sha256 from operations: "
+            "Harness binds the supplied immutable revisions. For a localized change inside a "
+            "long/minified line, use {\"patches\":[{\"path\":...,\"old_text\":...,"
+            "\"new_text\":...}]}; each old_text must occur exactly once. Do not mix patches "
+            "and line operations for the same file."
+        )
+    elif supplied_plan:
         system_prompt += (
             " Product Session policy overrides minimal-path guidance: there is no patch-line "
             "or touched-file minimality budget. Implement this one requested capability "
@@ -1587,13 +1601,13 @@ async def _run_atomic_patch_executor(
                 effective_patch_lines += max(
                     1, effective_patch_line_count(current if target.exists() else "", updated)
                 )
-                if not supplied_plan and effective_patch_lines > max_patch_lines:
+                if (not supplied_plan or frozen_compound) and effective_patch_lines > max_patch_lines:
                     raise ValueError(
                         f"Atomic candidate changes {effective_patch_lines} effective patch lines, "
                         f"exceeding the hard total budget of {max_patch_lines}; preserve unchanged "
                         "context and narrow the semantic edit."
                     )
-                if supplied_plan:
+                if supplied_plan and not frozen_compound:
                     if not relative.startswith("frontend/"):
                         raise ValueError(f"patch must target frontend source: {relative}")
                     if relative in mutation_policy.off_target_paths:
@@ -1622,7 +1636,7 @@ async def _run_atomic_patch_executor(
                     "compact_operation_count": len(item) if operation == "line_edits" else 1,
                 }, ensure_ascii=False) + "\n")
                 trace.flush()
-                if supplied_plan:
+                if supplied_plan and not frozen_compound:
                     continue  # The supplied browser check owns functional acceptance.
                 diff_check = subprocess.run(
                     ["git", "diff", "--check"],

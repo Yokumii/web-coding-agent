@@ -75,6 +75,8 @@ class HarnessConfig:
     edit_originality_required: bool = True
     edit_collect_visual_failures_before_repair: bool = False
     edit_webcompass_defect_checks: bool = False
+    edit_replay_all_accepted_checks: bool = False
+    edit_ignore_unstable_source_fragments: bool = False
     """harness 运行期配置，来源依次为显式参数、环境变量与内置默认值。"""
 
     api_key: str = field(default_factory=lambda: _env_str("ANTHROPIC_API_KEY"))
@@ -111,6 +113,9 @@ class HarnessConfig:
     )
     minimal_path_guidance_enabled: bool = field(
         default_factory=lambda: _env_bool("MINIMAL_PATH_GUIDANCE_ENABLED", True)
+    )
+    edit_frozen_compound_mode: bool = field(
+        default_factory=lambda: _env_bool("EDIT_FROZEN_COMPOUND_MODE", False)
     )
     minimal_path_max_patch_lines: int = field(
         default_factory=lambda: _env_int(

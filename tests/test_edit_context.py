@@ -291,3 +291,36 @@ def test_behavior_only_edit_context_skips_connected_stylesheet(tmp_path: Path):
         "frontend/app.js",
         "frontend/index.html",
     ]
+
+
+def test_frozen_compound_context_includes_direct_markup_and_style_dependencies(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "app.js").write_text("const app = true;\n", encoding="utf-8")
+    (frontend / "index.html").write_text("<main>Dashboard</main>\n", encoding="utf-8")
+    (frontend / "styles.css").write_text("main { color: black; }\n", encoding="utf-8")
+    plan = _plan()
+    plan["target_contract"] = {"requested_source_roles": ["behavior"]}
+    plan["source_change_cone"].update(
+        {
+            "initial_paths": ["frontend/app.js"],
+            "local_paths": ["frontend/app.js"],
+            "dependency_paths": ["frontend/index.html", "frontend/styles.css"],
+        }
+    )
+
+    payload = ensure_edit_context(
+        workdir=tmp_path,
+        harness_dir=tmp_path / ".harness",
+        plan=plan,
+        round_num=1,
+        include_dependency_paths=True,
+    )
+
+    assert payload["exposure"]["selected_paths"] == [
+        "frontend/app.js",
+        "frontend/index.html",
+        "frontend/styles.css",
+    ]

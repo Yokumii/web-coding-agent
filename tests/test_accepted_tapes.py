@@ -263,3 +263,28 @@ def test_long_chain_keeps_full_history_but_replays_only_minimal_sample(tmp_path)
     assert selection['checks'] == []
     assert selection['skipped_reasons']['UI-000'] == 'minimal_replay_limit'
     assert selection['skipped_reasons']['UI-002'] == 'minimal_replay_limit'
+
+
+def test_g2_chain_can_require_full_historical_replay(tmp_path):
+    checks = [_check(f"UI-{index:03d}") for index in range(9)]
+    append_accepted_tape(
+        harness_dir=tmp_path,
+        sprint_num=1,
+        round_num=1,
+        checks=checks,
+        evidence={"checks": [
+            {"check_id": check["id"], "status": "ok"} for check in checks
+        ]},
+    )
+
+    selection = select_accepted_replay_checks(
+        tmp_path,
+        edit_card={},
+        accepted_edit_index=2,
+        full_replay_interval=5,
+        replay_all=True,
+    )
+
+    assert selection["mode"] == "required_full"
+    assert selection["checks"] == checks
+    assert selection["skipped_reasons"] == {}

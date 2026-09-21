@@ -2326,6 +2326,7 @@ def ensure_minimal_path_plan(
     mode: str,
     max_patch_lines: int,
     max_touched_files: int,
+    eager_dependency_context: bool = False,
 ) -> dict[str, Any]:
     """Create one immutable harness-owned plan for an edit/repair round."""
     path = harness_dir / plan_name(round_num)
@@ -2622,6 +2623,24 @@ def ensure_minimal_path_plan(
         if target and target not in local and target not in dependencies:
             dependencies.append(target)
     dependencies.sort()
+    if eager_dependency_context:
+        # A frozen compound Edit gets one implementation request. Pre-authorize
+        # the smallest connected source unit so that request can make a coherent
+        # HTML/CSS/JS change without a validation-driven second discovery turn.
+        eager_paths = list(dict.fromkeys([*local, *dependencies]))
+        cursor = 0
+        while cursor < len(eager_paths) and len(eager_paths) < max_touched_files:
+            seed = eager_paths[cursor]
+            cursor += 1
+            for dependency in sorted(_dependency_neighbors(graph, seed)):
+                if dependency not in admissible_paths or dependency in eager_paths:
+                    continue
+                eager_paths.append(dependency)
+                if len(eager_paths) >= max_touched_files:
+                    break
+        local = sorted(eager_paths)
+        initial = list(local)
+        dependencies = []
     all_paths = [_relative_to_workdir(item, workdir) for item in files]
     protected = sorted(set(all_paths) - set(local) - set(dependencies))
     executable_edges = [

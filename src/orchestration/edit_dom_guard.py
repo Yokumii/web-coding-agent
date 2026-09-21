@@ -954,6 +954,18 @@ async def capture_baseline(
     snapshot = await snapshot_semantic_dom(
         app_url, headless=config.playwright_headless, routes=routes
     )
+    if (
+        snapshot.get("stable") is not True
+        and config.edit_ignore_unstable_source_fragments
+    ):
+        unstable = set(snapshot.get("unstable_fragment_keys") or [])
+        snapshot["fragments"] = [
+            item
+            for item in snapshot.get("fragments") or []
+            if item.get("key") not in unstable
+        ]
+        snapshot["ignored_unstable_fragment_keys"] = sorted(unstable)
+        snapshot["stable"] = True
     if snapshot.get("stable") is not True:
         raise RuntimeError(
             "semantic baseline is unstable across two samples: "
@@ -980,6 +992,18 @@ async def capture_sprint_source_baseline(
     snapshot = await snapshot_semantic_dom(
         app_url, headless=config.playwright_headless, routes=routes
     )
+    if (
+        snapshot.get("stable") is not True
+        and config.edit_ignore_unstable_source_fragments
+    ):
+        unstable = set(snapshot.get("unstable_fragment_keys") or [])
+        snapshot["fragments"] = [
+            item
+            for item in snapshot.get("fragments") or []
+            if item.get("key") not in unstable
+        ]
+        snapshot["ignored_unstable_fragment_keys"] = sorted(unstable)
+        snapshot["stable"] = True
     if snapshot.get("stable") is not True:
         raise RuntimeError(
             "semantic sprint baseline is unstable across two samples: "

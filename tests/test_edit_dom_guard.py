@@ -875,6 +875,40 @@ def test_fragment_guard_fails_closed_on_unstable_baseline():
     assert "unstable" in result["reason"]
 
 
+@pytest.mark.anyio
+async def test_g2_baseline_can_exclude_only_twice_observed_unstable_fragments(
+    tmp_path, monkeypatch
+):
+    async def fake_snapshot(*args, **kwargs):
+        return {
+            "version": 4,
+            "stable": False,
+            "unstable_fragment_keys": ["canvas", "clock"],
+            "roots": [],
+            "fragments": [
+                {"key": "main", "fingerprint": "stable", "route": "/"},
+                {"key": "canvas", "fingerprint": "moving", "route": "/"},
+                {"key": "clock", "fingerprint": "ticking", "route": "/"},
+            ],
+        }
+
+    monkeypatch.setattr(
+        "src.orchestration.edit_dom_guard.snapshot_semantic_dom", fake_snapshot
+    )
+    file_comm = FileComm(tmp_path / ".harness")
+
+    captured = await capture_baseline(
+        workdir=tmp_path,
+        file_comm=file_comm,
+        config=HarnessConfig(edit_ignore_unstable_source_fragments=True),
+        app_url="http://127.0.0.1:1",
+    )
+
+    assert captured["stable"] is True
+    assert [item["key"] for item in captured["fragments"]] == ["main"]
+    assert captured["ignored_unstable_fragment_keys"] == ["canvas", "clock"]
+
+
 def test_multi_route_scope_rejects_allowed_root_from_protected_page():
     baseline = {
         "version": 3,

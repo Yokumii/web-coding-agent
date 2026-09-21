@@ -181,6 +181,7 @@ def ensure_edit_context(
     max_file_chars: int = 12_000,
     context_lines: int = 18,
     source_anchors: list[str] | None = None,
+    include_dependency_paths: bool = False,
 ) -> dict[str, Any]:
     """Select deterministic code windows; never ask an LLM to discover source scope."""
     path = harness_dir / edit_context_name(round_num)
@@ -192,14 +193,21 @@ def ensure_edit_context(
     }
     initial_paths = [str(item) for item in cone.get("initial_paths") or []]
     local_paths = [str(item) for item in cone.get("local_paths") or []]
+    dependency_paths = [str(item) for item in cone.get("dependency_paths") or []]
     requested_roles = {
         str(item)
         for item in (plan.get("target_contract") or {}).get(
             "requested_source_roles", []
         )
     }
-    selected_paths = list(dict.fromkeys(initial_paths + local_paths))
-    if "style" not in requested_roles:
+    selected_paths = list(
+        dict.fromkeys(
+            initial_paths
+            + local_paths
+            + (dependency_paths if include_dependency_paths else [])
+        )
+    )
+    if "style" not in requested_roles and not include_dependency_paths:
         # Behavior-only edits need markup and script context, but loading every
         # connected stylesheet spends tokens and invites gratuitous visual churn.
         # A typed style failure can still unlock that dependency on a later round.

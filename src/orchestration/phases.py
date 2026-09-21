@@ -557,6 +557,7 @@ async def run_build_phase(
             mode=mode,
             max_patch_lines=ctx.config.minimal_path_max_patch_lines,
             max_touched_files=ctx.config.minimal_path_max_touched_files,
+            eager_dependency_context=ctx.config.edit_frozen_compound_mode,
         )
         if minimal_path_plan.get("status") == "blocked":
             route_scope = minimal_path_plan.get("route_scope") or {}
@@ -580,6 +581,7 @@ async def run_build_phase(
             plan=minimal_path_plan,
             round_num=round_num,
             source_anchors=list(atomic_plan.get("source_anchors") or []),
+            include_dependency_paths=ctx.config.edit_frozen_compound_mode,
             **({"max_total_chars": 250000, "max_file_chars": 250000}
                if (ctx.file_comm.read_state() or {}).get("supplied_atomic_plan") else {}),
         )
@@ -1340,6 +1342,7 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                             accepted_edit_index=len(ctx.sprint_state.accepted) + 1,
                             full_replay_interval=ctx.config.edit_full_replay_interval,
                             before_round=round_num,
+                            replay_all=ctx.config.edit_replay_all_accepted_checks,
                         )
                         replay_checks = list(regression_selection.pop("checks"))
                         (ctx.file_comm.dir / f"regression_selection_round_{round_num}.json").write_text(

@@ -149,6 +149,7 @@ def select_accepted_replay_checks(
     accepted_edit_index: int,
     full_replay_interval: int = 5,
     before_round: int | None = None,
+    replay_all: bool = False,
 ) -> dict[str, Any]:
     """Select historical obligations by impact and keep one route sentinel.
 
@@ -205,8 +206,14 @@ def select_accepted_replay_checks(
             continue
         active.append(check)
 
-    if periodic_full or legacy_full:
-        mode = "periodic_full" if periodic_full else "legacy_full"
+    if replay_all or periodic_full or legacy_full:
+        mode = (
+            "required_full"
+            if replay_all
+            else "periodic_full"
+            if periodic_full
+            else "legacy_full"
+        )
         for check in active:
             include(check, mode)
     else:
@@ -236,7 +243,7 @@ def select_accepted_replay_checks(
             if check_id not in selected_ids:
                 skipped_reasons.setdefault(check_id, "outside_impact_slice")
 
-    if len(selected) > MAX_SELECTED_REPLAY_CHECKS:
+    if not replay_all and len(selected) > MAX_REPLAY_CHECKS:
         kept = selected[:MAX_SELECTED_REPLAY_CHECKS]
         kept_ids = {str(item.get("id", "")) for item in kept}
         for check in selected[MAX_SELECTED_REPLAY_CHECKS:]:
