@@ -125,6 +125,7 @@ def _provider_config(args: argparse.Namespace) -> HarnessConfig:
         # frozen current + full historical browser replay for acceptance.
         minimality_guard_enabled=False,
         minimal_path_guidance_enabled=True,
+        minimal_path_max_patch_lines=240,
         minimal_path_max_touched_files=12,
         agent_request_timeout_seconds=args.request_timeout,
     )

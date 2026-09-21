@@ -139,6 +139,12 @@ def test_plan_normalizes_unambiguous_action_field_aliases():
             "key": "page",
             "value": 2,
         },
+        {
+            "action": "assert_property",
+            "selector": "#status",
+            "name": "data-running",
+            "value": True,
+        },
     ]
 
     normalized = normalize_frozen_compound_plan(
@@ -153,6 +159,8 @@ def test_plan_normalizes_unambiguous_action_field_aliases():
     assert actions[0]["name"] == "disabled"
     assert "property" not in actions[0]
     assert actions[1]["storage"] == "session"
+    assert actions[2]["action"] == "assert_attribute"
+    assert actions[2]["name"] == "data-running"
 
 
 def test_plan_normalizes_common_interaction_aliases():

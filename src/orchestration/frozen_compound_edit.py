@@ -161,6 +161,11 @@ def normalize_frozen_compound_plan(
                             and "name" not in action
                         ):
                             action["name"] = action.pop("property")
+                        if (
+                            action.get("action") == "assert_property"
+                            and str(action.get("name") or "").startswith(("data-", "aria-"))
+                        ):
+                            action["action"] = "assert_attribute"
                         if action.get("action") in {
                             "assert_storage_value",
                             "set_storage_value",
