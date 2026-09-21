@@ -283,6 +283,8 @@ def test_reset_run_artifacts_clears_new_planning_files():
         traces_dir.mkdir()
         (logs_dir / "frontend.log").write_text("log")
         (traces_dir / "planner.jsonl").write_text("trace")
+        (harness_dir / "edit_risk_tests.json").write_text("{}")
+        (harness_dir / "hidden_oracle_checks.json").write_text("{}")
 
         comm.reset_run_artifacts()
 
@@ -304,6 +306,8 @@ def test_reset_run_artifacts_clears_new_planning_files():
         assert not logs_dir.exists()
         assert not traces_dir.exists()
         assert not (harness_dir / "design").exists()
+        assert not (harness_dir / "edit_risk_tests.json").exists()
+        assert not (harness_dir / "hidden_oracle_checks.json").exists()
 
 
 def test_reset_keeps_accepted_edit_baseline_but_removes_stale_edit_scope():

@@ -1,14 +1,177 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 from src.orchestration.minimal_path_guidance import (
     MinimalPathPolicy,
+    effective_patch_line_count,
+    _extract_selectors,
+    _resolve_target_route,
+    _selector_tokens,
     _fragment_dom_scope,
+    _selector_anchor_variants,
+    _stable_source_anchor_checks,
     _validate_target_scoped_css,
     ensure_minimal_path_plan,
 )
+
+
+def test_static_index_alias_resolves_only_to_its_actual_entry_file():
+    assert _resolve_target_route("/index.html", {"/": {"frontend/index.html"}}) == "/"
+    assert _resolve_target_route("/docs/index.html", {"/docs": {"frontend/docs/index.html"}}) == "/docs"
+    assert _resolve_target_route("/index.html", {"/": {"frontend/src/App.tsx"}}) is None
+    assert _resolve_target_route("/catalog.html", {"/": {"frontend/index.html"}}) is None
+
+
+def test_fragment_scope_uses_verified_alias_without_including_another_route():
+    baseline = {"version":4, "fragments":[{"key":"panel", "route":"/", "anchors":["#panel"]}]}
+    checks = [{"route":"/index.html", "actions":[{"action":"assert_visible", "selector":"#panel"}]}]
+    result = _fragment_dom_scope(baseline, checks, ["/"], route_aliases={"/index.html":"/"})
+    assert result[0] == ["panel"]
+    checks[0]["route"] = "/another.html"
+    assert _fragment_dom_scope(baseline, checks, ["/"], route_aliases={"/index.html":"/"})[0] == []
+
+
+def test_extract_selectors_includes_both_drag_endpoints():
+    selectors = _extract_selectors([{"actions": [{
+        "action": "drag_and_drop",
+        "source_selector": ".artifact-card:nth-child(1)",
+        "target_selector": ".artifact-card:nth-child(2)",
+    }]}])
+
+    assert selectors == [
+        ".artifact-card:nth-child(1)",
+        ".artifact-card:nth-child(2)",
+    ]
+    assert "artifact-card" in _selector_tokens(selectors)
+    assert "artifact-card:nth-child" not in _selector_tokens(selectors)
+
+
+def test_selector_anchor_variants_extract_class_after_tag_name():
+    variants = _selector_anchor_variants(
+        'a.sidebar-item[data-name="Audio Studio Driver"][class~="highlighted"]'
+    )
+
+    assert ".sidebar-item" in variants
+    assert ".highlighted" not in variants
+
+
+def test_stable_source_anchor_checks_exclude_positional_selectors():
+    checks = _stable_source_anchor_checks(
+        {
+            "source_anchors": [
+                "#view-gallery",
+                "[data-testid='results']",
+                "a:nth-of-type(3)",
+            ]
+        },
+        ["/"],
+    )
+
+    assert [item["actions"][0]["selector"] for item in checks] == [
+        "#view-gallery",
+        "[data-testid='results']",
+    ]
+
+
+def test_unresolved_hash_source_anchor_is_not_a_required_new_dom_fragment():
+    baseline = {
+        "version": 4,
+        "fragments": [
+            {"key": "view-gallery", "route": "/", "anchors": ["#view-gallery"]}
+        ],
+    }
+    allowed, expected, evidence, unresolved = _fragment_dom_scope(
+        baseline,
+        [{"route": "/", "actions": [{"action": "check_level", "selector": "#gallery"}]}],
+        ["/"],
+    )
+
+    assert allowed == []
+    assert expected == []
+    assert unresolved == []
+    assert evidence == [{
+        "selector": "#gallery",
+        "route": "/",
+        "resolution": "unresolved_source_anchor_ignored",
+    }]
+
+
+def test_fragment_scope_collapses_nested_allowed_fragments_to_target_surface():
+    baseline = {
+        "version": 4,
+        "fragments": [
+            {
+                "key": "/::gallery",
+                "route": "/",
+                "anchors": ["#view-gallery"],
+            },
+            {
+                "key": "/::grid",
+                "route": "/",
+                "parent_key": "/::gallery",
+                "anchors": ["#gallery-grid"],
+            },
+            {
+                "key": "/::card",
+                "route": "/",
+                "parent_key": "/::grid",
+                "anchors": [".artifact-card"],
+            },
+        ],
+    }
+    checks = [{
+        "route": "/",
+        "actions": [
+            {"action": "assert_visible", "selector": ".artifact-card"},
+            {"action": "check_level", "selector": "#view-gallery"},
+            {"action": "check_level", "selector": "#gallery-grid"},
+        ],
+    }]
+
+    allowed, _expected, _evidence, unresolved = _fragment_dom_scope(
+        baseline, checks, ["/"]
+    )
+
+    assert allowed == ["/::gallery"]
+    assert unresolved == []
+
+
+def test_fragment_scope_carries_interaction_state_across_split_check_parts():
+    baseline = {
+        "version": 4,
+        "fragments": [{
+            "key": "/::download",
+            "route": "/",
+            "anchors": ["#download"],
+        }],
+    }
+    checks = [
+        {
+            "id": "history__part1",
+            "route": "/",
+            "actions": [
+                {"action": "click", "selector": "#download"},
+                {"action": "assert_visible", "selector": "[data-testid='download-history']"},
+            ],
+        },
+        {
+            "id": "history__part2",
+            "route": "/",
+            "actions": [
+                {"action": "assert_visible", "selector": "[data-testid='history-file-size']"},
+            ],
+        },
+    ]
+
+    _allowed, expected, _evidence, unresolved = _fragment_dom_scope(
+        baseline, checks, ["/"]
+    )
+
+    assert unresolved == []
+    assert all(item.get("min_count") == 0 for item in expected)
 
 
 def _write_contract(workdir: Path) -> None:
@@ -72,6 +235,57 @@ def _write_contract(workdir: Path) -> None:
     )
 
 
+def test_dynamic_testid_item_is_covered_by_new_structural_container():
+    baseline = {
+        "version": 4,
+        "stable": True,
+        "fragments": [
+            {
+                "key": "main",
+                "route": "/",
+                "fingerprint": "stable",
+                "anchors": ["main"],
+            }
+        ],
+    }
+    checks = [
+        {
+            "route": "/",
+            "actions": [
+                {"action": "click", "selector": "#downloadBtn"},
+                {
+                    "action": "assert_visible",
+                    "selector": "[data-testid='download-history']",
+                },
+                {
+                    "action": "assert_visible",
+                    "selector": "[data-testid='download-history-item']:first-child",
+                },
+            ],
+        }
+    ]
+
+    _allowed, expected, evidence, unresolved = _fragment_dom_scope(
+        baseline, checks, ["/"], existing_source_selectors={"#downloadBtn"}
+    )
+
+    assert expected == [
+        {
+            "route": "/",
+            "selector": "[data-testid='download-history']",
+            "min_count": 0,
+            "max_count": 1,
+        }
+    ]
+    assert any(
+        item.get("resolution") == "covered_by_expected_subtree"
+        and item.get("selector")
+        == "[data-testid='download-history-item']:first-child"
+        for item in evidence
+    )
+    assert unresolved == []
+
+
 def test_fragment_scope_tracks_route_transitions_and_groups_new_subtrees():
     baseline = {
         "version": 4,
@@ -128,6 +342,149 @@ def test_fragment_scope_tracks_route_transitions_and_groups_new_subtrees():
         and item.get("resolution") == "covered_by_expected_subtree"
         for item in evidence
     )
+
+
+def test_fragment_scope_separates_runtime_source_control_from_new_target_subtree():
+    baseline = {
+        "version": 4,
+        "fragments": [
+            {
+                "key": "/::download-button",
+                "route": "/",
+                "anchors": ["#downloadBtn", "button"],
+            }
+        ],
+    }
+    checks = [
+        {
+            "route": "/",
+            "actions": [
+                {"action": "click", "selector": "button:has-text('Download Now')"},
+                {"action": "wait_for", "selector": "[data-testid='download-history']"},
+                {
+                    "action": "assert_count",
+                    "selector": "[data-testid='download-history'] li",
+                    "count": 1,
+                },
+            ],
+        }
+    ]
+
+    allowed, expected, evidence, unresolved = _fragment_dom_scope(
+        baseline, checks, ["/"]
+    )
+
+    assert allowed == []
+    assert expected == [
+        {
+            "route": "/",
+            "selector": "[data-testid='download-history']",
+            "min_count": 0,
+            "max_count": 1,
+        }
+    ]
+    assert unresolved == []
+    assert any(
+        item.get("selector") == "button:has-text('Download Now')"
+        and item.get("resolution") == "runtime_source_control"
+        for item in evidence
+    )
+    assert any(
+        item.get("selector") == "[data-testid='download-history'] li"
+        and item.get("resolution") == "covered_by_expected_subtree"
+        for item in evidence
+    )
+
+
+def test_requested_text_named_control_can_be_a_new_fragment():
+    selector = "button:has-text('Save schedule')"
+    checks = [{"route": "/", "actions": [{"action": "assert_visible", "selector": selector}]}]
+    baseline = {"version": 4, "fragments": []}
+    _, expected, _, unresolved = _fragment_dom_scope(
+        baseline, checks, ["/"], instruction_delta="Add a Save schedule button to store the current arrangement.")
+    assert unresolved == []
+    assert expected == [{"route": "/", "selector": selector, "min_count": 1, "max_count": 50}]
+    _, expected, _, unresolved = _fragment_dom_scope(
+        baseline, checks, ["/"], instruction_delta="Add a preview.")
+    assert expected == []
+    assert unresolved == ["/::" + selector]
+
+
+def test_fragment_scope_keeps_interaction_created_selector_conditional_after_reload():
+    checks = [
+        {
+            "route": "/",
+            "actions": [
+                {"action": "click", "selector": "#download"},
+                {
+                    "action": "assert_visible",
+                    "selector": "[data-testid='history-item']",
+                },
+            ],
+        },
+        {
+            "route": "/",
+            "actions": [
+                {"action": "reload"},
+                {
+                    "action": "assert_visible",
+                    "selector": "[data-testid='history-item']",
+                },
+            ],
+        },
+    ]
+
+    _allowed, expected, _evidence, unresolved = _fragment_dom_scope(
+        {
+            "version": 4,
+            "fragments": [{
+                "key": "/::download",
+                "route": "/",
+                "anchors": ["#download"],
+            }],
+        },
+        checks,
+        ["/"],
+    )
+
+    assert expected == [{
+        "route": "/",
+        "selector": "[data-testid='history-item']",
+        "min_count": 0,
+        "max_count": 1,
+    }]
+    assert unresolved == []
+
+
+def test_fragment_scope_allows_only_target_route_physical_link_replacements():
+    baseline = {
+        "version": 4,
+        "fragments": [
+            {
+                "key": "/::dashboard-link",
+                "route": "/",
+                "anchors": ["a[href=\"#/dashboard\"]"],
+            }
+        ],
+    }
+    checks = [
+        {
+            "route": "/",
+            "actions": [
+                {"action": "assert_visible", "selector": "a[href='/']"},
+                {"action": "assert_visible", "selector": "a[href='/admin.html']"},
+            ],
+        }
+    ]
+
+    _allowed, expected, _evidence, unresolved = _fragment_dom_scope(
+        baseline,
+        checks,
+        ["/", "/settings.html"],
+    )
+
+    assert expected == [{"route": "/", "selector": "a[href='/']", "max_count": 1}]
+    assert unresolved == ["/::a[href='/admin.html']"]
 def test_harness_builds_change_cone_from_action_contract_and_dom(tmp_path: Path):
     workdir = tmp_path
     frontend = workdir / "frontend"
@@ -174,6 +531,7 @@ def test_harness_builds_change_cone_from_action_contract_and_dom(tmp_path: Path)
         "owner": "harness",
         "plan": ".harness/minimal_path_plan_round_1.json",
         "baseline": ".harness/edit_dom_source_sprint_1.json",
+        "max_fragments_per_route": {"/": 0},
         "allowed_root_keys": ["main:catalog"],
         "allow_new_roots": False,
         "allowed_fragment_keys": [],
@@ -182,6 +540,34 @@ def test_harness_builds_change_cone_from_action_contract_and_dom(tmp_path: Path)
         "target_routes": ["/"],
         "protected_routes": [],
     }
+
+
+def test_repair_change_cone_keeps_accepted_edit_baseline(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    (frontend / "src").mkdir(parents=True)
+    (frontend / "src" / "App.jsx").write_text(
+        'export default () => <input id="catalog-search" />;\n'
+    )
+    _write_contract(tmp_path)
+    harness = tmp_path / ".harness"
+    (harness / "repair_dom_source_round_2.json").write_text(json.dumps({
+        "version": 2,
+        "roots": [{"key": "corrupt-root", "fingerprint": "failed"}],
+    }))
+
+    ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+        max_patch_lines=80,
+        max_touched_files=3,
+    )
+
+    scope = json.loads((harness / "edit_scope_round_2.json").read_text())
+    assert scope["baseline"] == ".harness/edit_dom_source_sprint_1.json"
+    assert "corrupt-root" not in scope["allowed_root_keys"]
 
 
 def test_visual_contract_routes_initial_path_to_style_source(tmp_path: Path):
@@ -233,6 +619,80 @@ def test_visual_contract_routes_initial_path_to_style_source(tmp_path: Path):
 
     assert plan["target_contract"]["requested_source_roles"] == ["style"]
     assert plan["source_change_cone"]["initial_paths"] == ["frontend/styles.css"]
+
+
+def test_functional_contract_routes_initial_path_to_behavior_source(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<button id="toggle">Toggle</button>\n' * 8 + '<script src="app.js"></script>\n',
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text(
+        "document.querySelector('#toggle').addEventListener('click', () => {});\n",
+        encoding="utf-8",
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(json.dumps({
+        "sprints": [{"sprint": 1, "checks": [{
+            "id": "UI-TOGGLE",
+            "category": "functional",
+            "actions": [
+                {"action": "click", "selector": "#toggle"},
+                {"action": "assert_attribute", "selector": "#toggle", "name": "aria-expanded", "value": "true"},
+            ],
+        }]}],
+    }), encoding="utf-8")
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=20,
+        max_touched_files=2,
+    )
+
+    assert plan["target_contract"]["requested_source_roles"] == ["behavior"]
+    assert plan["source_change_cone"]["initial_paths"] == ["frontend/app.js"]
+
+
+def test_new_target_selector_uses_typed_role_fallback_instead_of_html_entry(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main>Accepted page</main><script src="app.js"></script>\n',
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text("document.body.dataset.ready = 'true';\n")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(json.dumps({
+        "sprints": [{"sprint": 1, "checks": [{
+            "id": "UI-NEW-STATE",
+            "category": "functional",
+            "actions": [{
+                "action": "assert_visible",
+                "selector": "[data-testid='new-state']",
+            }],
+        }]}],
+    }), encoding="utf-8")
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=20,
+        max_touched_files=2,
+    )
+
+    assert plan["source_change_cone"]["initial_paths"] == ["frontend/app.js"]
 
 
 def test_repair_prioritizes_source_role_of_failed_typed_checks(tmp_path: Path):
@@ -318,6 +778,109 @@ def test_repair_prioritizes_source_role_of_failed_typed_checks(tmp_path: Path):
     assert plan["target_contract"]["failed_check_ids"] == ["UI-IMPORT"]
     assert plan["source_change_cone"]["initial_paths"] == ["frontend/app.js"]
     assert plan["source_change_cone"]["hotspots"][0]["path"] == "frontend/app.js"
+
+
+def test_repair_routes_missing_target_selector_to_markup(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main>Accepted page</main><script src="app.js"></script>\n',
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text("document.body.dataset.ready = 'true';\n")
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    check = {
+        "id": "UI-MISSING",
+        "category": "functional",
+        "actions": [{"action": "wait_for", "selector": "[data-testid='driver']"}],
+    }
+    (harness / "ui_verification_plan.json").write_text(json.dumps({
+        "sprints": [{"sprint": 1, "checks": [check]}],
+    }))
+    (harness / "grade_round_1.json").write_text(json.dumps({
+        "ui_checks": [{"check_id": "UI-MISSING", "status": "fail"}],
+    }))
+    (harness / "browser_evidence_round_1.json").write_text(json.dumps({
+        "checks": [{
+            "check_id": "UI-MISSING",
+            "steps": [{
+                "action": "wait_for",
+                "ok": False,
+                "error": 'TimeoutError: waiting for locator("[data-testid=driver]")',
+            }],
+        }],
+    }))
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+        max_patch_lines=20,
+        max_touched_files=2,
+    )
+
+    assert plan["target_contract"]["priority_source_roles"] == ["markup"]
+    assert plan["source_change_cone"]["initial_paths"] == ["frontend/index.html"]
+
+
+def test_repair_routes_post_reload_disappearance_to_behavior(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<div data-testid="history-item"></div><script src="app.js"></script>\n'
+    )
+    (frontend / "app.js").write_text(
+        "function renderHistory() { "
+        "document.querySelector('[data-testid=\"history-item\"]'); "
+        "localStorage.getItem('history'); }\n"
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    selector = "[data-testid='history-item']"
+    check = {
+        "id": "UI-PERSIST",
+        "category": "persistence",
+        "actions": [
+            {"action": "click", "selector": "#reset"},
+            {"action": "assert_visible", "selector": selector},
+            {"action": "reload"},
+            {"action": "assert_visible", "selector": selector},
+        ],
+    }
+    (harness / "ui_verification_plan.json").write_text(json.dumps({
+        "sprints": [{"sprint": 1, "checks": [check]}],
+    }))
+    (harness / "grade_round_1.json").write_text(json.dumps({
+        "ui_checks": [{"check_id": "UI-PERSIST", "status": "fail"}],
+    }))
+    (harness / "browser_evidence_round_1.json").write_text(json.dumps({
+        "checks": [{"check_id": "UI-PERSIST", "steps": [
+            {"action": "click", "ok": True},
+            {"action": "assert_visible", "ok": True},
+            {"action": "reload", "ok": True},
+            {
+                "action": "assert_visible",
+                "ok": False,
+                "error": "TimeoutError: waiting for locator(history-item)",
+            },
+        ]}],
+    }))
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+        max_patch_lines=20,
+        max_touched_files=2,
+    )
+
+    assert plan["target_contract"]["priority_source_roles"] == ["behavior"]
+    assert plan["source_change_cone"]["initial_paths"] == ["frontend/app.js"]
 
 
 def test_semantic_guard_only_repair_does_not_route_to_stylesheet(tmp_path: Path):
@@ -776,6 +1339,244 @@ def test_generate_can_plan_one_new_static_route_without_widening_existing_page(
     )
 
 
+def test_explicit_edit_can_plan_one_declared_new_static_route(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main id="dashboard">Dashboard</main><script src="./app.js"></script>\n'
+    )
+    (frontend / "app.js").write_text(
+        "document.querySelector('#dashboard').dataset.ready = 'true';\n"
+    )
+    (tmp_path / "seed_manifest.json").write_text(
+        json.dumps({"status": "ok", "baseline_commit": "accepted-seed"})
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(
+        json.dumps(
+            {
+                "requested_target_routes": ["/", "/settings.html"],
+                "protect_non_target_routes": True,
+            }
+        )
+    )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-DASHBOARD",
+                                "route": "/",
+                                "category": "functional",
+                                "actions": [
+                                    {"action": "assert_visible", "selector": "#dashboard"}
+                                ],
+                            },
+                            {
+                                "id": "UI-NEW-SETTINGS",
+                                "route": "/settings.html",
+                                "category": "functional",
+                                "actions": [
+                                    {"action": "assert_visible", "selector": "#settings"}
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=120,
+        max_touched_files=3,
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["route_scope"]["target_routes"] == ["/", "/settings.html"]
+    assert plan["route_scope"]["planned_new_routes"] == ["/settings.html"]
+    assert plan["route_scope"]["planned_new_route_entries"] == [
+        "frontend/settings.html"
+    ]
+    assert plan["dom_change_cone"]["expected_new_routes"] == ["/settings.html"]
+    assert "frontend/settings.html" in plan["source_change_cone"]["planned_new_paths"]
+
+    (frontend / "settings.html").write_text(
+        '<main id="settings">Settings</main>\n', encoding="utf-8"
+    )
+    repair_plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+        max_patch_lines=120,
+        max_touched_files=3,
+    )
+    assert repair_plan["dom_change_cone"]["expected_new_routes"] == [
+        "/settings.html"
+    ]
+    repair_scope = json.loads(
+        (harness / "edit_scope_round_2.json").read_text(encoding="utf-8")
+    )
+    assert repair_scope["expected_new_routes"] == ["/settings.html"]
+
+
+def test_multi_page_static_edit_unlocks_each_target_entry(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<nav>Home</nav>\n")
+    (frontend / "about.html").write_text("<nav>About</nav>\n")
+    (tmp_path / "seed_manifest.json").write_text(
+        json.dumps({"status": "ok", "baseline_commit": "accepted-seed"})
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(json.dumps({
+        "requested_target_routes": ["/", "/about.html", "/intake.html"],
+        "protect_non_target_routes": True,
+    }))
+    (harness / "ui_verification_plan.json").write_text(json.dumps({
+        "sprints": [{"sprint": 1, "checks": [
+            {"id": "home", "route": "/", "category": "interaction",
+             "actions": [{"action": "assert_visible", "selector": "#intake-link"}]},
+            {"id": "about", "route": "/about.html", "category": "interaction",
+             "actions": [{"action": "assert_visible", "selector": "#intake-link"}]},
+            {"id": "intake", "route": "/intake.html", "category": "interaction",
+             "actions": [{"action": "assert_visible", "selector": "#intake"}]},
+        ]}],
+    }))
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path, harness_dir=harness, round_num=1, sprint_num=1,
+        mode="generate", max_patch_lines=120, max_touched_files=3,
+    )
+
+    assert plan["source_change_cone"]["route_isolation_strategy"]["status"] == (
+        "recommended"
+    )
+    assert set(plan["source_change_cone"]["initial_paths"]) == {
+        "frontend/index.html", "frontend/about.html", "frontend/intake.html",
+    }
+
+
+def test_new_static_route_reuses_declared_existing_assets_across_target_pages(
+    tmp_path: Path,
+):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        """<nav><a href="#/dashboard">Dashboard</a></nav>
+<main id="dashboard">Dashboard</main>
+<link rel="stylesheet" href="styles.css">
+<script src="app.js"></script>
+"""
+    )
+    (frontend / "app.js").write_text(
+        "document.querySelector('#dashboard').dataset.ready = 'true';\n"
+    )
+    (frontend / "styles.css").write_text("#dashboard { display: block; }\n")
+    (tmp_path / "seed_manifest.json").write_text(
+        json.dumps({"status": "ok", "baseline_commit": "accepted-seed"})
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "edit_task_contract.json").write_text(
+        json.dumps(
+            {
+                "requested_target_routes": ["/", "/settings.html"],
+                "protect_non_target_routes": True,
+            }
+        )
+    )
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "UI-PHYSICAL-NAV",
+                                "route": "/",
+                                "category": "interaction",
+                                "actions": [
+                                    {
+                                        "action": "assert_visible",
+                                        "selector": "a[href='/']",
+                                    },
+                                    {
+                                        "action": "click",
+                                        "selector": "a[href='/settings.html']",
+                                    },
+                                    {"action": "assert_url", "value": "/settings.html"},
+                                ],
+                            },
+                            {
+                                "id": "UI-SETTINGS",
+                                "route": "/settings.html",
+                                "category": "interaction",
+                                "actions": [
+                                    {
+                                        "action": "assert_attribute",
+                                        "selector": "script[src='app.js']",
+                                        "name": "src",
+                                        "value": "app.js",
+                                    },
+                                    {
+                                        "action": "click",
+                                        "selector": "#save-settings",
+                                    },
+                                    {
+                                        "action": "assert_visible",
+                                        "selector": "#settings-saved",
+                                    },
+                                ],
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=1,
+        sprint_num=1,
+        mode="generate",
+        max_patch_lines=120,
+        max_touched_files=6,
+    )
+
+    assert plan["status"] == "ready"
+    scope = plan["route_scope"]
+    assert scope["path_owners"]["frontend/app.js"] == ["/", "/settings.html"]
+    assert "frontend/app.js" in scope["target_shared_paths"]
+    assert scope["planned_route_dependency_edges"] == [
+        {
+            "from": "frontend/settings.html",
+            "to": "frontend/app.js",
+            "kind": "planned_route_dependency",
+        }
+    ]
+    cone = plan["source_change_cone"]
+    assert cone["route_isolation_strategy"]["status"] == "not_applicable"
+    assert cone["planned_new_paths"] == ["frontend/settings.html"]
+    assert "frontend/settings.html" in cone["initial_paths"]
+    assert any(path != "frontend/settings.html" for path in cone["initial_paths"])
+
+
 def test_explicit_edit_contract_rejects_planner_route_drift(tmp_path: Path):
     frontend = tmp_path / "frontend"
     frontend.mkdir()
@@ -1194,6 +1995,80 @@ def test_plan_indexes_existing_css_tokens_for_design_system_guidance(tmp_path: P
             "usage_count": 1,
         },
     ]
+
+
+def test_repair_initial_cone_reuses_only_prior_failed_touched_paths(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text(
+        '<main><button id="save">Save</button></main>'
+        '<script src="app.js"></script>\n',
+        encoding="utf-8",
+    )
+    (frontend / "app.js").write_text(
+        "document.querySelector('#save').onclick = () => {};\n",
+        encoding="utf-8",
+    )
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    (harness / "ui_verification_plan.json").write_text(
+        json.dumps(
+            {
+                "sprints": [
+                    {
+                        "sprint": 1,
+                        "checks": [
+                            {
+                                "id": "SAVE",
+                                "route": "/",
+                                "category": "interaction",
+                                "actions": [
+                                    {"action": "click", "selector": "#save"},
+                                    {"action": "assert_visible", "selector": "main"},
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (harness / "minimal_path_state_round_1.json").write_text(
+        json.dumps(
+            {
+                "touched_paths": [
+                    "frontend/index.html",
+                    "frontend/app.js",
+                    "frontend/not-in-cone.js",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = ensure_minimal_path_plan(
+        workdir=tmp_path,
+        harness_dir=harness,
+        round_num=2,
+        sprint_num=1,
+        mode="repair",
+        max_patch_lines=40,
+        max_touched_files=3,
+    )
+
+    assert set(plan["source_change_cone"]["initial_paths"]) == {
+        "frontend/index.html",
+        "frontend/app.js",
+    }
+    # Resuming an older checkpoint must receive the same repair cone even if
+    # its persisted plan predates the planner-side rule above.
+    plan["source_change_cone"]["initial_paths"] = ["frontend/app.js"]
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    assert policy.initial_paths == {
+        "frontend/index.html",
+        "frontend/app.js",
+    }
 
 
 def test_shared_state_container_allows_only_target_named_additions(tmp_path: Path):
@@ -2112,3 +2987,84 @@ def test_policy_denies_unplanned_source_and_harness_state_mutation(tmp_path: Pat
     assert unplanned is not None and "unplanned new source" in unplanned
     assert state_edit is not None and "harness-owned" in state_edit
     assert ledger_edit is not None and "harness-owned" in ledger_edit
+
+
+def test_effective_patch_line_count_ignores_repeated_unchanged_context():
+    before = "one\ntwo\nthree\nfour\n"
+    after = "one\ntwo changed\nthree\nfour\n"
+
+    assert effective_patch_line_count(before, after) == 1
+
+
+def test_policy_accepts_sha_bound_line_edit_with_nonunique_text(tmp_path: Path):
+    source = tmp_path / "frontend" / "index.html"
+    source.parent.mkdir()
+    content = "<section>\n</section>\n<section>\n</section>\n"
+    source.write_text(content)
+    (tmp_path / ".harness").mkdir()
+    plan = {
+        "schema_version": "minimal-path-plan-v3",
+        "owner": "harness",
+        "round": 1,
+        "source_change_cone": {
+            "local_paths": ["frontend/index.html"],
+            "initial_paths": ["frontend/index.html"],
+            "dependency_paths": [],
+            "protected_paths": [],
+        },
+        "budgets": {"max_patch_lines": 10, "max_touched_files": 1},
+        "dom_change_cone": {"allow_new_roots": True},
+    }
+    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
+    policy.observe_result(
+        "read_file", {"path": "frontend/index.html"}, ok=True, output=content
+    )
+
+    denial = policy.check(
+        "apply_patch",
+        {
+            "path": "frontend/index.html",
+            "old_text": "</section>\n",
+            "new_text": "<p>History</p>\n",
+            "_harness_source_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "_harness_start_line": 2,
+            "_harness_end_line": 2,
+        },
+    )
+
+    assert denial is None
+
+
+def test_supplied_plan_allows_new_dialog_selector_but_keeps_route_ownership(tmp_path):
+    frontend = tmp_path / 'frontend'
+    frontend.mkdir()
+    (frontend / 'index.html').write_text('<h1>Events</h1><p>No events</p>')
+    (frontend / 'other.html').write_text('<h1>Other page</h1>')
+    harness = tmp_path / '.harness'
+    harness.mkdir()
+    for name, payload in {
+        'harness_state.json': {'supplied_atomic_plan': True},
+        'edit_task_contract.json': {'requested_target_routes':['/'], 'protect_non_target_routes':True},
+        'ui_verification_plan.json': {'sprints':[{'sprint':1,'checks':[{'id':'new-dialog','route':'/',
+            'actions':[{'action':'assert_visible','selector':'[role="dialog"][data-testid="event-editor"]'}]}]}]},
+    }.items():
+        (harness / name).write_text(json.dumps(payload))
+    plan = ensure_minimal_path_plan(workdir=tmp_path, harness_dir=harness, round_num=1,
+        sprint_num=1, mode='generate', max_patch_lines=500, max_touched_files=4)
+    assert plan['status'] == 'ready'
+    assert 'frontend/other.html' in plan['source_change_cone']['protected_paths']
+
+
+def test_supplied_navigation_entry_does_not_expand_mutation_routes(tmp_path):
+    from src.orchestration.minimal_path_guidance import _route_scope
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    for name in ["index.html", "events.html"]:
+        (frontend / name).write_text('<main>Page</main>')
+    scope = _route_scope(files=list(frontend.glob('*.html')), frontend=frontend,
+        workdir=tmp_path, graph={}, checks=[{"route": "/index.html"}],
+        explicit_target_routes=["/events.html", "/planner.html"],
+        allow_planned_static_routes=True, allow_navigation_entry=True)
+    assert scope["status"] == "multi_page_scoped"
+    assert scope["target_routes"] == ["/events.html", "/planner.html"]
+    assert "frontend/index.html" in scope["off_target_paths"]

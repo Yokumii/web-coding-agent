@@ -72,6 +72,9 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass
 class HarnessConfig:
+    edit_originality_required: bool = True
+    edit_collect_visual_failures_before_repair: bool = False
+    edit_webcompass_defect_checks: bool = False
     """harness 运行期配置，来源依次为显式参数、环境变量与内置默认值。"""
 
     api_key: str = field(default_factory=lambda: _env_str("ANTHROPIC_API_KEY"))
@@ -119,6 +122,9 @@ class HarnessConfig:
             "MINIMAL_PATH_MAX_TOUCHED_FILES", DEFAULT_MINIMAL_PATH_MAX_TOUCHED_FILES
         )
     )
+    allow_paid_resume_call: bool = field(
+        default_factory=lambda: _env_bool("ALLOW_PAID_RESUME_CALL", False)
+    )
 
     planner_model: str = field(
         default_factory=lambda: _env_str("PLANNER_MODEL", DEFAULT_MODEL)
@@ -130,6 +136,9 @@ class HarnessConfig:
         default_factory=lambda: _env_str("EVALUATOR_MODEL", DEFAULT_MODEL)
     )
     evaluator_mode: str = field(default_factory=lambda: _env_str("EVALUATOR_MODE", "full"))
+    evaluator_evidence_route: str = field(
+        default_factory=lambda: _env_str("EVALUATOR_EVIDENCE_ROUTE", "llm")
+    )
     final_project_mode: bool = field(default_factory=lambda: _env_bool("FINAL_PROJECT_MODE", False))
     planner_scope_mode: str = field(
         default_factory=lambda: _env_str(

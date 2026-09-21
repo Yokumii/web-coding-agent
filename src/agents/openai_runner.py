@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from src.agents.openai_tools import OpenAIToolExecutor, openai_tool_schemas
 from src.config import HarnessConfig
@@ -141,6 +143,22 @@ def _is_finalization_command(command: str) -> bool:
     ))
 
 
+def _read_call_fingerprint(workdir: Path, args: dict[str, Any]) -> str | None:
+    raw_path = args.get("path") or args.get("file_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = workdir / path
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(workdir.resolve())
+        payload = resolved.read_bytes()
+    except (OSError, ValueError):
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _historical_trace_usage(trace_path: Path | None) -> dict[str, int]:
     """Sum billable attempts already present in an append-only phase trace.
 
@@ -189,8 +207,110 @@ def _historical_trace_usage(trace_path: Path | None) -> dict[str, int]:
 
 class OpenAIHTTPClient:
     def __init__(self, config: HarnessConfig, timeout: float): self.config, self.timeout = config, timeout
+
+    async def _stream_complete(self, client, base, key, payload):
+        """Collect TokenWave chunks without waiting behind its non-stream gateway."""
+        import httpx
+        result = {"choices": [], "usage": {}}
+        message = {"role": "assistant", "content": ""}
+        calls, finish, done = {}, None, False
+        async with client.stream("POST", base + "/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={**payload, "stream": True, "stream_options": {"include_usage": True}}) as response:
+            if response.is_error:
+                body = (await response.aread()).decode(errors="replace")[:2000]
+                raise httpx.HTTPStatusError(f"{response.status_code} from streamed chat completions: {body}",
+                                           request=response.request, response=response)
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    done = True
+                    break
+                chunk = json.loads(data)
+                if chunk.get("error"):
+                    raise RuntimeError(f"streamed chat completions error: {chunk['error']}")
+                for key_name in ("id", "model", "created"):
+                    if key_name in chunk:
+                        result[key_name] = chunk[key_name]
+                if chunk.get("usage"):
+                    result["usage"] = chunk["usage"]
+                for choice in chunk.get("choices", []):
+                    if choice.get("index", 0) != 0:
+                        raise ValueError("Harness expects one streamed completion")
+                    delta = choice.get("delta") or {}
+                    message["content"] += delta.get("content") or ""
+                    for item in delta.get("tool_calls") or []:
+                        call = calls.setdefault(item["index"], {"id": "", "type": "function",
+                                                              "function": {"name": "", "arguments": ""}})
+                        if item.get("id"):
+                            call["id"] = item["id"]
+                        for field_name in ("name", "arguments"):
+                            call["function"][field_name] += (item.get("function") or {}).get(field_name) or ""
+                    finish = choice.get("finish_reason") or finish
+        if not done or finish is None:
+            raise RuntimeError("chat completion stream ended without a completed choice and DONE marker")
+        if calls:
+            message["tool_calls"] = [calls[index] for index in sorted(calls)]
+        result["choices"] = [{"index": 0, "message": message, "finish_reason": finish}]
+        return result
+
+    async def _stream_responses(self, client, base, key, payload):
+        """Recover a no-tool Product Session request via the same provider/model."""
+        import httpx
+        if payload.get("tools"):
+            raise ValueError("Responses recovery currently supports no-tool requests only")
+        instructions, inputs = [], []
+        for message in payload.get("messages", []):
+            if message["role"] == "system":
+                instructions.append(str(message.get("content") or ""))
+                continue
+            content = message.get("content") or ""
+            if isinstance(content, list):
+                converted = []
+                for item in content:
+                    if item.get("type") == "text":
+                        converted.append({"type": "input_text", "text": item["text"]})
+                    elif item.get("type") == "image_url":
+                        converted.append({"type": "input_image", "image_url": item["image_url"]["url"]})
+                    else:
+                        raise ValueError("unsupported Responses recovery message content")
+                content = converted
+            inputs.append({"role": message["role"], "content": content})
+        request = {"model": payload["model"], "instructions": "\n\n".join(instructions),
+                   "input": inputs, "max_output_tokens": payload.get("max_tokens", 12000),
+                   "stream": True, "store": False}
+        completed = None
+        async with client.stream("POST", base + "/responses",
+                headers={"Authorization": f"Bearer {key}"}, json=request) as response:
+            if response.is_error:
+                body = (await response.aread()).decode(errors="replace")[:2000]
+                raise httpx.HTTPStatusError(f"{response.status_code} from streamed responses: {body}",
+                                           request=response.request, response=response)
+            async for line in response.aiter_lines():
+                if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                    continue
+                event = json.loads(line[5:].strip())
+                if event.get("type") in {"response.completed", "response.failed", "response.incomplete"}:
+                    completed = event.get("response")
+                elif event.get("type") == "error":
+                    raise RuntimeError(f"streamed responses error: {event}")
+        if not completed or completed.get("status") != "completed":
+            raise RuntimeError(f"responses stream ended without a completed response: {completed}")
+        content = "".join(part.get("text", "") for item in completed.get("output", [])
+                          for part in item.get("content", []) if part.get("type") == "output_text")
+        if not content.strip():
+            raise RuntimeError("completed Responses request returned no text")
+        usage = completed.get("usage") or {}
+        return {"choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": content}}],
+                "usage": {**usage, "prompt_tokens": usage.get("input_tokens", 0),
+                          "completion_tokens": usage.get("output_tokens", 0)}}
+
     async def complete(self, **payload):
         import httpx
+        protocol = payload.pop("_protocol", "chat")
         base = (self.config.openai_base_url or self.config.base_url).rstrip("/")
         key = self.config.openai_api_key or self.config.api_key
         if not base or not key:
@@ -204,7 +324,12 @@ class OpenAIHTTPClient:
             timeout=httpx.Timeout(self.timeout),
             verify=os.getenv("SSL_NO_VERIFY") != "1",
             trust_env=True,
+            proxy=os.environ.get("TOKENWAVE_API_PROXY") if urlsplit(base).hostname == "api.tokenwave.us" else None,
         ) as client:
+            if urlsplit(base).hostname == "api.tokenwave.us":
+                if protocol == "responses":
+                    return await self._stream_responses(client, base, key, payload)
+                return await self._stream_complete(client, base, key, payload)
             # Paid requests are single-attempt. Transport errors, throttling,
             # and provider failures must never cause an implicit duplicate call.
             response = await client.post(
@@ -220,7 +345,21 @@ class OpenAIHTTPClient:
                     request=response.request,
                     response=response,
                 )
-            return response.json()
+            try:
+                payload = response.json()
+            except (json.JSONDecodeError, ValueError) as exc:
+                content_type = response.headers.get("content-type", "unknown")
+                raise RuntimeError(
+                    "chat completions returned a non-JSON success response "
+                    f"(status={response.status_code}, content-type={content_type}): "
+                    f"{body}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    "chat completions returned a non-object JSON response "
+                    f"(status={response.status_code})"
+                )
+            return payload
 
 
 async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path, model: str,
@@ -254,12 +393,22 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
         usage = dict(prior_usage)
         attempt_usage = {"input_tokens": 0, "output_tokens": 0}; last_text = ""
         last_signature = None; consecutive_calls = 0; last_error = None; consecutive_errors = 0
+        visible_read_calls: dict[str, tuple[str, str]] = {}
         native_guidance = (
             "\n\nNative harness tools: use write_file to create or overwrite files and apply_patch "
             "for exact replacements. Never write files with shell redirection, heredocs, echo, cat, "
             "or inline interpreter code. run_command permits only foreground allowlisted commands "
             "without shell control operators. Paths must remain inside the workdir."
         )
+        if (workdir / "frontend" / ".git").exists() and not (workdir / ".git").exists():
+            native_guidance += (
+                " Each run_command starts in the harness workdir, whose Git repository is "
+                "the frontend subdirectory. Use `cd frontend && git status --short`, "
+                "`cd frontend && git diff --check`, and `cd frontend && git add ... && git commit ...`. "
+                "A previous cd does not persist between tool calls. Git paths after cd are "
+                "relative to frontend; do not prefix them with frontend again. "
+                "The command policy does not support git -C."
+            )
         if allow_playwright:
             native_guidance += (
                 " You are evaluating an already-running app. Do not inspect processes, ports, "
@@ -471,7 +620,46 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                                 "changed": False,
                             })()
                         else:
-                            result = await tools.execute(fn["name"], args)
+                            read_signature = None
+                            read_fingerprint = None
+                            if fn["name"] in {"read", "read_file"}:
+                                read_signature = json.dumps(args, sort_keys=True, ensure_ascii=False)
+                                read_fingerprint = _read_call_fingerprint(workdir, args)
+                            prior_read = visible_read_calls.get(read_signature or "")
+                            prior_still_visible = bool(
+                                prior_read
+                                and any(
+                                    message.get("role") == "tool"
+                                    and message.get("tool_call_id") == prior_read[1]
+                                    for message in messages
+                                )
+                            )
+                            if (
+                                read_signature is not None
+                                and read_fingerprint is not None
+                                and prior_read is not None
+                                and prior_read[0] == read_fingerprint
+                                and prior_still_visible
+                            ):
+                                result = type("R", (), {
+                                    "ok": True,
+                                    "output": (
+                                        "UNCHANGED_READ_SUPPRESSED: this exact file/range is unchanged "
+                                        "and its earlier result is still in context. Use that result, "
+                                        "apply the scoped edit, or request a different focused range."
+                                    ),
+                                    "changed": False,
+                                })()
+                            else:
+                                result = await tools.execute(fn["name"], args)
+                                if (
+                                    result.ok
+                                    and read_signature is not None
+                                    and read_fingerprint is not None
+                                ):
+                                    visible_read_calls[read_signature] = (
+                                        read_fingerprint, str(call["id"])
+                                    )
                     # Successful reads/searches advance the model's information state even
                     # when they do not mutate the filesystem. Count only failed tool turns
                     # as no progress; the global tool-call cap still bounds read-only loops.

@@ -63,15 +63,29 @@ def _classify(path: Path) -> tuple[str, str, int]:
 
 
 def stage_task_inputs(workdir: Path, input_paths: Iterable[Path]) -> dict[str, Any]:
-    """Copy bounded local inputs into a harness-owned, content-addressed directory."""
+    """Copy bounded inputs and persist only the routing metadata models need."""
     workdir = workdir.resolve()
     harness = workdir / ".harness"
     staged_dir = harness / "inputs"
     harness.mkdir(parents=True, exist_ok=True)
+    sources = [Path(item) for item in input_paths]
+    manifest_path = harness / MANIFEST_NAME
+    if not sources:
+        manifest_path.unlink(missing_ok=True)
+        if staged_dir.is_dir():
+            shutil.rmtree(staged_dir)
+        return {
+            "schema_version": "harness-task-inputs-v2",
+            "input_count": 0,
+            "total_size_bytes": 0,
+            "inputs": [],
+        }
+    if staged_dir.is_dir():
+        shutil.rmtree(staged_dir)
     staged_dir.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
     total = 0
-    for index, raw_path in enumerate(input_paths):
+    for index, raw_path in enumerate(sources):
         source = Path(raw_path).expanduser().resolve()
         if not source.is_file():
             raise TaskInputError(f"task input does not exist or is not a file: {source}")
@@ -81,26 +95,22 @@ def stage_task_inputs(workdir: Path, input_paths: Iterable[Path]) -> dict[str, A
             raise TaskInputError(
                 f"task inputs exceed the {_MAX_TOTAL_BYTES}-byte total limit"
             )
-        digest = _sha256(source)
-        staged = staged_dir / f"{index:02d}_{digest[:12]}_{_safe_name(source.name)}"
-        if not staged.exists():
-            shutil.copy2(source, staged)
+        staged = staged_dir / f"{index:02d}_{_safe_name(source.name)}"
+        shutil.copy2(source, staged)
         records.append({
             "index": index,
             "kind": kind,
             "media_type": media_type,
             "size_bytes": size,
-            "sha256": digest,
-            "source_path": str(source),
             "staged_path": staged.relative_to(workdir).as_posix(),
         })
     manifest = {
-        "schema_version": "harness-task-inputs-v1",
+        "schema_version": "harness-task-inputs-v2",
         "input_count": len(records),
         "total_size_bytes": total,
         "inputs": records,
     }
-    (harness / MANIFEST_NAME).write_text(
+    manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -111,19 +121,22 @@ def load_task_input_manifest(workdir: Path) -> dict[str, Any]:
     path = Path(workdir) / ".harness" / MANIFEST_NAME
     if not path.is_file():
         return {
-            "schema_version": "harness-task-inputs-v1",
+            "schema_version": "harness-task-inputs-v2",
             "input_count": 0,
             "total_size_bytes": 0,
             "inputs": [],
         }
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != "harness-task-inputs-v1":
+    if payload.get("schema_version") not in {
+        "harness-task-inputs-v1",
+        "harness-task-inputs-v2",
+    }:
         raise TaskInputError(f"unsupported task input manifest: {path}")
     return payload
 
 
 def task_input_source_hashes(input_paths: Iterable[Path]) -> list[str]:
-    """Validate proposed resume inputs without mutating the persisted manifest."""
+    """Validate proposed inputs transiently without persisting their hashes."""
     hashes: list[str] = []
     total = 0
     for raw_path in input_paths:
@@ -140,6 +153,29 @@ def task_input_source_hashes(input_paths: Iterable[Path]) -> list[str]:
     return hashes
 
 
+def task_inputs_match(workdir: Path, input_paths: Iterable[Path]) -> bool:
+    """Compare explicit resume inputs with staged copies without stored hashes."""
+    root = Path(workdir).resolve()
+    records = load_task_input_manifest(root).get("inputs") or []
+    sources = [Path(item).expanduser().resolve() for item in input_paths]
+    if len(records) != len(sources):
+        return False
+    for source, item in zip(sources, records, strict=True):
+        if not source.is_file():
+            return False
+        kind, media_type, size = _classify(source)
+        if (
+            item.get("kind") != kind
+            or item.get("media_type") != media_type
+            or item.get("size_bytes") != size
+        ):
+            return False
+        staged = _resolve_staged_input(root, item)
+        if _sha256(source) != _sha256(staged):
+            return False
+    return True
+
+
 def _resolve_staged_input(root: Path, item: dict[str, Any]) -> Path:
     relative = Path(str(item.get("staged_path") or ""))
     if relative.is_absolute() or ".." in relative.parts:
@@ -150,7 +186,7 @@ def _resolve_staged_input(root: Path, item: dict[str, Any]) -> Path:
         path.relative_to(inputs_root)
     except ValueError as exc:
         raise TaskInputError("staged task input escapes .harness/inputs") from exc
-    if not path.is_file() or _sha256(path) != item.get("sha256"):
+    if not path.is_file() or path.stat().st_size != item.get("size_bytes"):
         raise TaskInputError(f"staged task input is missing or changed: {path}")
     return path
 
@@ -181,7 +217,7 @@ def task_input_prompt_context(workdir: Path) -> str:
         relative = str(item["staged_path"])
         lines.append(
             f"- input {item['index']}: kind={item['kind']}, media_type={item['media_type']}, "
-            f"path=`{relative}`, sha256={item['sha256']}"
+            f"path=`{relative}`"
         )
         if item["kind"] == "text":
             path = _resolve_staged_input(root, item)

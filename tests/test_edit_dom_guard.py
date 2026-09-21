@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -7,6 +8,7 @@ from src.config import HarnessConfig
 from src.orchestration.edit_dom_guard import (
     capture_baseline,
     compare_contract,
+    evaluate_guard,
     snapshot_semantic_dom,
 )
 from src.orchestration.file_comm import FileComm
@@ -133,6 +135,130 @@ def test_fragment_guard_allows_dynamic_descendants_of_authorized_container():
     assert result["passed"] is True
 
 
+def test_fragment_guard_aligns_unique_unchanged_siblings_after_target_insertion():
+    baseline = _fragment_snapshot(
+        ("main", "main-before", "/", {}),
+        (
+            "a:unnamed",
+            "download-link-a",
+            "/",
+            {"parent_key": "main", "anchors": ["[aria-label='Download A']"]},
+        ),
+        (
+            "a:unnamed#2",
+            "download-link-b",
+            "/",
+            {"parent_key": "main", "anchors": ["[aria-label='Download B']"]},
+        ),
+    )
+    current = _fragment_snapshot(
+        ("main", "main-after", "/", {}),
+        (
+            "section:unnamed",
+            "new-history",
+            "/",
+            {"parent_key": "main", "anchors": ["[data-testid='download-history']"]},
+        ),
+        (
+            "a:unnamed#2",
+            "download-link-a",
+            "/",
+            {"parent_key": "main", "anchors": ["[aria-label='Download A']"]},
+        ),
+        (
+            "a:unnamed#3",
+            "download-link-b",
+            "/",
+            {"parent_key": "main", "anchors": ["[aria-label='Download B']"]},
+        ),
+    )
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [
+                {
+                    "route": "/",
+                    "selector": "[data-testid='download-history']",
+                    "max_count": 1,
+                }
+            ],
+            "target_routes": ["/"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["relocated_fragment_pairs"] == [
+        {"before": "a:unnamed", "after": "a:unnamed#2"},
+        {"before": "a:unnamed#2", "after": "a:unnamed#3"},
+    ]
+
+
+def test_fragment_guard_allows_new_wrapper_around_expected_target_root():
+    baseline = _fragment_snapshot(("main", "before", "/", {}))
+    current = _fragment_snapshot(
+        ("main", "after", "/", {}),
+        ("new-wrapper", "wrapper", "/", {"parent_key": "main", "anchors": ["aside"]}),
+        (
+            "history",
+            "history-root",
+            "/",
+            {
+                "parent_key": "new-wrapper",
+                "anchors": ["[data-testid='download-history']"],
+            },
+        ),
+    )
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [
+                {
+                    "route": "/",
+                    "selector": "[data-testid='download-history']",
+                    "max_count": 1,
+                }
+            ],
+            "target_routes": ["/"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+
+
+def test_fragment_guard_allows_state_conditional_target_to_be_absent_initially():
+    baseline = _fragment_snapshot(("main", "stable", "/", {}))
+    current = _fragment_snapshot(("main", "stable", "/", {}))
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [
+                {
+                    "route": "/",
+                    "selector": "[data-testid='download-history-item']",
+                    "min_count": 0,
+                    "max_count": 1,
+                }
+            ],
+            "target_routes": ["/"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["expected_new_hits"] == [0]
+
+
 def test_fragment_guard_allows_only_one_explicit_new_selector():
     baseline = _fragment_snapshot(("main", "same", "/catalog", {}))
     current = _fragment_snapshot(
@@ -149,6 +275,88 @@ def test_fragment_guard_allows_only_one_explicit_new_selector():
                 {"route": "/catalog", "selector": "#new-dialog", "max_count": 1}
             ],
             "target_routes": ["/catalog"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is True
+
+
+def test_fragment_guard_allows_exact_selector_aware_href_transitions():
+    baseline = _fragment_snapshot(
+        (
+            "/::header:unnamed", "header-before", "/",
+            {"anchors": ["a", 'a[href="#/dashboard"]', 'a[href="#/settings"]']},
+        ),
+        (
+            "/::nav:unnamed", "nav-before", "/",
+            {
+                "parent_key": "/::header:unnamed",
+                "anchors": ["a", 'a[href="#/dashboard"]', 'a[href="#/settings"]'],
+            },
+        ),
+        (
+            "/::a:unnamed", "dashboard-before", "/",
+            {
+                "parent_key": "/::nav:unnamed",
+                "anchors": ["a", 'a[href="#/dashboard"]'],
+            },
+        ),
+        (
+            "/::a:unnamed#2", "settings-before", "/",
+            {
+                "parent_key": "/::nav:unnamed",
+                "anchors": ["a", 'a[href="#/settings"]'],
+            },
+        ),
+        ("/::main", "main-stable", "/", {}),
+    )
+    current = _fragment_snapshot(
+        (
+            "/::header:unnamed", "header-after", "/",
+            {"anchors": ["a", 'a[href="/"]', 'a[href="/settings.html"]']},
+        ),
+        (
+            "/::nav:unnamed", "nav-after", "/",
+            {
+                "parent_key": "/::header:unnamed",
+                "anchors": ["a", 'a[href="/"]', 'a[href="/settings.html"]'],
+            },
+        ),
+        (
+            "/::a:unnamed", "dashboard-after", "/",
+            {
+                "parent_key": "/::nav:unnamed",
+                "anchors": ["a", 'a[href="/"]'],
+            },
+        ),
+        (
+            "/::a:unnamed#2", "settings-after", "/",
+            {
+                "parent_key": "/::nav:unnamed",
+                "anchors": ["a", 'a[href="/settings.html"]'],
+            },
+        ),
+        ("/::main", "main-stable", "/", {}),
+    )
+    current["selector_counts"] = [
+        {"route": "/", "selector": "a[href='/']", "count": 1},
+        {"route": "/", "selector": "a[href='/settings.html']", "count": 1},
+    ]
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": [],
+            "expected_new_fragments": [
+                {"route": "/", "selector": "a[href='/']", "max_count": 1},
+                {
+                    "route": "/", "selector": "a[href='/settings.html']",
+                    "max_count": 1,
+                },
+            ],
+            "target_routes": ["/"],
             "protected_routes": [],
         },
     )
@@ -370,6 +578,49 @@ def test_non_forward_repair_scope_uses_failed_source_baseline(tmp_path):
     ) is None
 
 
+@pytest.mark.anyio
+async def test_guard_prefers_accepted_sprint_baseline_over_failed_repair_snapshot(
+    monkeypatch, tmp_path
+):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    accepted = {
+        "version": 4,
+        "stable": True,
+        "routes": ["/"],
+        "roots": [],
+        "fragments": [],
+    }
+    failed = {
+        **accepted,
+        "fragments": [
+            {"key": "/::broken", "route": "/", "fingerprint": "broken"}
+        ],
+    }
+    (harness / "edit_dom_source_sprint_1.json").write_text(json.dumps(accepted))
+    (harness / "repair_dom_source_round_2.json").write_text(json.dumps(failed))
+
+    async def fake_snapshot(*_args, **_kwargs):
+        return accepted
+
+    monkeypatch.setattr(
+        "src.orchestration.edit_dom_guard.snapshot_semantic_dom", fake_snapshot
+    )
+
+    result = await evaluate_guard(
+        workdir=tmp_path,
+        file_comm=FileComm(harness),
+        config=HarnessConfig(),
+        app_url="http://127.0.0.1:1",
+        round_num=2,
+        sprint_num=1,
+    )
+
+    assert result is not None
+    assert result["passed"] is True
+    assert result["baseline_file"] == ".harness/edit_dom_source_sprint_1.json"
+
+
 def test_harness_owned_scope_can_reference_current_sprint_baseline(tmp_path):
     (tmp_path / "seed_manifest.json").write_text("{}")
     harness = tmp_path / ".harness"
@@ -386,6 +637,36 @@ def test_harness_owned_scope_can_reference_current_sprint_baseline(tmp_path):
     )
 
     assert _validate_edit_scope(tmp_path, 2) is None
+
+
+@pytest.mark.anyio
+async def test_semantic_snapshot_does_not_wait_for_background_fetch():
+    release = asyncio.Event()
+    requested = asyncio.Event()
+
+    async def page(_request):
+        return web.Response(text="<main><button>Ready</button></main><script>fetch('/pending')</script>", content_type="text/html")
+
+    async def pending(_request):
+        requested.set()
+        await release.wait()
+        return web.Response(text="done")
+
+    app = web.Application()
+    app.router.add_get("/", page)
+    app.router.add_get("/pending", pending)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        snapshot = await asyncio.wait_for(snapshot_semantic_dom(f"http://127.0.0.1:{port}", headless=True), 10)
+        assert requested.is_set()
+        assert [root["key"] for root in snapshot["roots"]] == ["main:unnamed"]
+    finally:
+        release.set()
+        await runner.cleanup()
 
 
 @pytest.mark.anyio
@@ -484,7 +765,64 @@ async def test_multi_route_semantic_guard_detects_protected_page_change():
     )
     assert result["passed"] is False
     assert result["violations"] == [
-        {"fragment": "/settings.html::settings", "kind": "semantic_changed"}
+        {
+            "fragment": "/settings.html::settings",
+            "kind": "semantic_changed",
+            "before_summary": "Settings stable",
+            "after_summary": "Settings changed by collateral edit",
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_fragment_guard_detects_non_target_computed_style_change():
+    state = {"header_background": "rgb(255, 255, 255)"}
+
+    async def page(_request):
+        return web.Response(
+            text=(
+                "<style>"
+                f"#site-header {{ background-color: {state['header_background']}; }}"
+                "#target { background-color: rgb(240, 240, 240); }"
+                "</style>"
+                "<header id='site-header'><h1>Store</h1></header>"
+                "<main id='target'>Catalog</main>"
+            ),
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/", page)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        baseline = await snapshot_semantic_dom(
+            f"http://127.0.0.1:{port}", headless=True, routes=["/"]
+        )
+        state["header_background"] = "rgb(0, 0, 255)"
+        current = await snapshot_semantic_dom(
+            f"http://127.0.0.1:{port}", headless=True, routes=["/"]
+        )
+    finally:
+        await runner.cleanup()
+
+    result = compare_contract(
+        baseline,
+        current,
+        {
+            "allowed_fragment_keys": ["/::target"],
+            "expected_new_fragments": [],
+            "target_routes": ["/"],
+            "protected_routes": [],
+        },
+    )
+
+    assert result["passed"] is False
+    assert result["violations"] == [
+        {"fragment": "/::site-header", "kind": "visual_style_changed"}
     ]
 
 
@@ -591,3 +929,18 @@ def test_generator_accepts_two_roots_for_each_target_route(tmp_path):
     )
 
     assert _validate_edit_scope(tmp_path, 1) is None
+
+
+def test_explicit_fragment_budget_preserves_undeclared_siblings():
+    fields = [f"field-{i}" for i in range(7)]
+    baseline = _fragment_snapshot(*[(key, "before", "/", {}) for key in fields + ["footer"]])
+    current = _fragment_snapshot(*[(key, "after" if key in fields else "before", "/", {}) for key in fields + ["footer"]])
+    scope = {"allowed_fragment_keys": fields, "expected_new_fragments": [],
+             "target_routes": ["/"], "protected_routes": []}
+    assert compare_contract(baseline, current, scope)["passed"] is False
+    scope["max_fragments_per_route"] = {"/": 7}
+    assert compare_contract(baseline, current, scope)["passed"] is True
+    current["fragments"][-1]["fingerprint"] = "collateral"
+    result = compare_contract(baseline, current, scope)
+    assert result["passed"] is False
+    assert result["violations"] == [{"fragment": "footer", "kind": "semantic_changed"}]

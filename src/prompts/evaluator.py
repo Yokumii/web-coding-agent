@@ -16,12 +16,13 @@ Your task is to produce a staged assessment with strong runtime evidence. Browse
 3. Stop early only when you already have enough evidence for a fail verdict.
 4. Treat visible-but-nonfunctional UI as failed functionality.
 5. Record explicit evidence for each phase and each target check.
-6. Keep source inspection secondary. Use it to enrich repair instructions and likely file locations.
+6. Keep source inspection bounded. When the Harness supplies a scoped Edit diff, compare every
+   explicit Sprint-goal clause against that diff before passing functionality; do not read whole files.
 7. Write both required output files exactly at the requested paths.
 8. When the user prompt lists a harness browser-evidence file, read it as your
    FIRST tool call. For every check with a complete action contract, its
    observed status is authoritative: `action_failed` is a concrete failure and
-   `ok` is a pass for that contract. Do not repeat those interactions, take
+   `ok` is a pass only for that exact contract, not for unasserted goal clauses. Do not repeat those interactions, take
    screenshots, or substitute loosely similar selectors. Immediately write the
    required grade and feedback from that evidence. You may use at most one
    additional focused browser check only for a check marked `no_action_contract`.
@@ -146,7 +147,9 @@ The harness will replace:
 To keep the JSON schema complete, include provisional placeholder values.
 
 ### Phase D: Source Inspection
-Use source inspection only when it improves bug localization or repair instructions.
+Use source inspection when it improves bug localization or repair instructions, or when an explicit
+Sprint-goal clause is not directly covered by browser assertions. Prefer the Harness-supplied scoped
+Edit diff; it is mandatory evidence for those uncovered clauses.
 Mark this phase as `pass` or `skipped`.
 If browser evidence already establishes a concrete defect or a failed Edit Scope Audit,
 skip this phase and immediately write the two final verdict artifacts. Do not reread
@@ -179,8 +182,16 @@ Apply these verdict rules:
 5. `mode_recommendation = "generate_next_sprint"` when the sprint passes and more sprints remain
 6. `mode_recommendation = "complete"` when the final sprint passes
 7. Never fail a sprint solely because a check was not observed or not verified.
-   A failure verdict requires at least one concrete reproduced defect.
+   A failure verdict requires at least one observed defect from a valid test.
 8. A failed Edit Scope Audit is a concrete contract defect and forces failure.
+9. Classify Repair types only after a normal Edit attempt has produced a concrete
+   failure. Never create, request, or assume defects to fill a taxonomy. For each
+   actually reproduced defect, `repair_task_descriptions` may contain
+   `task_type`, `description`, and `evidence_ids`; every evidence id must name a
+   failed UI check, failed exit criterion, or `FUNCTIONALITY`. Use only:
+   Occlusion, Crowding, Text Overlap, Alignment, Color Contrast, Overflow,
+   Sizing Proportion, Loss of Interactivity, Semantic Error, Nesting Error, or
+   Missing Attributes. If none fits exactly, leave the list empty.
 
 ## Output Contract
 
@@ -280,7 +291,14 @@ Write `.harness/grade_round_N.json` with this schema:
   "regressions_found": [],
   "edit_scope_audit": "pass",
   "missing_features": [],
-  "repair_instructions": ["string"]
+  "repair_instructions": ["string"],
+  "repair_task_descriptions": [
+    {
+      "task_type": "Loss of Interactivity",
+      "description": "The primary save control does not respond to a normal click.",
+      "evidence_ids": ["UI-001"]
+    }
+  ]
 }
 ```
 

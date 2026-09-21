@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 from claude_agent_sdk.types import ResultMessage
 
 from src.agents.evaluator import (
+    _bounded_edit_diff,
     _determine_passed,
     _extract_grades_from_response,
+    _contract_only_route_eligible,
     _normalize_contract_grades,
     _run_contract_only_evaluator,
+    _typed_pass_route_eligible,
+    build_deterministic_pass_grades,
     build_deterministic_failure_grades,
     run_evaluator,
 )
@@ -196,6 +202,94 @@ def test_contract_grade_normalization_repairs_provider_schema_drift():
     assert grades["overall_passed"] is False
 
 
+def test_contract_grade_normalization_preserves_semantic_failure():
+    grades = _normalize_contract_grades(
+        {
+            "overall_passed": False,
+            "criteria": {
+                "functionality": {
+                    "score": 4,
+                    "passed": False,
+                    "notes": "The filter clause is not evidenced.",
+                }
+            },
+        },
+        round_num=1,
+        sprint_num=1,
+        sprint_context={"exit_criteria": ["Filter totals by route"]},
+        ui_checks=[{"id": "UI-001", "critical": True}],
+        evidence={"checks": [{"check_id": "UI-001", "status": "ok"}]},
+        edit_guard={"passed": True},
+    )
+
+    assert grades["ui_checks"][0]["status"] == "pass"
+    assert grades["criteria"]["functionality"]["passed"] is False
+    assert grades["target_exit_criteria_results"][0]["passed"] is False
+    assert grades["overall_passed"] is False
+
+
+def test_contract_grade_normalization_keeps_only_observed_post_hoc_repair_types():
+    grades = _normalize_contract_grades(
+        {
+            "overall_passed": False,
+            "criteria": {"functionality": {"passed": False, "score": 4}},
+            "repair_task_descriptions": [
+                {
+                    "task_type": "Loss of Interactivity",
+                    "description": "The save button does not respond.",
+                    "evidence_ids": ["UI-001"],
+                },
+                {
+                    "task_type": "Invented Category",
+                    "description": "Unsupported label.",
+                    "evidence_ids": ["UI-001"],
+                },
+                {
+                    "task_type": "Overflow",
+                    "description": "No failed evidence supports this.",
+                    "evidence_ids": ["UI-999"],
+                },
+            ],
+        },
+        round_num=1,
+        sprint_num=1,
+        sprint_context={"exit_criteria": ["Save works"]},
+        ui_checks=[{"id": "UI-001", "critical": True}],
+        evidence={"checks": [{"check_id": "UI-001", "status": "action_failed"}]},
+        edit_guard={"passed": True},
+    )
+
+    assert grades["repair_task_descriptions"] == [{
+        "task_type": "Loss of Interactivity",
+        "description": "The save button does not respond.",
+        "evidence_ids": ["UI-001"],
+    }]
+
+
+def test_contract_grade_normalization_treats_subthreshold_functionality_as_failure():
+    grades = _normalize_contract_grades(
+        {
+            "overall_passed": True,
+            "criteria": {
+                "functionality": {
+                    "score": 5,
+                    "passed": True,
+                    "notes": "Some semantic evidence is incomplete.",
+                }
+            },
+        },
+        round_num=1,
+        sprint_num=1,
+        sprint_context={"exit_criteria": ["Filter totals by route"]},
+        ui_checks=[{"id": "UI-001", "critical": True}],
+        evidence={"checks": [{"check_id": "UI-001", "status": "ok"}]},
+        edit_guard={"passed": True},
+    )
+
+    assert grades["criteria"]["functionality"]["passed"] is False
+    assert grades["overall_passed"] is False
+
+
 def test_reproduced_browser_failure_builds_zero_cost_grades(tmp_path: Path):
     file_comm = FileComm(tmp_path / ".harness")
     (file_comm.dir / "browser_evidence_round_1.json").write_text(
@@ -221,6 +315,194 @@ def test_reproduced_browser_failure_builds_zero_cost_grades(tmp_path: Path):
     assert grades["evidence_route"]["llm_evaluator_called"] is False
     assert grades["bugs_found"] == ["Deterministic browser contract failed: UI-001"]
     assert stats.cost_usd == 0
+
+
+def test_complete_behavior_only_contract_can_take_zero_cost_pass_route(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "edit_card.json").write_text(json.dumps({
+        "schema_version": "edit-card-v1",
+        "visual_evidence": "not_required",
+    }))
+    checks = [{
+        "id": "UI-001", "feature_id": "F001", "critical": True,
+        "task": "Use the control", "expected_result": "Status changes",
+        "actions": [
+            {"action": "click", "selector": "#control"},
+            {"action": "assert_text", "selector": "#status", "value": "Done"},
+        ],
+    }]
+    evidence = {"checks": [{"check_id": "UI-001", "status": "ok"}]}
+    config = HarnessConfig(evaluator_evidence_route="auto")
+
+    assert _typed_pass_route_eligible(
+        config=config, file_comm=file_comm, ui_checks=checks,
+        evidence=evidence, edit_guard={"passed": True},
+    )
+    passed, grades, stats = build_deterministic_pass_grades(
+        file_comm=file_comm, round_num=1, sprint_num=1,
+        sprint_context={"exit_criteria": ["Status changes"]},
+        ui_checks=checks, evidence=evidence, edit_guard={"passed": True},
+    )
+
+    assert passed is True
+    assert grades["evidence_route"]["llm_evaluator_called"] is False
+    assert grades["evidence_route"]["formal_full_evaluator"] is False
+    assert stats.cost_usd == 0
+
+
+def test_complete_chain_edit_contract_can_take_zero_cost_pass_route(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "edit_card.json").write_text(json.dumps({
+        "schema_version": "edit-card-v1",
+        "visual_evidence": "not_required",
+        "chain_obligations": {
+            "edit_id": "q2", "depends_on": ["q1"],
+            "produces": [{"state": "A saved item persists after reload."}],
+        },
+    }))
+    checks = [{
+        "id": "UI-001",
+        "actions": [
+            {"action": "click", "selector": "#save"},
+            {"action": "reload"},
+            {"action": "assert_text", "selector": "#item", "value": "Saved"},
+        ],
+    }]
+
+    assert _typed_pass_route_eligible(
+        config=HarnessConfig(evaluator_evidence_route="auto"),
+        file_comm=file_comm,
+        ui_checks=checks,
+        evidence={"checks": [{"check_id": "UI-001", "status": "ok"}]},
+        edit_guard=None,
+    )
+
+
+def test_redundant_presence_after_action_requires_full_evaluator(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "edit_card.json").write_text(json.dumps({
+        "schema_version": "edit-card-v1",
+        "visual_evidence": "not_required",
+    }))
+    checks = [
+        {
+            "id": "UI-001",
+            "actions": [
+                {"action": "assert_visible", "selector": "#total"},
+            ],
+        },
+        {
+            "id": "UI-002",
+            "actions": [
+                {"action": "click", "selector": "#download"},
+                {"action": "assert_visible", "selector": "#total"},
+            ],
+        },
+    ]
+    evidence = {"checks": [
+        {"check_id": "UI-001", "status": "ok"},
+        {"check_id": "UI-002", "status": "ok"},
+    ]}
+
+    assert not _typed_pass_route_eligible(
+        config=HarnessConfig(evaluator_evidence_route="auto"),
+        file_comm=file_comm,
+        ui_checks=checks,
+        evidence=evidence,
+        edit_guard={"passed": True},
+    )
+
+
+def test_presence_only_contract_requires_source_capable_evaluator(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "edit_card.json").write_text(json.dumps({
+        "schema_version": "edit-card-v1",
+        "visual_evidence": "not_required",
+    }))
+    checks = [{
+        "id": "UI-001",
+        "actions": [
+            {"action": "click", "selector": "#download"},
+            {"action": "assert_visible", "selector": "#history"},
+            {"action": "reload"},
+            {"action": "assert_visible", "selector": "#history-item"},
+        ],
+    }]
+
+    assert not _typed_pass_route_eligible(
+        config=HarnessConfig(evaluator_evidence_route="auto"),
+        file_comm=file_comm,
+        ui_checks=checks,
+        evidence={"checks": [{"check_id": "UI-001", "status": "ok"}]},
+        edit_guard={"passed": True},
+    )
+    assert _contract_only_route_eligible(
+        config=HarnessConfig(evaluator_evidence_route="auto"),
+        file_comm=file_comm,
+        ui_checks=checks,
+    )
+
+
+def test_bounded_edit_diff_exposes_only_baseline_to_candidate_patch(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
+    (frontend / "app.js").write_text("const value = 1;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "-m", "seed"],
+        cwd=frontend,
+        check=True,
+        capture_output=True,
+    )
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    (tmp_path / "seed_manifest.json").write_text(
+        json.dumps({"baseline_commit": baseline}), encoding="utf-8"
+    )
+    (frontend / "app.js").write_text("const value = 2;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.js"], cwd=frontend, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Harness", "-c", "user.email=harness@example.com", "commit", "-m", "edit"],
+        cwd=frontend,
+        check=True,
+        capture_output=True,
+    )
+
+    diff = _bounded_edit_diff(tmp_path)
+
+    assert "-const value = 1;" in diff
+    assert "+const value = 2;" in diff
+
+
+def test_visual_required_typed_contract_uses_compact_semantic_route(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "edit_card.json").write_text(json.dumps({
+        "schema_version": "edit-card-v1",
+        "visual_evidence": "required",
+    }))
+    checks = [{
+        "id": "UI-001",
+        "actions": [
+            {"action": "click", "selector": "#save"},
+            {"action": "assert_text", "selector": "#status", "value": "Saved"},
+        ],
+    }]
+
+    assert _contract_only_route_eligible(
+        config=HarnessConfig(evaluator_evidence_route="typed"),
+        file_comm=file_comm,
+        ui_checks=checks,
+    ) is True
+    assert _typed_pass_route_eligible(
+        config=HarnessConfig(evaluator_evidence_route="typed"),
+        file_comm=file_comm,
+        ui_checks=checks,
+        evidence={"checks": [{"check_id": "UI-001", "status": "ok"}]},
+        edit_guard={"passed": True},
+    ) is False
 
 
 @pytest.mark.anyio
@@ -359,7 +641,7 @@ async def test_evaluator_prompt_prioritizes_harness_browser_evidence(monkeypatch
     )
 
     assert ".harness/browser_evidence_round_1.json" in captured["prompt"]
-    assert "Treat `action_failed`, or an `evaluate` step with `ok: false`, as a concrete reproduced failure" in captured["prompt"]
+    assert "Treat `action_failed`, or an `evaluate` step with `ok: false`, as an observed valid-test failure" in captured["prompt"]
 
 
 def test_evaluator_prompt_requires_independent_edit_scope_audit(tmp_path: Path):
@@ -723,3 +1005,65 @@ def test_evaluator_prompt_prioritizes_verdict_artifacts_after_reproduced_defect(
 
     assert "write `grade_round_N.json` first" in EVALUATOR_SYSTEM_PROMPT
     assert "Do not reread" in EVALUATOR_SYSTEM_PROMPT
+
+
+def test_completed_evaluation_key_requires_same_clean_source_and_browser_facts(tmp_path):
+    import subprocess
+    from src.agents.evaluator import _completed_evaluation_key
+    frontend=tmp_path/'frontend'; frontend.mkdir()
+    subprocess.run(['git','init','-q'],cwd=frontend,check=True)
+    (frontend/'main.js').write_text('const value = 1;')
+    subprocess.run(['git','add','.'],cwd=frontend,check=True)
+    subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.test',
+                    'commit','-qm','source'],cwd=frontend,check=True)
+    evidence=tmp_path/'evidence.json'; evidence.write_text('{"checks":[{"status":"ok"}]}')
+    config=HarnessConfig()
+    key=_completed_evaluation_key(tmp_path,evidence,'request',config)
+    assert key and key==_completed_evaluation_key(tmp_path,evidence,'request',config)
+    assert key!=_completed_evaluation_key(tmp_path,evidence,'changed request',config)
+    evidence.write_text('{"checks":[{"status":"action_failed"}]}')
+    assert key!=_completed_evaluation_key(tmp_path,evidence,'request',config)
+    (frontend/'main.js').write_text('const value = 2;')
+    assert _completed_evaluation_key(tmp_path,evidence,'request',config) is None
+
+
+@pytest.mark.anyio
+async def test_completed_semantic_result_survives_downstream_visual_failure(monkeypatch,tmp_path):
+    file_comm=FileComm(tmp_path/'.harness');_write_evaluator_context(file_comm)
+    calls=[]
+    async def sdk(**kwargs):
+        calls.append(kwargs)
+        file_comm.write_grades(2,_passing_grades(2))
+        return (ResultMessage(subtype='result',duration_ms=1,duration_api_ms=1,is_error=False,
+            num_turns=1,session_id='session',total_cost_usd=0.3,
+            usage={'input_tokens':100_000},result='done'),0.3,'',[])
+    monkeypatch.setattr('src.agents.evaluator.run_sdk_agent',sdk)
+    monkeypatch.setattr('src.agents.evaluator._completed_evaluation_key',lambda *args:'identical-verified-evidence')
+    config=HarnessConfig(evaluator_model='claude-sonnet-4-6')
+    original=await run_evaluator(config,file_comm,tmp_path,round_num=2,app_url='http://127.0.0.1:4173')
+    failed=_passing_grades(2);failed['overall_passed']=False
+    failed['evaluation_infrastructure_failure']={'phase':'visual_review','reason':'503'}
+    file_comm.write_grades(2,failed)
+    resumed=await run_evaluator(config,file_comm,tmp_path,round_num=2,app_url='http://127.0.0.1:4173')
+    assert len(calls)==1 and resumed[0] is True
+    assert not resumed[1].get('evaluation_infrastructure_failure')
+    assert resumed[2].cost_usd==original[2].cost_usd
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status, expected", [("ok", True), ("action_failed", False)])
+async def test_product_session_uses_only_supplied_browser_evidence(tmp_path, monkeypatch, status, expected):
+    comm = FileComm(tmp_path / ".harness")
+    _write_evaluator_context(comm)
+    comm.write_state({"supplied_atomic_plan": True})
+    (comm.dir / "browser_evidence_round_1.json").write_text(json.dumps({
+        "checks": [{"check_id": "UI-001", "status": status}]}))
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Product Session must not call an evaluator LLM")
+    monkeypatch.setattr("src.agents.evaluator.OpenAIHTTPClient.complete", forbidden)
+    passed, grades, stats = await run_evaluator(
+        HarnessConfig(agent_runtime="openai", evaluator_evidence_route="typed"),
+        comm, tmp_path, 1, "http://localhost:18931")
+    assert passed is expected
+    assert grades["evidence_route"]["llm_evaluator_called"] is False
+    assert stats.cost_usd == 0

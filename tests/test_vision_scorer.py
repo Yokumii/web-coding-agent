@@ -544,3 +544,27 @@ def test_perform_visual_review_request_propagates_json_parse_errors(
             sprint_context={"title": "t", "goal": "g", "deliverables": [], "exit_criteria": []},
             screenshot_paths=paths,
         )
+
+
+def test_tokenwave_visual_review_reuses_native_proxy_transport(tmp_path, monkeypatch):
+    from src.agents.openai_runner import OpenAIHTTPClient
+    workdir, paths, file_comm = _seed_workdir(tmp_path)
+    captured = {}
+    async def complete(self, **payload):
+        captured.update(payload)
+        assert self.config.openai_base_url == 'https://api.tokenwave.us/v1'
+        return {'choices': [{'message': {'content': _success_review_text()}}],
+                'usage': {'prompt_tokens': 12, 'completion_tokens': 8}}
+    monkeypatch.setattr(OpenAIHTTPClient, 'complete', complete)
+    monkeypatch.setattr(vision_scorer, 'completion', lambda **kwargs: pytest.fail('legacy transport'))
+    review, stats = vision_scorer._perform_visual_review_request(
+        config=_vision_config(evaluator_vision_model='gpt-5.5',
+            evaluator_vision_endpoint_type='openai',
+            evaluator_vision_base_url='https://api.tokenwave.us/v1'),
+        file_comm=file_comm, workdir=workdir, sprint_num=1,
+        sprint_context={'title':'t', 'goal':'g', 'deliverables':[], 'exit_criteria':[]},
+        screenshot_paths=paths)
+    assert captured['model'] == 'gpt-5.5'
+    assert 'temperature' not in captured
+    assert review['phase_result'] == 'pass'
+    assert stats.usage['prompt_tokens'] == 12

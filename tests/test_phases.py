@@ -14,8 +14,11 @@ from src.orchestration.phases import (
     HarnessContext,
     Verdict,
     _apply_browser_click_evidence_gate,
+    _append_hidden_risk_repairs,
     _checks_are_tape_eligible,
     _contract_functionality_recheck_allowed,
+    _conditional_fragment_recheck_allowed,
+    _counterfactual_minimality_is_sound,
     _reconcile_action_contract_evidence,
     _action_contract_grade_conflicts,
     _edit_guard_requires_repair,
@@ -24,11 +27,21 @@ from src.orchestration.phases import (
     _visual_style_recheck_allowed,
     _dedicated_visual_recheck_allowed,
     _non_visual_gates_passed,
+    _edit_visual_diagnostics_ready,
     run_build_phase,
     run_evaluate_phase,
     run_planner_phase,
 )
 from src.orchestration.sprint_state import SprintState
+
+
+def test_navigation_infrastructure_preserves_failure_reason():
+    observed={'checks':[{'check_id':'old-return','status':'navigation_failed',
+        'navigation_error':'TimeoutError: Page.goto: Timeout 15000ms exceeded.'}]}
+    with pytest.raises(phases.EvaluationInfrastructureError, match='Browser navigation infrastructure failed: old-return: TimeoutError: Page.goto'):
+        phases._raise_navigation_infrastructure(observed)
+    assert not phases._has_observed_valid_test_failure(observed)
+    phases._raise_navigation_infrastructure({'checks':[{'status':'action_failed'}]})
 
 
 @pytest.fixture
@@ -47,7 +60,7 @@ def _stats(cost_usd: float) -> AgentRunStats:
     )
 
 
-def test_tape_eligibility_matches_one_to_four_assertion_contract():
+def test_tape_eligibility_accepts_complete_typed_flow():
     check = {
         "id": "UI-001",
         "actions": [
@@ -61,8 +74,51 @@ def test_tape_eligibility_matches_one_to_four_assertion_contract():
         {"action": "assert_visible", "selector": f"#item-{index}"}
         for index in range(3)
     )
-    assert _checks_are_tape_eligible([check]) is False
+    assert _checks_are_tape_eligible([check]) is True
     assert _checks_are_tape_eligible(["not-a-check"]) is False
+
+
+def test_hidden_risk_failure_becomes_evidence_grounded_repair_metadata():
+    grades = {"repair_instructions": [], "repair_task_descriptions": []}
+    _append_hidden_risk_repairs(
+        grades=grades,
+        hidden_checks=[{
+            "id": "RISK-01-OVERFLOW",
+            "origin": "source_edit_risk_analysis",
+            "repair_type": "Overflow",
+        }],
+        hidden_evidence={"checks": [{
+            "check_id": "RISK-01-OVERFLOW",
+            "status": "action_failed",
+            "steps": [{
+                "action": "assert_webcompass_risk", "ok": False,
+                "output": {"actual": {"defect_type": "Overflow", "passed": False, "issues": [{
+                    "kind": "viewport-horizontal-overflow",
+                    "element": "html",
+                }]}},
+            }],
+        }]},
+        failed_check_ids=["RISK-01-OVERFLOW"],
+    )
+
+    assert grades["repair_task_descriptions"] == [{
+        "task_type": "Overflow",
+        "description": (
+            "Overflow reproduced after the normal Edit: "
+            "viewport-horizontal-overflow at html."
+        ),
+        "evidence_ids": ["RISK-01-OVERFLOW"],
+    }]
+    assert "viewport-horizontal-overflow at html" in grades["repair_instructions"][0]
+
+
+def test_edit_counterfactual_minimality_requires_complete_typed_admission():
+    assert _counterfactual_minimality_is_sound(
+        {"evidence_route": {"decision": "deterministic_typed_pass"}},
+        is_edit=True,
+    ) is True
+    assert _counterfactual_minimality_is_sound({}, is_edit=True) is False
+    assert _counterfactual_minimality_is_sound({}, is_edit=False) is True
 
 
 def test_visual_capture_targets_current_sprint_routes_in_order():
@@ -119,6 +175,50 @@ def test_non_visual_pass_can_reach_dedicated_visual_review():
     ) is True
     grade["bugs_found"] = ["real bug"]
     assert _dedicated_visual_recheck_allowed(grade) is False
+
+
+def test_skipped_optional_source_inspection_does_not_suppress_visual_review():
+    grade = {
+        "phase_results": {
+            "render_gate": "pass",
+            "ui_functionality": "pass",
+            "appearance": "skipped",
+            "source_inspection": "skipped",
+        },
+        "bugs_found": [],
+        "regressions_found": [],
+    }
+    evidence = {"checks": [{"check_id": "UI-1", "status": "ok"}]}
+
+    assert _non_visual_gates_passed(
+        grade, evidence, None, {"passed": True}
+    ) is True
+    grade["phase_results"]["source_inspection"] = "fail"
+    assert _non_visual_gates_passed(
+        grade, evidence, None, {"passed": True}
+    ) is False
+
+
+def test_one_repair_edit_can_collect_visual_findings_with_hidden_failure():
+    grade = {
+        "phase_results": {
+            "render_gate": "pass",
+            "ui_functionality": "fail",
+            "appearance": "skipped",
+            "source_inspection": "pass",
+        },
+        "bugs_found": ["Harness-owned hidden browser oracle failed"],
+        "evaluation_infrastructure_failure": None,
+    }
+    visible = {"checks": [{"check_id": "UI-1", "status": "ok"}]}
+    assert _non_visual_gates_passed(grade, visible, None, {"passed": True}) is False
+    assert _edit_visual_diagnostics_ready(
+        grade, visible, None, {"passed": True}
+    ) is True
+    visible["checks"][0]["status"] = "action_failed"
+    assert _edit_visual_diagnostics_ready(
+        grade, visible, None, {"passed": True}
+    ) is False
 
 
 def test_legacy_positive_grade_without_phase_block_can_reach_visual_review():
@@ -252,6 +352,7 @@ def test_complete_passing_action_contracts_calibrate_functionality_to_threshold(
         '{"check_id":"UI-002","status":"ok"}]}\n'
     )
     grades = {
+        "evidence_route": {"decision": "contract_only_semantic_pass"},
         "criteria": {
             "functionality": {
                 "score": 5.0,
@@ -324,6 +425,34 @@ def test_contract_functionality_policy_change_allows_zero_mutation_recheck(tmp_p
     }
 
     assert _contract_functionality_recheck_allowed(file_comm, 8, grade) is True
+
+
+def test_dynamic_fragment_scope_upgrade_allows_zero_mutation_recheck(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.dir.mkdir(parents=True, exist_ok=True)
+    (file_comm.dir / "browser_evidence_round_1.json").write_text(
+        '{"checks":[{"check_id":"UI-001","status":"ok"}]}\n'
+    )
+    selector = "[data-testid='history-file-size']"
+    grade = {
+        "overall_passed": False,
+        "ui_checks": [{"check_id": "UI-001", "status": "pass"}],
+        "edit_guard": {
+            "passed": False,
+            "violations": [{
+                "kind": "expected_addition_missing",
+                "fragment": "/::" + selector,
+            }],
+        },
+    }
+    checks = [{
+        "id": "UI-001",
+        "actions": [{"action": "assert_visible", "selector": selector}],
+    }]
+
+    assert _conditional_fragment_recheck_allowed(
+        file_comm, 1, grade, checks
+    ) is True
 
 
 def test_action_contract_conflict_gate_only_checks_complete_contracts(tmp_path: Path):
@@ -485,13 +614,29 @@ async def test_run_planner_phase_uses_dedicated_atomic_path_for_edit(
         del args, kwargs
         raise AssertionError("explicit Edit must not use the full Generate planner")
 
+    def fake_freeze(**kwargs):
+        assert kwargs["file_comm"].read_state() is None
+        calls.append("validate")
+        return {"status": "frozen_before_build"}
+
+    def fake_risk_tests(**kwargs):
+        assert kwargs["instruction_delta"] == ctx.user_prompt
+        calls.append("risk-tests")
+        return {"status": "authored_before_build"}
+
     monkeypatch.setattr("src.orchestration.phases.run_atomic_edit_planner", fake_atomic)
     monkeypatch.setattr("src.orchestration.phases.run_planner", forbidden_general)
     monkeypatch.setattr("src.orchestration.phases.materialize_edit_card", lambda **_: None)
+    monkeypatch.setattr(
+        "src.orchestration.phases.materialize_edit_risk_tests", fake_risk_tests
+    )
+    monkeypatch.setattr(
+        "src.orchestration.phases.freeze_preimplementation_validation", fake_freeze
+    )
 
     await run_planner_phase(ctx)
 
-    assert calls == ["atomic"]
+    assert calls == ["atomic", "risk-tests", "validate"]
     assert ctx.file_comm.read_state()["last_completed_phase"] == "plan"
 
 
@@ -659,14 +804,17 @@ async def test_later_generate_sprint_is_a_scoped_incremental_edit(monkeypatch, t
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("evaluator_stalls", [False, True])
 async def test_run_evaluate_phase_normalizes_inconsistent_pass_and_recommendation(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, evaluator_stalls
 ):
     ctx = _make_ctx(tmp_path)
     stack = _DummyAppStack()
 
     async def fake_run_evaluator(*args, **kwargs):
         del args, kwargs
+        if evaluator_stalls:
+            await asyncio.sleep(2)
         return (
             True,
             {
@@ -726,6 +874,14 @@ async def test_run_evaluate_phase_normalizes_inconsistent_pass_and_recommendatio
         return {"checks": []}
     monkeypatch.setattr("src.orchestration.phases.collect_browser_evidence", fake_collect_browser_evidence)
 
+    if evaluator_stalls:
+        ctx.config.agent_phase_timeout_seconds = 0.02
+        with pytest.raises(phases.EvaluationInfrastructureError, match="0.02s hard timeout"):
+            await asyncio.wait_for(run_evaluate_phase(ctx, 1), 1)
+        assert stack.closed is True
+        assert ctx.file_comm.read_grades(1) is None
+        return
+
     verdict = await run_evaluate_phase(ctx, 1)
 
     assert verdict is Verdict.failed_review
@@ -746,3 +902,14 @@ async def test_run_evaluate_phase_normalizes_inconsistent_pass_and_recommendatio
     assert state is not None
     assert state["last_completed_phase"] == "evaluate_r1"
     assert state["last_verdict"] == "failed_review"
+
+
+def test_failed_risk_setup_cannot_become_a_typed_defect():
+    grades = {}
+    _append_hidden_risk_repairs(grades=grades,
+        hidden_checks=[{"id":"risk","origin":"source_edit_risk_analysis","repair_type":"Occlusion"}],
+        hidden_evidence={"checks":[{"check_id":"risk","steps":[
+            {"action":"click","ok":False,"output":{"actual":"not clickable"}}]}]},
+        failed_check_ids=["risk"])
+    assert grades["repair_task_descriptions"] == []
+    assert grades["repair_instructions"] == []

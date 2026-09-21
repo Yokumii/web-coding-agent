@@ -47,6 +47,29 @@ def test_determine_passed_rejects_failed_regression_even_when_sprint_passed():
     assert determine_passed(grades) is False
 
 
+def test_behavior_only_edit_does_not_fail_on_unreviewed_visual_scores():
+    grades = {
+        "sprint_passed": True,
+        "regression_passed": True,
+        "overall_passed": True,
+        "phase_results": {
+            "render_gate": "pass",
+            "ui_functionality": "pass",
+            "appearance": "skipped",
+            "source_inspection": "pass",
+        },
+        "visual_evidence_decision": {"status": "not_required"},
+        "criteria": {
+            "design_quality": {"score": 1.0},
+            "functionality": {"score": 6.0},
+            "originality": {"score": 1.0},
+            "craft": {"score": 1.0},
+        },
+    }
+
+    assert determine_passed(grades) is True
+
+
 def test_one_fail():
     grades = {
         "criteria": {
@@ -267,3 +290,20 @@ def test_apply_visual_review_scores_recomputes_overall_passed():
     assert merged["mode_recommendation"] == "repair"
     assert "below threshold" in merged["repair_instructions"][-1]
     assert grades["overall_passed"] is True
+
+
+def test_product_session_originality_is_descriptive_but_other_quality_still_required():
+    grades=_grades_with(7.0)
+    grades.update(overall_passed=True,sprint_passed=True,regression_passed=True)
+    normalized={'phase_result':'pass','appearance_review':{'screenshots':['report.png'],'notes':'clear'},
+        'criteria_scores':{'design_quality':{'score':7,'notes':'clear'},
+            'originality':{'score':4,'notes':'conventional table'},'craft':{'score':7,'notes':'good'}}}
+    assert not determine_passed(apply_visual_review_scores(grades,normalized))
+    grades['visual_evidence_decision']={'owner':'harness','task_mode':'edit','originality_required':False}
+    result=apply_visual_review_scores(grades,normalized)
+    assert determine_passed(result)
+    assert result['criteria']['originality']['score']==4
+    assert result['criteria']['originality']['passed'] is False
+    assert not result.get('repair_instructions')
+    normalized['criteria_scores']['design_quality']['score']=3
+    assert not determine_passed(apply_visual_review_scores(grades,normalized))

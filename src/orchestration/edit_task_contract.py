@@ -122,7 +122,8 @@ def resolve_task_mode(workdir: Path, requested: str) -> str:
 
 
 def prepare_edit_task_contract(
-    workdir: Path, *, requested_target_routes: Iterable[str]
+    workdir: Path, *, requested_target_routes: Iterable[str],
+    chain_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     workdir = workdir.resolve()
     normalized_routes = normalize_target_routes(requested_target_routes)
@@ -167,6 +168,7 @@ def prepare_edit_task_contract(
         "task_mode": "edit",
         "baseline_commit": baseline,
         "requested_target_routes": normalized_routes,
+        **({"chain_metadata": chain_metadata} if chain_metadata is not None else {}),
         "protect_non_target_routes": True,
         "source_policy": {
             "preserve_unrelated_files": True,
@@ -182,6 +184,17 @@ def prepare_edit_task_contract(
         encoding="utf-8",
     )
     return contract
+
+
+def chain_obligations(contract: dict[str, Any]) -> dict[str, Any]:
+    """Expose host-state requirements, keeping donor evidence/provenance internal."""
+    metadata = contract.get("chain_metadata") or {}
+    return {
+        key: metadata[key] for key in (
+            "edit_id", "source_version", "target_version", "depends_on",
+            "requires", "produces", "preserve", "acceptance",
+        ) if key in metadata
+    }
 
 
 def read_edit_task_contract(workdir: Path) -> dict[str, Any] | None:

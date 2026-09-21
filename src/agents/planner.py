@@ -24,6 +24,7 @@ from src.orchestration.task_inputs import (
     task_input_prompt_context,
 )
 from src.prompts.planner import planner_system_prompt
+from src.utils.llm_json import extract_json_object
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -276,9 +277,9 @@ def _check_action_contracts(verification_plan: dict[str, Any]) -> None:
                 and action.get("action") in TYPED_ASSERTION_ACTIONS
                 for action in actions
             )
-            if not 1 <= assertion_count <= 4:
+            if not 1 <= assertion_count <= 8:
                 errors.append(
-                    f"{check_id}: must contain 1 to 4 related typed assertions; found {assertion_count}"
+                    f"{check_id}: must contain 1 to 8 related typed assertions; found {assertion_count}"
                 )
             for index, action in enumerate(actions, 1):
                 if (
@@ -624,6 +625,49 @@ def _planner_trace_usage(trace_path: Path) -> dict[str, Any]:
     return latest
 
 
+def _trace_proven_atomic_response(
+    trace_path: Path,
+) -> tuple[dict[str, Any], str] | None:
+    """Recover one completed atomic response without repeating the paid call."""
+    prompt = ""
+    response_text: str | None = None
+    usage_recorded = False
+    failed = False
+    try:
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if (
+                event.get("event") == "run_start"
+                and event.get("phase") == "atomic_edit_planner"
+            ):
+                prompt = str(event.get("prompt") or "")
+                response_text = None
+                usage_recorded = False
+                failed = False
+            elif event.get("event") == "assistant_response":
+                response_text = str(event.get("content") or "")
+            elif event.get("event") == "usage" and response_text is not None:
+                usage_recorded = True
+            elif event.get("event") == "run_error":
+                failed = True
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if not response_text or not usage_recorded or failed:
+        return None
+    try:
+        payload = extract_json_object(response_text)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+    instruction = "Recovered atomic Edit"
+    prefix = "Create the atomic Edit plan for this instruction:\n\n"
+    suffix = "\n\nRequested target routes:"
+    if prefix in prompt:
+        candidate = prompt.split(prefix, 1)[1].split(suffix, 1)[0].strip()
+        if candidate:
+            instruction = candidate
+    return payload, instruction
+
+
 def recover_trace_proven_planner_checkpoint(
     file_comm: FileComm, config: HarnessConfig
 ) -> AgentRunStats | None:
@@ -639,15 +683,44 @@ def recover_trace_proven_planner_checkpoint(
                 ATOMIC_EDIT_PLAN_NAME,
                 materialize_atomic_edit_compatibility_bundle,
                 read_atomic_edit_plan,
+                write_atomic_edit_plan,
             )
 
+            recovered_response = _trace_proven_atomic_response(trace_path)
+            if recovered_response is not None:
+                raw_plan, instruction_delta = recovered_response
+                write_atomic_edit_plan(
+                    file_comm.dir,
+                    raw_plan,
+                    instruction_delta=instruction_delta,
+                )
             plan = read_atomic_edit_plan(file_comm.dir)
-            if plan is None or ATOMIC_EDIT_PLAN_NAME not in written:
+            if plan is None or (
+                ATOMIC_EDIT_PLAN_NAME not in written
+                and recovered_response is None
+            ):
                 return None
             materialize_atomic_edit_compatibility_bundle(
                 file_comm=file_comm,
-                instruction_delta="Recovered atomic Edit",
+                instruction_delta=(
+                    recovered_response[1]
+                    if recovered_response is not None
+                    else "Recovered atomic Edit"
+                ),
                 plan=plan,
+            )
+            from src.orchestration.edit_card import materialize_edit_card
+
+            materialize_edit_card(
+                harness_dir=file_comm.dir,
+                instruction_delta=(
+                    recovered_response[1]
+                    if recovered_response is not None
+                    else "Recovered atomic Edit"
+                ),
+                edit_contract=edit_contract,
+                sprint_plan=file_comm.read_sprint_plan() or {},
+                verification_plan=file_comm.read_ui_verification_plan() or {},
             )
         elif not _PLANNER_TRACE_ARTIFACTS.issubset(written):
             return None

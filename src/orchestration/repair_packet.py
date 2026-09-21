@@ -28,9 +28,11 @@ def write_repair_packet(
     harness = Path(workdir) / ".harness"
     browser_ref = harness / f"browser_evidence_round_{round_num}.json"
     tape_ref = harness / f"accepted_tape_replay_round_{round_num}.json"
+    hidden_ref = harness / f"hidden_oracle_evidence_round_{round_num}.json"
     plan_ref = harness / f"minimal_path_plan_round_{round_num}.json"
     browser = _read_json(browser_ref)
     tape = _read_json(tape_ref)
+    hidden = _read_json(hidden_ref)
     plan = _read_json(plan_ref)
     cone = plan.get("source_change_cone") or {}
     budgets = plan.get("budgets") or cone.get("budgets") or {}
@@ -49,11 +51,13 @@ def write_repair_packet(
         "source_round": round_num,
         "sprint": sprint_num,
         "target_routes": list((plan.get("route_scope") or {}).get("target_routes") or []),
-        "failed_checks": _failed_checks(browser),
+        "failed_checks": [*_failed_checks(browser), *_failed_checks(hidden)],
         "failed_regressions": _failed_checks(tape),
         "bugs": list(grades.get("bugs_found") or []),
         "regressions": list(grades.get("regressions_found") or []),
         "required_actions": list(grades.get("repair_instructions") or []),
+        "repair_task_descriptions": list(grades.get("repair_task_descriptions") or []),
+        "repair_policy": "all_observed_defects_in_one_call_then_retest",
         "allowed_source_paths": allowed_paths,
         "budgets": {
             "max_touched_files": max_files,
@@ -64,6 +68,7 @@ def write_repair_packet(
             for ref, path in (
                 (f".harness/browser_evidence_round_{round_num}.json", browser_ref),
                 (f".harness/accepted_tape_replay_round_{round_num}.json", tape_ref),
+                (f".harness/hidden_oracle_evidence_round_{round_num}.json", hidden_ref),
                 (f".harness/minimal_path_plan_round_{round_num}.json", plan_ref),
             )
             if path.is_file()

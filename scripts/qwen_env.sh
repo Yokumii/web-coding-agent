@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Source from web-coding-agent/. Credentials stay only in this shell's environment.
+# Source from the harness (harness/); the repo root owns docs/. Credentials stay only in this shell's environment.
 set -euo pipefail
 
 qwen_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-qwen_api_pdf="${QWEN_API_PDF:-$qwen_repo_root/../WebCoding_Data/docs/项目用api.pdf}"
+qwen_api_pdf="${QWEN_API_PDF:-$qwen_repo_root/../docs/项目用api.pdf}"
 if [[ ! -f "$qwen_api_pdf" ]]; then
   echo "Qwen API credential PDF not found; set QWEN_API_PDF" >&2
   return 1 2>/dev/null || exit 1

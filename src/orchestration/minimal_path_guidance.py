@@ -13,6 +13,7 @@ boundary rather than a prompt preference.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -20,8 +21,16 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 
-PLAN_VERSION = "minimal-path-plan-v3"
-SUPPORTED_PLAN_VERSIONS = {"minimal-path-plan-v1", "minimal-path-plan-v2", PLAN_VERSION}
+PLAN_VERSION = "minimal-path-plan-v6"
+SOURCE_SELECTION_STRATEGY = "typed-selectors-balanced-hotspots-v7-grounded-fragment-budgets"
+SUPPORTED_PLAN_VERSIONS = {
+    "minimal-path-plan-v1",
+    "minimal-path-plan-v2",
+    "minimal-path-plan-v3",
+    "minimal-path-plan-v4",
+    "minimal-path-plan-v5",
+    PLAN_VERSION,
+}
 CODE_EXTENSIONS = {
     ".css",
     ".ets",
@@ -41,6 +50,26 @@ CODE_EXTENSIONS = {
     ".wxml",
     ".wxss",
 }
+
+
+def expected_fragment_consumes_scope_slot(contract: dict[str, Any]) -> bool:
+    """Whether a new-fragment postcondition widens the mutable DOM surface."""
+    return re.fullmatch(
+        r"\[data-testid\s*=\s*(['\"])[^'\"]+\1\]",
+        str(contract.get("selector") or "").strip(),
+    ) is None
+
+
+def effective_patch_line_count(before: str, after: str) -> int:
+    """Count semantic line replacements, excluding unchanged context lines."""
+    matcher = difflib.SequenceMatcher(
+        a=before.splitlines(), b=after.splitlines(), autojunk=False
+    )
+    return sum(
+        max(old_end - old_start, new_end - new_start)
+        for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes()
+        if tag != "equal"
+    )
 BEHAVIOR_EXTENSIONS = {".ets", ".js", ".jsx", ".qml", ".svelte", ".ts", ".tsx", ".vue"}
 MARKUP_EXTENSIONS = {
     ".ets",
@@ -69,6 +98,7 @@ INTERACTION_ACTIONS = {
     "scroll",
     "select",
     "select_option",
+    "set_hash",
     "set_input_files",
     "tap",
     "type",
@@ -174,7 +204,7 @@ def _target_checks(plan: dict[str, Any], sprint_num: int) -> list[dict[str, Any]
 def _extract_selectors(checks: list[dict[str, Any]]) -> list[str]:
     selectors: set[str] = set()
     for key, value in _walk_strings(checks):
-        if key in {"selector", "locator"} and value.strip():
+        if key in {"selector", "locator", "source_selector", "target_selector"} and value.strip():
             selectors.add(value.strip())
         for match in _QUERY_SELECTOR_RE.finditer(value):
             selectors.add(match.group(1).strip())
@@ -187,7 +217,7 @@ def _selector_tokens(selectors: list[str]) -> list[str]:
     tokens: set[str] = set(selectors)
     patterns = (
         re.compile(r"#([A-Za-z_][\w:-]*)"),
-        re.compile(r"\.([A-Za-z_][\w:-]*)"),
+        re.compile(r"\.([A-Za-z_][\w-]*)"),
         re.compile(r"\[(?:data-testid|aria-label|name|role)\s*=\s*['\"]?([^'\"\]]+)"),
     )
     for selector in selectors:
@@ -269,6 +299,62 @@ def _repair_priority_source_roles(
         check for check in checks if str(check.get("id", "")) in failed_set
     ]
     if failed_checks:
+        browser_evidence = _read_json(
+            harness_dir / f"browser_evidence_round_{round_num - 1}.json", {}
+        )
+        checks_by_id = {str(check.get("id") or ""): check for check in failed_checks}
+
+        def disappeared_only_after_reload(item: dict[str, Any]) -> bool:
+            check = checks_by_id.get(str(item.get("check_id") or "")) or {}
+            actions = [
+                action for action in check.get("actions") or []
+                if isinstance(action, dict)
+            ]
+            steps = [
+                step for step in item.get("steps") or []
+                if isinstance(step, dict)
+            ]
+            for index, step in enumerate(steps):
+                if step.get("ok") is not False or index >= len(actions):
+                    continue
+                target = str(actions[index].get("selector") or "")
+                if not target:
+                    continue
+                for prior in range(index):
+                    if (
+                        prior < len(steps)
+                        and steps[prior].get("ok") is True
+                        and str(actions[prior].get("selector") or "") == target
+                        and any(
+                            actions[middle].get("action") == "reload"
+                            for middle in range(prior + 1, index)
+                        )
+                    ):
+                        return True
+            return False
+
+        missing_target_ids = {
+            str(item.get("check_id"))
+            for item in browser_evidence.get("checks") or []
+            if isinstance(item, dict)
+            and not disappeared_only_after_reload(item)
+            and any(
+                isinstance(step, dict)
+                and step.get("ok") is False
+                and step.get("action") in {"assert_visible", "wait_for"}
+                and "waiting for locator" in str(step.get("error") or "")
+                and "locator resolved to" not in str(step.get("error") or "")
+                and not (
+                    isinstance(step.get("visibility_diagnostic"), dict)
+                    and int(
+                        step["visibility_diagnostic"].get("base_matched_count") or 0
+                    ) > 0
+                )
+                for step in item.get("steps") or []
+            )
+        }
+        if missing_target_ids & failed_set:
+            return {"markup"}, failed_ids
         return _requested_source_roles(failed_checks), failed_ids
     edit_guard = grade.get("edit_guard") if isinstance(grade, dict) else None
     violations = edit_guard.get("violations") if isinstance(edit_guard, dict) else None
@@ -331,21 +417,35 @@ def _source_hotspots(
         role_evidence = sorted(_file_source_roles(path) & requested_roles)
         lines = content.splitlines()
         for selector in selectors:
-            for index, line in enumerate(lines, start=1):
-                if selector in line:
-                    matches.append(
-                        {"line": index, "anchor": selector, "strength": "selector"}
-                    )
-                    score += 8
-        for token in tokens:
+            occurrences = [
+                index for index, line in enumerate(lines, start=1) if selector in line
+            ]
+            score += 8 * len(occurrences)
+            sampled = (
+                occurrences
+                if len(occurrences) <= 6
+                else [*occurrences[:3], *occurrences[-3:]]
+            )
+            matches.extend(
+                {"line": index, "anchor": selector, "strength": "selector"}
+                for index in sampled
+            )
+        for token in sorted(tokens, key=lambda item: (-len(item), item)):
             if token in selectors:
                 continue
-            for index, line in enumerate(lines, start=1):
-                if token in line:
-                    matches.append(
-                        {"line": index, "anchor": token, "strength": "token"}
-                    )
-                    score += 3
+            occurrences = [
+                index for index, line in enumerate(lines, start=1) if token in line
+            ]
+            score += 3 * len(occurrences)
+            sampled = (
+                occurrences
+                if len(occurrences) <= 6
+                else [*occurrences[:3], *occurrences[-3:]]
+            )
+            matches.extend(
+                {"line": index, "anchor": token, "strength": "token"}
+                for index in sampled
+            )
         if score and role_evidence:
             # The source layer implied by an executable action is stronger
             # evidence than the same selector appearing in incidental text.
@@ -575,6 +675,10 @@ def _dependency_closure(seed_paths: set[str], graph: dict[str, set[str]]) -> set
 def _resolve_target_route(route: str, entries: dict[str, set[str]]) -> str | None:
     if route in entries:
         return route
+    if route.endswith("/index.html"):
+        directory_route = route[:-len("index.html")].rstrip("/") or "/"
+        if "frontend" + route in entries.get(directory_route, set()):
+            return directory_route
     candidates = []
     if route != "/":
         candidates.extend((route.rstrip("/") + ".html", route.rstrip("/")))
@@ -590,6 +694,7 @@ def _route_scope(
     checks: list[dict[str, Any]],
     explicit_target_routes: list[str] | None = None,
     allow_planned_static_routes: bool = False,
+    allow_navigation_entry: bool = False,
 ) -> dict[str, Any]:
     entries = _route_entries(files, frontend, workdir)
     if not entries:
@@ -608,13 +713,18 @@ def _route_scope(
     unexpected_check_routes = sorted(
         set(check_routes) - set(contract_routes)
     ) if contract_routes else []
+    if allow_navigation_entry:
+        unexpected_check_routes = [
+            route for route in unexpected_check_routes
+            if _resolve_target_route(route, entries) is None
+        ]
     # A multi-route Edit should remain route-local per sprint. The explicit
     # contract is the run-wide upper bound, while this sprint opens only the
     # routes for which it has executable checks. If the planner drifts outside
     # that upper bound, keep the user-declared routes in the blocked artifact
     # rather than accidentally legitimizing the drifted page.
     requested = (
-        contract_routes if unexpected_check_routes else check_routes
+        contract_routes if (unexpected_check_routes or allow_navigation_entry) and contract_routes else check_routes
     )
     missing_check_routes: list[str] = []
     resolved = {
@@ -638,11 +748,53 @@ def _route_scope(
             entries[requested_route] = {path}
             resolved[requested_route] = requested_route
             planned_route_entries[requested_route] = path
+    planned_route_dependency_edges: list[dict[str, str]] = []
+    planned_dependencies: dict[str, set[str]] = {}
+    for check in checks:
+        for contract in _routed_selector_contracts(check):
+            route = str(contract.get("route") or "")
+            entry_path = planned_route_entries.get(route)
+            if entry_path is None:
+                continue
+            selector = str(contract.get("selector") or "").strip()
+            resource = re.fullmatch(
+                r"(script|link)\[(src|href)\s*=\s*(['\"])([^'\"]+)\3\]",
+                selector,
+            )
+            if resource is None or (
+                (resource.group(1), resource.group(2))
+                not in {("script", "src"), ("link", "href")}
+            ):
+                continue
+            target = _resolve_reference(
+                frontend,
+                workdir / entry_path,
+                resource.group(4),
+            )
+            if target is None:
+                continue
+            target_path = _relative_to_workdir(target, workdir)
+            if resource.group(1) == "script" and target.suffix.lower() not in BEHAVIOR_EXTENSIONS:
+                continue
+            if resource.group(1) == "link" and target.suffix.lower() not in STYLE_EXTENSIONS:
+                continue
+            planned_dependencies.setdefault(route, set()).add(target_path)
+            edge = {
+                "from": entry_path,
+                "to": target_path,
+                "kind": "planned_route_dependency",
+            }
+            if edge not in planned_route_dependency_edges:
+                planned_route_dependency_edges.append(edge)
     unresolved = sorted(route for route, match in resolved.items() if match is None)
     target_routes = sorted({match for match in resolved.values() if match is not None})
     closures = {
         route: _dependency_closure(paths, graph) for route, paths in entries.items()
     }
+    for route, dependencies in planned_dependencies.items():
+        closures.setdefault(route, set()).update(
+            _dependency_closure(dependencies, graph)
+        )
     all_paths = {_relative_to_workdir(path, workdir) for path in files}
     # Framework shells are implicit runtime dependencies rather than normal
     # page imports. Assign them to every page they wrap so a layout/global CSS
@@ -745,6 +897,10 @@ def _route_scope(
         ),
         "planned_new_route_entries": sorted(planned_route_entries.values()),
         "planned_new_routes": sorted(planned_route_entries),
+        "planned_route_dependency_edges": sorted(
+            planned_route_dependency_edges,
+            key=lambda item: (item["from"], item["to"]),
+        ),
         "global_style_paths": sorted(global_style_paths),
         "route_local_paths": sorted(route_local),
         "target_shared_paths": sorted(target_shared),
@@ -1751,6 +1907,14 @@ def _selector_anchor_variants(selector: str) -> set[str]:
         compounds = _selector_compounds(value)
         if compounds:
             variants.add(compounds[-1])
+        # A stable class/id can follow a tag in a compound selector
+        # (``a.sidebar-item``). Remove attribute bodies first so dots inside
+        # data values are not mistaken for class anchors.
+        without_attributes = re.sub(r"\[[^\]]*\]", "", value)
+        variants.update(
+            match.group(0)
+            for match in re.finditer(r"[#.][A-Za-z_][\w-]*", without_attributes)
+        )
     return {item for item in variants if item}
 
 
@@ -1768,21 +1932,39 @@ def _routed_selector_contracts(check: dict[str, Any]) -> list[dict[str, Any]]:
     current_route = initial_route
     contracts: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for action in check.get("actions", []):
+    actions = [action for action in check.get("actions", []) if isinstance(action, dict)]
+    state_changed = bool(
+        check.get("category") == "persistence"
+        and actions
+        and actions[0].get("action") == "reload"
+    )
+    for action in actions:
         if not isinstance(action, dict):
             continue
         for selector in _extract_selectors([action]):
-            count = action.get("count") if action.get("action") == "assert_count" else 1
+            exact_count = action.get("action") == "assert_count"
+            count = action.get("count") if exact_count else 1
             if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                 count = 1
+            unique_identity = bool(
+                re.fullmatch(
+                    r"(?:#[A-Za-z_][\w-]*|\[(?:data-testid|aria-label)\s*=\s*(['\"])[^'\"]+\1\]|a\[href\s*=\s*(['\"])[^'\"]+\2\])",
+                    selector.strip(),
+                )
+            )
             contracts.append(
                 {
                     "route": current_route,
                     "selector": selector,
-                    "max_count": min(count, 50),
+                    "min_count": min(count, 50),
+                    "max_count": min(count, 50) if exact_count or unique_identity else 50,
+                    "action_types": [str(action.get("action") or "")],
+                    "after_state_change": state_changed,
                 }
             )
             seen.add(selector)
+        if str(action.get("action") or "") in INTERACTION_ACTIONS:
+            state_changed = True
         if action.get("action") == "assert_url":
             next_route = _normalize_route(action.get("value", ""))
             if next_route is not None:
@@ -1792,7 +1974,12 @@ def _routed_selector_contracts(check: dict[str, Any]) -> list[dict[str, Any]]:
     for selector in _extract_selectors([check]):
         if selector not in seen:
             contracts.append(
-                {"route": initial_route, "selector": selector, "max_count": 1}
+                {
+                    "route": initial_route,
+                    "selector": selector,
+                    "max_count": 1,
+                    "action_types": ["check_level"],
+                }
             )
     return contracts
 
@@ -1804,6 +1991,8 @@ def _fragment_dom_scope(
     *,
     existing_source_selectors: set[str] | None = None,
     expected_new_routes: set[str] | None = None,
+    route_aliases: dict[str, str] | None = None,
+    instruction_delta: str = "",
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     """Resolve each action selector to the deepest stable semantic fragment."""
     if baseline.get("version") != 4:
@@ -1832,15 +2021,50 @@ def _fragment_dom_scope(
     source_selectors = existing_source_selectors or set()
     new_route_set = expected_new_routes or set()
     routed: dict[tuple[str, str], dict[str, Any]] = {}
+    continued_state: dict[str, bool] = {}
     for check in checks:
-        for contract in _routed_selector_contracts(check):
-            route = str(contract["route"])
+        check_id = str(check.get("id") or "") if isinstance(check, dict) else ""
+        part_match = re.fullmatch(r"(.+)__part(\d+)", check_id)
+        continuation_key = part_match.group(1) if part_match else check_id
+        contracts = _routed_selector_contracts(check)
+        if part_match and int(part_match.group(2)) > 1 and continued_state.get(continuation_key):
+            for contract in contracts:
+                contract["after_state_change"] = True
+        if any(
+            isinstance(action, dict)
+            and str(action.get("action") or "") in INTERACTION_ACTIONS
+            for action in (check.get("actions") or [])
+        ):
+            continued_state[continuation_key] = True
+        for contract in contracts:
+            route = (route_aliases or {}).get(str(contract["route"]), str(contract["route"]))
+            contract["route"] = route
             if route not in target_set:
                 continue
             key = (route, str(contract["selector"]))
             prior = routed.get(key)
-            if prior is None or int(contract["max_count"]) > int(prior["max_count"]):
+            if prior is None:
                 routed[key] = contract
+            else:
+                prior["max_count"] = max(
+                    int(prior["max_count"]), int(contract["max_count"])
+                )
+                prior["min_count"] = max(
+                    int(prior.get("min_count", 1)), int(contract.get("min_count", 1))
+                )
+                prior["action_types"] = sorted(set(
+                    list(prior.get("action_types") or [])
+                    + list(contract.get("action_types") or [])
+                ))
+                # A selector that is produced by any interaction remains a
+                # conditional runtime fragment even if a continuation check
+                # later reasserts it after reload. The guard snapshots a fresh
+                # browser without replaying those actions, so requiring it at
+                # rest creates a false missing-addition regression.
+                prior["after_state_change"] = bool(
+                    prior.get("after_state_change")
+                    or contract.get("after_state_change")
+                )
 
     pending_new: list[dict[str, Any]] = []
     source_variants = {
@@ -1888,6 +2112,19 @@ def _fragment_dom_scope(
                 }
             )
             continue
+        # Check-level contracts are preservation anchors, never new target
+        # requirements. In particular, a hash route such as ``#gallery`` may
+        # look like an id selector without denoting a DOM node.
+        action_types = set(contract.get("action_types") or [])
+        if action_types == {"check_level"}:
+            evidence.append(
+                {
+                    "selector": selector,
+                    "route": route,
+                    "resolution": "unresolved_source_anchor_ignored",
+                }
+            )
+            continue
         if route in new_route_set:
             evidence.append(
                 {
@@ -1897,29 +2134,95 @@ def _fragment_dom_scope(
                 }
             )
             continue
-        terminal = (_selector_compounds(selector) or [selector])[-1]
+        target_observation = any(
+            action.startswith("assert_") or action in {"check_level", "wait_for"}
+            for action in action_types
+        )
+        compounds = _selector_compounds(selector) or [selector]
+        terminal = compounds[-1]
+        terminal_without_attributes = re.sub(r"\[[^\]]*\]", "", terminal)
+        navigation = re.fullmatch(
+            r"a\[href\s*=\s*(['\"])([^'\"]+)\1\]",
+            terminal,
+        )
+        navigation_route = (
+            _normalize_route(navigation.group(2)) if navigation is not None else None
+        )
+        planned_root = compounds[0]
+        planned_root_without_attributes = re.sub(
+            r"\[[^\]]*\]", "", planned_root
+        )
         strong = bool(
-            re.search(r"(?:^|[^\\])(?:#|\.)[A-Za-z_-]", terminal)
+            re.search(
+                r"(?:^|[^\\])(?:#|\.)[A-Za-z_-]",
+                terminal_without_attributes + " " + planned_root_without_attributes,
+            )
             or terminal.startswith("[data-testid=")
             or terminal.startswith("[aria-label=")
+            or planned_root.startswith("[data-testid=")
+            or planned_root.startswith("[aria-label=")
+            or navigation_route in target_set
         )
+        named_control = re.fullmatch(r"(?:button|a|label):has-text\((['\"])([^'\"]+)\1\)", selector)
+        if (named_control and named_control.group(2).strip()
+                and named_control.group(2).casefold() in instruction_delta.casefold()):
+            # A requested, explicitly observed new control is addressable by
+            # its literal user-facing label, just as by a planned test ID.
+            strong = True
+        if not target_observation and not strong:
+            evidence.append(
+                {
+                    "selector": selector,
+                    "route": route,
+                    "resolution": "runtime_source_control",
+                    "action_types": sorted(action_types),
+                }
+            )
+            continue
         if strong:
-            pending_new.append(contract)
+            pending_new.append(
+                {
+                    "route": contract["route"],
+                    "selector": contract["selector"],
+                    "max_count": contract["max_count"],
+                    "min_count": contract.get("min_count", 1),
+                    "after_state_change": bool(contract.get("after_state_change")),
+                }
+            )
         else:
             unresolved.append(f"{route}::{selector}")
 
     for contract in pending_new:
         selector = str(contract["selector"])
         compounds = _selector_compounds(selector)
+
+        def testid_value(value: str) -> str:
+            match = re.search(
+                r"\[data-testid\s*=\s*(['\"])([^'\"]+)\1\]", value
+            )
+            return match.group(2) if match is not None else ""
+
+        child_testid = testid_value(selector)
         covering = next(
             (
                 other
                 for other in pending_new
                 if other is not contract
                 and other["route"] == contract["route"]
-                and len(compounds) > 1
-                and _selector_base(str(other["selector"]))
-                == _selector_base(compounds[0])
+                and (
+                    (
+                        len(compounds) > 1
+                        and _selector_base(str(other["selector"]))
+                        == _selector_base(compounds[0])
+                    )
+                    or (
+                        bool(contract.get("after_state_change"))
+                        and bool(testid_value(str(other["selector"])))
+                        and child_testid.startswith(
+                            testid_value(str(other["selector"])) + "-"
+                        )
+                    )
+                )
             ),
             None,
         )
@@ -1933,8 +2236,37 @@ def _fragment_dom_scope(
                 }
             )
             continue
-        expected_new.append(contract)
-    return allowed, expected_new, evidence, sorted(set(unresolved))
+        expected_new.append(
+            {
+                "route": contract["route"],
+                "selector": contract["selector"],
+                **(
+                    {"min_count": 0}
+                    if contract.get("after_state_change")
+                    else (
+                        {"min_count": contract["min_count"]}
+                        if contract["min_count"] != contract["max_count"]
+                        else {}
+                    )
+                ),
+                "max_count": contract["max_count"],
+            }
+        )
+    allowed_set = set(allowed)
+    collapsed_allowed: list[str] = []
+    for key in allowed:
+        parent = (fragments.get(key) or {}).get("parent_key")
+        visited = {key}
+        covered = False
+        while isinstance(parent, str) and parent and parent not in visited:
+            if parent in allowed_set:
+                covered = True
+                break
+            visited.add(parent)
+            parent = (fragments.get(parent) or {}).get("parent_key")
+        if not covered:
+            collapsed_allowed.append(key)
+    return collapsed_allowed, expected_new, evidence, sorted(set(unresolved))
 
 
 def _scope_payload(plan: dict[str, Any]) -> dict[str, Any]:
@@ -1949,9 +2281,40 @@ def _scope_payload(plan: dict[str, Any]) -> dict[str, Any]:
         "allowed_fragment_keys": list(dom.get("allowed_fragment_keys", [])),
         "expected_new_fragments": list(dom.get("expected_new_fragments", [])),
         "expected_new_routes": list(dom.get("expected_new_routes", [])),
+        "max_fragments_per_route": dict(dom.get("max_fragments_per_route", {})),
         "target_routes": list((plan.get("route_scope") or {}).get("target_routes", [])),
         "protected_routes": list((plan.get("route_scope") or {}).get("protected_routes", [])),
     }
+
+
+def _stable_source_anchor_checks(
+    atomic_plan: dict[str, Any], target_routes: list[str]
+) -> list[dict[str, Any]]:
+    """Expose grounded target containers to the DOM complement guard.
+
+    Action checks often name only the new control. A filtering Edit also
+    intentionally changes the pre-existing results container, so a stable
+    planner source anchor such as ``#view-gallery`` must define that target
+    subtree. Positional selectors remain excluded because they are not stable
+    preservation boundaries.
+    """
+    route = target_routes[0] if target_routes else "/"
+    selectors = [
+        str(anchor).strip()
+        for anchor in atomic_plan.get("source_anchors") or []
+        if isinstance(anchor, str)
+        and re.fullmatch(
+            r"(?:#[A-Za-z_][\w-]*|\[(?:data-testid|aria-label)\s*=\s*(['\"])[^'\"]+\1\])",
+            anchor.strip(),
+        )
+    ]
+    return [
+        {
+            "route": route,
+            "actions": [{"action": "check_level", "selector": selector}],
+        }
+        for selector in dict.fromkeys(selectors)
+    ]
 
 
 def ensure_minimal_path_plan(
@@ -1969,7 +2332,9 @@ def ensure_minimal_path_plan(
     existing = _read_json(path, None)
     if (
         isinstance(existing, dict)
-        and existing.get("schema_version") in SUPPORTED_PLAN_VERSIONS
+        and existing.get("schema_version") == PLAN_VERSION
+        and existing.get("source_selection_strategy") == SOURCE_SELECTION_STRATEGY
+        and existing.get("status") != "blocked"
     ):
         scope_path = harness_dir / f"edit_scope_round_{round_num}.json"
         if not scope_path.exists():
@@ -1988,8 +2353,8 @@ def ensure_minimal_path_plan(
     )
     requested_roles |= priority_roles
     baseline_candidates = (
-        harness_dir / f"repair_dom_source_round_{round_num}.json",
         harness_dir / f"edit_dom_source_sprint_{sprint_num}.json",
+        harness_dir / f"repair_dom_source_round_{round_num}.json",
         harness_dir / "edit_dom_baseline.json",
     )
     baseline_path = next((item for item in baseline_candidates if item.is_file()), None)
@@ -2006,6 +2371,7 @@ def ensure_minimal_path_plan(
     if not isinstance(explicit_target_routes, list):
         explicit_target_routes = []
     route_scope = _route_scope(
+        allow_navigation_entry=bool(_read_json(harness_dir / "harness_state.json", {}).get("supplied_atomic_plan")),
         files=files,
         frontend=frontend,
         workdir=workdir,
@@ -2013,9 +2379,30 @@ def ensure_minimal_path_plan(
         checks=checks,
         explicit_target_routes=[str(item) for item in explicit_target_routes],
         allow_planned_static_routes=(
-            mode == "generate" and not (workdir / "seed_manifest.json").is_file()
+            mode == "generate"
+            and (
+                not (workdir / "seed_manifest.json").is_file()
+                # A forward Edit may turn one accepted HTML shell into a real
+                # multi-page site, but only for pathnames the caller placed in
+                # the run-wide Edit authorization ceiling.  Planner checks
+                # still have to cover every requested route below, so this
+                # does not grant arbitrary file creation.
+                or bool(explicit_target_routes)
+            )
         ),
     )
+    expected_new_routes = set(route_scope.get("planned_new_routes") or [])
+    if mode == "repair":
+        # Repair rounds are still evaluated against the accepted pre-Edit DOM
+        # baseline. A route created by the generation round is no longer new
+        # on disk, so preserve the original authorization instead of treating
+        # every required fragment on that route as an unexpected addition.
+        generation_scope = _read_json(harness_dir / "edit_scope_round_1.json", {})
+        expected_new_routes.update(
+            route
+            for route in generation_scope.get("expected_new_routes") or []
+            if route in set(route_scope.get("target_routes") or [])
+        )
     isolation_strategy = _route_isolation_strategy(
         route_scope=route_scope,
         files=files,
@@ -2028,10 +2415,15 @@ def ensure_minimal_path_plan(
         tokens,
         list(route_scope.get("target_routes") or []),
     )
+    atomic_plan = _read_json(harness_dir / "atomic_edit_plan.json", {})
+    dom_checks = checks + _stable_source_anchor_checks(
+        atomic_plan,
+        list(route_scope.get("target_routes") or []),
+    )
     allowed_fragments, expected_new_fragments, fragment_evidence, unresolved_fragments = (
         _fragment_dom_scope(
             baseline,
-            checks,
+            dom_checks,
             list(route_scope.get("target_routes") or []),
             existing_source_selectors={
                 str(match.get("anchor"))
@@ -2041,7 +2433,10 @@ def ensure_minimal_path_plan(
                 and match.get("strength") == "selector"
                 and match.get("anchor")
             },
-            expected_new_routes=set(route_scope.get("planned_new_routes") or []),
+            expected_new_routes=expected_new_routes,
+            route_aliases={route: _resolve_target_route(route, route_scope["route_entries"]) or route
+                           for route in route_scope.get("requested_routes", [])},
+            instruction_delta=str(_read_json(harness_dir / "edit_card.json", {}).get("instruction_delta") or ""),
         )
     )
     planned_companions = {
@@ -2081,10 +2476,11 @@ def ensure_minimal_path_plan(
     hotspots = [
         item for item in all_hotspots if str(item.get("path")) in admissible_paths
     ]
-    if priority_roles:
+    routing_roles = priority_roles or requested_roles
+    if routing_roles:
         hotspots.sort(
             key=lambda item: (
-                0 if set(item.get("role_evidence") or []) & priority_roles else 1,
+                0 if set(item.get("role_evidence") or []) & routing_roles else 1,
                 0 if item.get("role_evidence") else 1,
                 -int(item["score"]),
                 str(item["path"]),
@@ -2095,6 +2491,21 @@ def ensure_minimal_path_plan(
     }
 
     ranked = [str(item["path"]) for item in hotspots]
+    if not ranked and len(route_scope.get("target_routes") or []) == 1:
+        # A plan may intentionally assert only new target test IDs, yielding no
+        # lexical hit in the accepted source. For one route, prefer a route-
+        # local source layer implied by executable check types. Do not promote
+        # a cross-route guarded file from role evidence alone: the route entry
+        # is the safer first mutation and can unlock that shared dependency.
+        # For multiple target routes, retain one entrypoint per route so a
+        # generic role match cannot silently collapse the change cone.
+        ranked = sorted(
+            _relative_to_workdir(path, workdir)
+            for path in files
+            if _relative_to_workdir(path, workdir) in admissible_paths
+            and _relative_to_workdir(path, workdir) not in guarded_shared_paths
+            and _file_source_roles(path) & routing_roles
+        )
     if requested_roles == {"style"}:
         ranked = list(dict.fromkeys([*sorted(guarded_style_paths), *ranked]))
     elif guarded_style_paths:
@@ -2114,20 +2525,33 @@ def ensure_minimal_path_plan(
     if isolation_strategy.get("status") == "recommended":
         # The page entry is the first small mutation: connect it to the planned
         # route-local companion. Existing behavior sources remain protected.
-        initial = sorted(isolation_entries)[:1]
+        initial = sorted(isolation_entries)[:max_touched_files]
         local = sorted(isolation_entries)
     else:
         if len(route_scope.get("target_routes") or []) > 1:
             owners = route_scope.get("path_owners") or {}
             per_route_initial: list[str] = []
+            planned_route_set = set(route_scope.get("planned_new_routes") or [])
             for route in route_scope.get("target_routes") or []:
-                candidate = next(
-                    (
-                        path
-                        for path in ranked
-                        if route in set(owners.get(path) or [])
-                    ),
-                    None,
+                candidate = (
+                    next(
+                        (
+                            path
+                            for path in target_entries
+                            if route in set(owners.get(path) or [])
+                            and path not in per_route_initial
+                        ),
+                        None,
+                    )
+                    if route in planned_route_set
+                    else next(
+                        (
+                            path
+                            for path in ranked
+                            if route in set(owners.get(path) or [])
+                        ),
+                        None,
+                    )
                 )
                 if candidate is None:
                     candidate = next(
@@ -2135,6 +2559,7 @@ def ensure_minimal_path_plan(
                             path
                             for path in target_entries
                             if route in set(owners.get(path) or [])
+                            and path not in per_route_initial
                         ),
                         None,
                     )
@@ -2143,6 +2568,24 @@ def ensure_minimal_path_plan(
             initial = per_route_initial or (ranked[:1] if ranked else target_entries[:1])
         else:
             initial = ranked[:1] if ranked else target_entries[:1]
+        if mode == "repair" and round_num > 1:
+            # A repair may need to correct any file changed by the immediately
+            # preceding failed attempt.  Keep that cone exact: reuse only
+            # trace-backed prior touched paths that remain locally admissible,
+            # instead of forcing a meaningless mutation in the newly ranked
+            # first path merely to unlock the actual defective file.
+            prior_state = _read_json(
+                harness_dir / state_name(round_num - 1), {}
+            )
+            prior_touched = [
+                str(path)
+                for path in prior_state.get("touched_paths") or []
+                if str(path) in admissible_paths
+            ]
+            if prior_touched:
+                initial = list(dict.fromkeys([*initial, *prior_touched]))[
+                    :max_touched_files
+                ]
         seeds = ranked[:max_touched_files]
         if not seeds:
             seeds = target_entries[:1]
@@ -2174,6 +2617,11 @@ def ensure_minimal_path_plan(
     for shared_style in sorted(guarded_style_paths):
         if shared_style not in local and shared_style not in dependencies:
             dependencies.append(shared_style)
+    for edge in route_scope.get("planned_route_dependency_edges") or []:
+        target = str(edge.get("to") or "")
+        if target and target not in local and target not in dependencies:
+            dependencies.append(target)
+    dependencies.sort()
     all_paths = [_relative_to_workdir(item, workdir) for item in files]
     protected = sorted(set(all_paths) - set(local) - set(dependencies))
     executable_edges = [
@@ -2203,6 +2651,13 @@ def ensure_minimal_path_plan(
         if isinstance(item, dict)
         for path in (item.get("planned_companion_path"), item.get("planned_style_path"))
         if path
+    )
+    executable_edges.extend(
+        dict(edge)
+        for edge in route_scope.get("planned_route_dependency_edges") or []
+        if isinstance(edge, dict)
+        and edge.get("from") in admissible_paths
+        and edge.get("to") in admissible_paths
     )
     style_owners = route_scope.get("path_owners") or {}
     executable_edge_keys = {
@@ -2239,22 +2694,30 @@ def ensure_minimal_path_plan(
             1
             for contract in expected_new_fragments
             if contract.get("route") == route
+            # Exact, count-bounded test IDs do not widen access to any
+            # existing source fragment. They are postconditions inside the
+            # already bounded target root, not independent mutable regions.
+            and expected_fragment_consumes_scope_slot(contract)
         )
         for route in route_scope.get("target_routes", [])
     }
+    # External Product Session checks describe the post-edit UI. Missing
+    # source selectors are expected for added dialogs and controls; keep
+    # them as diagnostics, while route ownership still bounds the edit.
+    supplied_plan = bool(_read_json(harness_dir / "harness_state.json", {}).get("supplied_atomic_plan"))
     status = (
         "blocked"
         if route_scope["unresolved_routes"]
         or route_scope["unexpected_check_routes"]
         or route_scope["missing_check_routes"]
-        or bool(unresolved_fragments)
-        or any(count > 4 for count in fragment_route_counts.values())
+        or (bool(unresolved_fragments) and not supplied_plan)
         else "ready"
         if local and checks
         else "advisory"
     )
     plan = {
         "schema_version": PLAN_VERSION,
+        "source_selection_strategy": SOURCE_SELECTION_STRATEGY,
         "owner": "harness",
         "round": round_num,
         "sprint": sprint_num,
@@ -2278,8 +2741,9 @@ def ensure_minimal_path_plan(
             "allow_new_roots": allow_new_roots,
             "root_evidence": root_evidence,
             "allowed_fragment_keys": allowed_fragments,
+            "max_fragments_per_route": fragment_route_counts,
             "expected_new_fragments": expected_new_fragments,
-            "expected_new_routes": list(route_scope.get("planned_new_routes") or []),
+            "expected_new_routes": sorted(expected_new_routes),
             "fragment_evidence": fragment_evidence,
             "unresolved_fragment_selectors": unresolved_fragments,
         },
@@ -2339,6 +2803,15 @@ class MinimalPathPolicy:
             if isinstance(item, dict) and item.get("path")
         ]
         fallback_initial = hotspots[:1] or sorted(self.local_paths)[:1]
+        if str(plan.get("mode") or "") == "repair" and self.round_num > 1:
+            prior_state = _read_json(
+                self.workdir / ".harness" / state_name(self.round_num - 1), {}
+            )
+            configured_initial.update(
+                str(path)
+                for path in prior_state.get("touched_paths") or []
+                if str(path) in self.local_paths
+            )
         self.initial_paths = configured_initial or set(fallback_initial)
         self.dependency_paths = set(cone.get("dependency_paths") or [])
         self.protected_paths = set(cone.get("protected_paths") or [])
@@ -2366,7 +2839,10 @@ class MinimalPathPolicy:
             {},
         )
         self.preloaded_regions: dict[str, list[str]] = {}
-        if isinstance(context, dict) and context.get("schema_version") == "edit-context-v1":
+        if isinstance(context, dict) and context.get("schema_version") in {
+            "edit-context-v1",
+            "edit-context-v2",
+        }:
             for item in context.get("source_windows") or []:
                 if isinstance(item, dict) and item.get("path") and item.get("content"):
                     self.preloaded_regions.setdefault(str(item["path"]), []).append(
@@ -2515,6 +2991,16 @@ class MinimalPathPolicy:
     def _patch_pairs(tool: str, tool_input: dict[str, Any]) -> list[tuple[str, str]]:
         normalized = tool.lower()
         if normalized in {"write", "write_file"}:
+            copy_pairs = tool_input.get("_harness_copy_pairs")
+            if tool_input.get("_harness_copy_from") and isinstance(copy_pairs, list):
+                return [
+                    (
+                        str(item.get("old_text", "")),
+                        str(item.get("new_text", "")),
+                    )
+                    for item in copy_pairs
+                    if isinstance(item, dict)
+                ]
             return [("", str(tool_input.get("content", "")))]
         if normalized in {"apply_patch", "edit"}:
             old = tool_input.get("old_text", tool_input.get("old_string", ""))
@@ -2961,8 +3447,7 @@ class MinimalPathPolicy:
                     "Read only the focused missing line range before widening the patch.",
                 )
         patch_lines = sum(
-            max(len(old.splitlines()) or 1, len(new.splitlines()) or 1)
-            for old, new in pairs
+            max(1, effective_patch_line_count(old, new)) for old, new in pairs
         )
         if pairs and patch_lines > self.max_patch_lines:
             return self._deny(
@@ -2974,6 +3459,10 @@ class MinimalPathPolicy:
             )
         if pairs and absolute.is_file():
             content = absolute.read_text(encoding="utf-8", errors="replace")
+            source_lines = content.splitlines(keepends=True)
+            coordinate_start = tool_input.get("_harness_start_line")
+            coordinate_end = tool_input.get("_harness_end_line")
+            coordinate_sha = str(tool_input.get("_harness_source_sha256") or "")
             css_guarded = any(
                 item.get("mutation_mode") == "target_scoped_css"
                 for item in self.guarded_shared_regions.get(relative, [])
@@ -2981,7 +3470,26 @@ class MinimalPathPolicy:
             css_candidate = content
             for old, new in pairs:
                 current_content = css_candidate if css_guarded else content
-                if not old or current_content.count(old) != 1:
+                coordinated_span: tuple[int, int] | None = None
+                if (
+                    len(pairs) == 1
+                    and isinstance(coordinate_start, int)
+                    and not isinstance(coordinate_start, bool)
+                    and isinstance(coordinate_end, int)
+                    and not isinstance(coordinate_end, bool)
+                    and 1 <= coordinate_start <= coordinate_end <= len(source_lines)
+                    and coordinate_sha
+                    == hashlib.sha256(content.encode("utf-8")).hexdigest()
+                ):
+                    span_start = sum(
+                        len(line) for line in source_lines[: coordinate_start - 1]
+                    )
+                    span_end = sum(len(line) for line in source_lines[:coordinate_end])
+                    if content[span_start:span_end] == old:
+                        coordinated_span = (span_start, span_end)
+                if not old or (
+                    coordinated_span is None and current_content.count(old) != 1
+                ):
                     return self._deny(
                         tool,
                         relative,
@@ -3005,8 +3513,11 @@ class MinimalPathPolicy:
                             )
                         css_candidate = next_content
                     else:
-                        start = content.index(old)
-                        end = start + len(old)
+                        if coordinated_span is not None:
+                            start, end = coordinated_span
+                        else:
+                            start = content.index(old)
+                            end = start + len(old)
                         contract = self._guarded_contract_for_span(
                             relative, content, start, end
                         )

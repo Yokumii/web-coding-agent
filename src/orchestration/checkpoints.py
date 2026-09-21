@@ -46,8 +46,10 @@ class CheckpointTransaction:
     costs: Mapping[str, float]
     phase_metrics: Mapping[str, dict[str, Any]]
 
-    def record_plan_completed(self) -> None:
-        self._write_checkpoint("plan", 0, last_verdict="planned")
+    def record_plan_completed(self, *, edit_freeze: dict[str, Any] | None = None) -> None:
+        self._write_checkpoint(
+            "plan", 0, last_verdict="planned", edit_freeze=edit_freeze
+        )
 
     def record_design_completed(self, metadata: dict[str, Any]) -> None:
         self._write_checkpoint(
@@ -109,6 +111,7 @@ class CheckpointTransaction:
         last_verdict: str | None = None,
         accepted_sprints_payload: dict[str, Any] | None = None,
         design_metadata: dict[str, Any] | None = None,
+        edit_freeze: dict[str, Any] | None = None,
     ) -> None:
         if accepted_sprints_payload is None:
             accepted_sprints_payload = self.file_comm.read_accepted_sprints() or {}
@@ -127,6 +130,12 @@ class CheckpointTransaction:
         }
         if design_metadata:
             state.update(design_metadata)
+        previous_state = self.file_comm.read_state() or {}
+        frozen = edit_freeze or previous_state.get("edit_freeze")
+        if isinstance(frozen, dict):
+            state["edit_freeze"] = frozen
+        if previous_state.get("supplied_atomic_plan") is True:
+            state["supplied_atomic_plan"] = True
         self.file_comm.write_state(state)
         logger.debug(f"Checkpoint saved: {phase} (round {round_num})")
 

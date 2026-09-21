@@ -633,8 +633,8 @@ uv run python scripts/validate_webcompass_edit_matrix.py
 
 它覆盖单页、内联状态、多页共享文件、两路由/五文件和 hash-router，并把 accepted、
 候选拒收与基础设施错误分开统计；同时验证共享状态的定向增量、computed style、受保护
-路由 sentinel 和反事实 `non_minimal` 证书。带日期的结果与外部建议整理见
-[`docs/edit_harness_external_ideas_and_real_matrix_20260828.md`](docs/edit_harness_external_ideas_and_real_matrix_20260828.md)。
+路由 sentinel 和反事实 `non_minimal` 证书。当前生产与验收约束见
+[`docs/synthesis/pipeline.md`](docs/synthesis/pipeline.md)。
 
 ## 许可
 

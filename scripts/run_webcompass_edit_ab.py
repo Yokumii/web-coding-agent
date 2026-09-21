@@ -43,7 +43,7 @@ def parser() -> argparse.ArgumentParser:
         "--dataset",
         type=Path,
         default=repo.parent
-        / "WebCoding_Data/output/0805_supplement_release_cache/text-edit.jsonl.gz",
+        / "output/0805_supplement_release_cache/text-edit.jsonl.gz",
     )
     value.add_argument("--instance-id", default=DEFAULT_INSTANCE_ID)
     value.add_argument("--model", default=os.getenv("GENERATOR_MODEL", "qwen3.6-plus"))

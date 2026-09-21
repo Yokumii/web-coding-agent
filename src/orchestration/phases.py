@@ -1,4 +1,4 @@
-"""harness 的三个阶段实现。
+"""Harness phase implementations, including target-blind Edit validation.
 
 每个阶段函数负责本阶段的检查点写入、成本累计与 phase_metrics 记录。
 """
@@ -56,6 +56,7 @@ from src.orchestration.edit_card import (
     visual_evidence_required,
 )
 from src.orchestration.edit_task_contract import read_edit_task_contract
+from src.orchestration.hidden_oracle_checks import read_hidden_oracle_checks
 from src.orchestration.edit_context import ensure_edit_context
 from src.orchestration.atomic_edit_plan import (
     normalize_atomic_edit_plan_payload,
@@ -63,6 +64,15 @@ from src.orchestration.atomic_edit_plan import (
 )
 from src.orchestration.repair_packet import write_repair_packet
 from src.orchestration.task_inputs import load_task_input_manifest
+from src.orchestration.preimplementation_validation import (
+    freeze_preimplementation_validation,
+    frozen_checks_for_sprint,
+    frozen_hidden_oracle_checks,
+    verify_preimplementation_validation,
+)
+from src.orchestration.edit_risk_tests import (
+    materialize_edit_risk_tests, collect_source_risk_baseline, distinguish_preexisting_risks,
+)
 from src.orchestration.ui_action_contracts import TYPED_ASSERTION_ACTIONS
 from src.orchestration.minimality_runtime import (
     certify_round_minimality,
@@ -124,6 +134,25 @@ def _task_has_image_input(workdir: Path) -> bool:
     return any(item.get("kind") == "image" for item in manifest.get("inputs", []))
 
 
+def _counterfactual_minimality_is_sound(
+    grades: dict[str, Any], *, is_edit: bool
+) -> bool:
+    """A cheap deletion oracle is sound only when typed evidence is complete.
+
+    If the full evaluator was needed, the typed browser contract was already
+    judged insufficient for semantic admission.  Reusing that incomplete
+    contract to delete allegedly redundant code can remove unasserted required
+    behavior (for example the filtering itself while preserving only its hash).
+    """
+    if not is_edit:
+        return True
+    route = grades.get("evidence_route")
+    return (
+        isinstance(route, dict)
+        and route.get("decision") == "deterministic_typed_pass"
+    )
+
+
 # ---- 局部辅助函数 ----
 
 
@@ -172,6 +201,7 @@ async def run_planner_phase(ctx: HarnessContext) -> None:
     logger.info("[bold cyan]═" * 40)
     logger.info("[bold cyan]PHASE 1: PLAN")
     started = time.perf_counter()
+    edit_freeze: dict[str, Any] | None = None
     async with _agent_phase_session(ctx, phase_name="planner"):
         edit_contract = read_edit_task_contract(ctx.workdir)
         if edit_contract is not None:
@@ -190,8 +220,24 @@ async def run_planner_phase(ctx: HarnessContext) -> None:
                 sprint_plan=ctx.file_comm.read_sprint_plan() or {},
                 verification_plan=ctx.file_comm.read_ui_verification_plan() or {},
             )
+            logger.info(
+                "[bold blue]VALIDATE: deriving source/Edit risk tests before Build"
+            )
+            materialize_edit_risk_tests(
+                workdir=ctx.workdir,
+                instruction_delta=ctx.user_prompt,
+                applicable_states=ctx.config.edit_webcompass_defect_checks,
+            )
+            logger.info(
+                "[bold blue]VALIDATE: freezing target-blind Edit tests before Build"
+            )
+            edit_freeze = freeze_preimplementation_validation(
+                workdir=ctx.workdir,
+                file_comm=ctx.file_comm,
+                instruction_delta=ctx.user_prompt,
+            )
         _record_phase_stats(ctx, "planner", _coerce_stats(raw_stats), started_at=started)
-        _checkpoint_transaction(ctx).record_plan_completed()
+        _checkpoint_transaction(ctx).record_plan_completed(edit_freeze=edit_freeze)
 
 
 async def run_design_phase(ctx: HarnessContext) -> dict[str, Any]:
@@ -366,6 +412,55 @@ def _contract_functionality_recheck_allowed(
     return all(observed.get(str(item["check_id"])) == "ok" for item in ui_checks)
 
 
+def _conditional_fragment_recheck_allowed(
+    file_comm: FileComm,
+    previous_round: int,
+    grade: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> bool:
+    """Re-evaluate a dynamic target that an old static scope misclassified."""
+    guard = grade.get("edit_guard") or {}
+    violations = guard.get("violations") if isinstance(guard, dict) else None
+    ui_checks = grade.get("ui_checks")
+    if (
+        grade.get("overall_passed") is not False
+        or not isinstance(violations, list)
+        or not violations
+        or any(
+            not isinstance(item, dict)
+            or item.get("kind") != "expected_addition_missing"
+            for item in violations
+        )
+        or not isinstance(ui_checks, list)
+        or not ui_checks
+        or any(
+            not isinstance(item, dict)
+            or str(item.get("status") or "").lower() != "pass"
+            for item in ui_checks
+        )
+    ):
+        return False
+    planned_selectors = {
+        str(action.get("selector") or "")
+        for check in checks
+        if isinstance(check, dict)
+        for action in check.get("actions") or []
+        if isinstance(action, dict)
+    }
+    missing_selectors = {
+        str(item.get("fragment") or "").split("::", 1)[-1]
+        for item in violations
+    }
+    evidence_path = file_comm.dir / f"browser_evidence_round_{previous_round}.json"
+    try:
+        records = json.loads(evidence_path.read_text(encoding="utf-8")).get("checks", [])
+    except (OSError, ValueError, TypeError):
+        return False
+    return bool(missing_selectors) and missing_selectors <= planned_selectors and all(
+        isinstance(item, dict) and item.get("status") == "ok" for item in records
+    )
+
+
 async def run_build_phase(
     ctx: HarnessContext,
     round_num: int,
@@ -375,6 +470,13 @@ async def run_build_phase(
     """执行当前目标 sprint 的 generator，并写入检查点。"""
     logger.info("[bold green]BUILD phase")
     sprint_num = ctx.sprint_state.current_target
+    edit_contract = read_edit_task_contract(ctx.workdir)
+    if edit_contract is not None:
+        verify_preimplementation_validation(
+            workdir=ctx.workdir,
+            file_comm=ctx.file_comm,
+            instruction_delta=ctx.user_prompt,
+        )
     mode = _select_generator_mode(ctx, round_num, sprint_num, resume_state)
     frontend_dir = ctx.workdir / "frontend"
     semantic_routes = discover_page_routes(ctx.workdir) or None
@@ -409,12 +511,16 @@ async def run_build_phase(
                 )
         finally:
             await app_stack.close()
-    elif mode == "repair" and (frontend_dir / ".git").exists():
+    elif (
+        mode == "repair"
+        and not sprint_baseline_path.exists()
+        and (frontend_dir / ".git").exists()
+    ):
         repair_baseline_path = ctx.file_comm.dir / repair_baseline_name(round_num)
         previous = ctx.file_comm.read_grades(round_num - 1) or {}
         render_failed = (previous.get("phase_results") or {}).get("render_gate") == "fail"
         if not repair_baseline_path.exists() and not render_failed:
-            # For a repair that did not originate from a forward-edit seed,
+            # For a repair that did not originate from an accepted Edit seed,
             # freeze the actual failed source. The repair may change its
             # declared surface, while the rest becomes a semantic frame.
             app_stack = await start_app_stack(
@@ -474,14 +580,16 @@ async def run_build_phase(
             plan=minimal_path_plan,
             round_num=round_num,
             source_anchors=list(atomic_plan.get("source_anchors") or []),
+            **({"max_total_chars": 250000, "max_file_chars": 250000}
+               if (ctx.file_comm.read_state() or {}).get("supplied_atomic_plan") else {}),
         )
-    track_minimality = (
-        ctx.config.minimality_guard_enabled
-        and (incremental_edit or mode == "repair")
+    track_build = (
+        (incremental_edit or mode == "repair")
         and (frontend_dir / ".git").exists()
     )
-    if track_minimality:
-        ensure_minimality_policy(ctx.file_comm.dir, ctx.config)
+    if track_build:
+        if ctx.config.minimality_guard_enabled:
+            ensure_minimality_policy(ctx.file_comm.dir, ctx.config)
         record_round_build_source(
             ctx.file_comm.dir, frontend_dir, round_num=round_num,
             sprint_num=sprint_num, mode=mode,
@@ -510,6 +618,12 @@ async def run_build_phase(
         or _contract_functionality_recheck_allowed(
             ctx.file_comm, round_num - 1, previous_grade
         )
+        or _conditional_fragment_recheck_allowed(
+            ctx.file_comm,
+            round_num - 1,
+            previous_grade,
+            ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+        )
     )
     async with _agent_phase_session(ctx, phase_name=f"generator round {round_num}"):
         ctx.sprint_state.mark_sprint_in_progress(sprint_num)
@@ -532,7 +646,7 @@ async def run_build_phase(
                 ctx.config, ctx.file_comm, ctx.workdir,
                 round_num=round_num, sprint_num=sprint_num, mode=mode,
             )
-        if track_minimality:
+        if track_build:
             record_round_build_destination(
                 ctx.file_comm.dir, frontend_dir, round_num=round_num
             )
@@ -668,7 +782,7 @@ def _checks_are_tape_eligible(checks: list[dict[str, Any]]) -> bool:
             and action.get("action") in TYPED_ASSERTION_ACTIONS
         )
         if (
-            not 1 <= assertion_count <= 4
+            assertion_count < 1
             or not isinstance(actions[-1], dict)
             or actions[-1].get("action") not in TYPED_ASSERTION_ACTIONS
         ):
@@ -826,7 +940,13 @@ def _reconcile_action_contract_evidence(
         status_by_id.get(check_id) == "ok" for check_id in grade_check_ids
     )
     functionality_calibrated = False
-    if contracts_complete:
+    calibration_route = str(
+        (reconciled.get("evidence_route") or {}).get("decision") or ""
+    )
+    if contracts_complete and calibration_route in {
+        "contract_only_semantic_pass",
+        "deterministic_typed_pass",
+    }:
         criteria = reconciled.get("criteria")
         functionality = criteria.get("functionality") if isinstance(criteria, dict) else None
         if isinstance(functionality, dict):
@@ -903,7 +1023,10 @@ def _non_visual_gates_passed(
     phase_failed = bool(phase) and (
         phase.get("render_gate") != "pass"
         or phase.get("ui_functionality") != "pass"
-        or phase.get("source_inspection") != "pass"
+        # Source inspection is optional when browser and semantic guards are
+        # already authoritative. A full evaluator may legitimately mark it
+        # skipped; that must not suppress the required independent visual gate.
+        or phase.get("source_inspection") == "fail"
     )
     if (
         grades.get("evaluation_infrastructure_failure")
@@ -925,7 +1048,47 @@ def _non_visual_gates_passed(
     return True
 
 
-def _has_reproduced_action_failure(evidence: dict[str, Any] | None) -> bool:
+def _edit_visual_diagnostics_ready(
+    grades: dict[str, Any],
+    browser_evidence: dict[str, Any] | None,
+    accepted_tape_evidence: dict[str, Any] | None,
+    guard_result: dict[str, Any] | None,
+) -> bool:
+    """Allow one-repair Edit runs to collect all actionable findings at once."""
+    phase = grades.get("phase_results") or {}
+    if (
+        grades.get("evaluation_infrastructure_failure")
+        or phase.get("render_gate") != "pass"
+        or phase.get("source_inspection") == "fail"
+        or (guard_result is not None and guard_result.get("passed") is not True)
+    ):
+        return False
+    for evidence in (browser_evidence, accepted_tape_evidence):
+        if evidence is None:
+            continue
+        checks = evidence.get("checks") if isinstance(evidence, dict) else None
+        if not isinstance(checks, list) or any(
+            not isinstance(item, dict) or item.get("status") != "ok"
+            for item in checks
+        ):
+            return False
+    return True
+
+
+def _raise_navigation_infrastructure(evidence: dict[str, Any]) -> None:
+    failures = [item for item in evidence.get('checks', [])
+                if isinstance(item, dict) and item.get('status') == 'navigation_failed']
+    if failures:
+        detail = '; '.join(f"{item.get('check_id')}: {item.get('navigation_error')}" for item in failures)
+        raise EvaluationInfrastructureError('Browser navigation infrastructure failed: ' + detail)
+
+
+def _has_observed_valid_test_failure(evidence: dict[str, Any] | None) -> bool:
+    """Return true for one executed valid test that observed a product failure.
+
+    ``action_failed`` is already distinct from an invalid test contract or an
+    infrastructure error. No second execution is required to enter Repair.
+    """
     return bool(
         isinstance(evidence, dict)
         and any(
@@ -933,6 +1096,75 @@ def _has_reproduced_action_failure(evidence: dict[str, Any] | None) -> bool:
             for item in evidence.get("checks") or []
         )
     )
+
+
+def _append_hidden_risk_repairs(
+    *,
+    grades: dict[str, Any],
+    hidden_checks: list[dict[str, Any]],
+    hidden_evidence: dict[str, Any],
+    failed_check_ids: list[str],
+) -> None:
+    """Turn an observed hidden risk failure into WebCompass Repair metadata."""
+    checks_by_id = {
+        str(item.get("id") or ""): item
+        for item in hidden_checks
+        if isinstance(item, dict)
+    }
+    evidence_by_id = {
+        str(item.get("check_id") or ""): item
+        for item in hidden_evidence.get("checks") or []
+        if isinstance(item, dict)
+    }
+    descriptions = grades.setdefault("repair_task_descriptions", [])
+    instructions = grades.setdefault("repair_instructions", [])
+    existing_description_keys = {
+        (str(item.get("task_type") or ""), tuple(item.get("evidence_ids") or []))
+        for item in descriptions
+        if isinstance(item, dict)
+    }
+    for check_id in failed_check_ids:
+        check = checks_by_id.get(check_id, {})
+        if check.get("origin") != "source_edit_risk_analysis":
+            continue
+        repair_type = str(check.get("repair_type") or "").strip()
+        if not repair_type:
+            continue
+        record = evidence_by_id.get(check_id, {})
+        issue_payloads = []
+        for step in record.get("steps") or []:
+            if (not isinstance(step, dict) or step.get("ok") is not False
+                    or step.get("action") != "assert_webcompass_risk"):
+                continue
+            output = step.get("output") if isinstance(step.get("output"), dict) else {}
+            actual = output.get("actual") if isinstance(output.get("actual"), dict) else {}
+            if actual.get("defect_type") != repair_type or actual.get("passed") is not False:
+                continue
+            issue_payloads.extend(
+                item for item in actual.get("issues") or [] if isinstance(item, dict)
+            )
+        if not issue_payloads:
+            continue
+        rendered_issues = "; ".join(
+            f"{item.get('kind', 'defect')} at {item.get('element', 'target surface')}"
+            for item in issue_payloads
+        )
+        symptom = rendered_issues or "the changed target surface failed its browser risk audit"
+        description = f"{repair_type} reproduced after the normal Edit: {symptom}."
+        key = (repair_type, (check_id,))
+        if key not in existing_description_keys:
+            descriptions.append({
+                "task_type": repair_type,
+                "description": description,
+                "evidence_ids": [check_id],
+            })
+            existing_description_keys.add(key)
+        repair_instruction = (
+            f"Repair the observed {repair_type} on the changed UI: {symptom}. "
+            "Preserve the requested Edit and accepted surrounding behavior."
+        )
+        if repair_instruction not in instructions:
+            instructions.append(repair_instruction)
 
 
 def _merge_visual_evidence_manifest(
@@ -950,7 +1182,7 @@ def _merge_visual_evidence_manifest(
         if ref not in screenshots:
             screenshots.append(ref)
     prior_notes = str(existing.get("notes", "")).strip()
-    note = "Harness independently captured top and scrolled visual evidence."
+    note = "Harness independently captured initial views and successful interaction states."
     return {
         "round": round_num,
         "app_url": app_url,
@@ -981,7 +1213,17 @@ async def _capture_independent_visual_evidence(
 
     checks = ctx.sprint_state.ui_checks_for_sprint(ctx.sprint_state.current_target)
     routes = _visual_routes_for_checks(checks)
-    refs: list[str] = []
+    evidence_path = ctx.file_comm.dir / f"browser_evidence_round_{round_num}.json"
+    evidence = json.loads(evidence_path.read_text()) if evidence_path.is_file() else {}
+    refs = [f".harness/{Path(item['screenshot']).name}" for item in evidence.get("checks", [])
+            if item.get("status") == "ok" and item.get("screenshot")
+            and (ctx.file_comm.dir / Path(item["screenshot"]).name).is_file()]
+    if refs:
+        ctx.file_comm.write_visual_manifest(round_num, {
+            "round": round_num, "app_url": app_url, "screenshots": refs,
+            "notes": "Successful target interaction states; planned visible feature regions are captured in full where available.",
+        })
+        return
     async with async_playwright() as playwright:
         browser = await launch_chromium(playwright, headless=True)
         try:
@@ -995,7 +1237,7 @@ async def _capture_independent_visual_evidence(
                 )
                 top_path = ctx.workdir / top_ref
                 top_path.parent.mkdir(parents=True, exist_ok=True)
-                await page.goto(route_url, wait_until="networkidle", timeout=30_000)
+                await page.goto(route_url, wait_until="load", timeout=30_000)
                 await page.screenshot(path=str(top_path))
                 refs.append(top_ref)
                 can_scroll = await page.evaluate(
@@ -1037,7 +1279,16 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     grades: dict[str, Any] = {}
     passed = False
     browser_evidence: dict[str, Any] | None = None
+    hidden_oracle_evidence: dict[str, Any] | None = None
     accepted_tape_evidence: dict[str, Any] | None = None
+    hidden_checks: list[dict[str, Any]] = []
+    frozen_validation: dict[str, Any] | None = None
+    if read_edit_task_contract(ctx.workdir) is not None:
+        frozen_validation = verify_preimplementation_validation(
+            workdir=ctx.workdir,
+            file_comm=ctx.file_comm,
+            instruction_delta=ctx.user_prompt,
+        )
 
     async with _agent_phase_session(ctx, phase_name=f"evaluator round {round_num}"):
         try:
@@ -1071,11 +1322,15 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
             passed = False
         else:
             try:
-                guard_result = await evaluate_guard(
-                    workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
-                    app_url=app_stack.frontend_url, round_num=round_num,
-                    sprint_num=sprint_num,
-                )
+                # A continuous Edit uses its one planner-authored browser flow
+                # as the only acceptance check. The legacy DOM scope guard can
+                # mistake explicitly requested additions for collateral edits.
+                if frozen_validation is None:
+                    guard_result = await evaluate_guard(
+                        workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
+                        app_url=app_stack.frontend_url, round_num=round_num,
+                        sprint_num=sprint_num,
+                    )
                 edit_card = read_edit_card(ctx.file_comm.dir)
                 try:
                     if edit_card is not None:
@@ -1108,6 +1363,7 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                         ),
                         timeout=75,
                     )
+                    _raise_navigation_infrastructure(accepted_tape_evidence)
                     invalid_tapes = [
                         str(item.get("check_id", "unknown"))
                         for item in accepted_tape_evidence.get("checks", [])
@@ -1123,14 +1379,23 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                 # Run planner-authored concrete actions independently.  Empty
                 # legacy plans remain valid; their evaluator falls back to the
                 # existing exploratory path.
+                visible_checks = (
+                    frozen_checks_for_sprint(frozen_validation, sprint_num)
+                    if frozen_validation is not None
+                    else ctx.sprint_state.ui_checks_for_sprint(sprint_num)
+                )
                 browser_evidence_path = ctx.file_comm.dir / f"browser_evidence_round_{round_num}.json"
                 try:
                     browser_evidence = await asyncio.wait_for(
                         collect_browser_evidence(
                             app_url=app_stack.frontend_url,
-                            checks=ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+                            checks=visible_checks,
                             output_path=browser_evidence_path,
                             headless=ctx.config.playwright_headless,
+                            capture_screenshots=True,
+                            visual_sanity_selectors=(guard_result or {}).get(
+                                "expected_new_fragments"
+                            ) or [],
                         ),
                         timeout=75,
                     )
@@ -1139,6 +1404,7 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                         "Browser action-contract execution exceeded its 75s hard timeout; "
                         "refusing to fabricate a repair from missing evidence."
                     ) from exc
+                _raise_navigation_infrastructure(browser_evidence)
                 invalid_contracts = [
                     str(item.get("check_id", "unknown"))
                     for item in (browser_evidence.get("checks") or [])
@@ -1150,18 +1416,55 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                         + ", ".join(invalid_contracts)
                         + "; refusing to fabricate a code repair from a broken test."
                     )
-                reproduced_failure = (
-                    _has_reproduced_action_failure(browser_evidence)
-                    or _has_reproduced_action_failure(accepted_tape_evidence)
+                hidden_checks = (
+                    frozen_hidden_oracle_checks(frozen_validation)
+                    if frozen_validation is not None
+                    else read_hidden_oracle_checks(ctx.file_comm.dir)
+                )
+                if hidden_checks:
+                    source_risks = await asyncio.wait_for(collect_source_risk_baseline(
+                        ctx.workdir, hidden_checks, headless=ctx.config.playwright_headless), timeout=75)
+                    hidden_oracle_evidence = await asyncio.wait_for(
+                        collect_browser_evidence(
+                            app_url=app_stack.frontend_url,
+                            checks=hidden_checks,
+                            output_path=ctx.file_comm.dir
+                            / f"hidden_oracle_evidence_round_{round_num}.json",
+                            headless=ctx.config.playwright_headless,
+                            capture_screenshots=True,
+                            fail_fast=False,
+                        ),
+                        timeout=75,
+                    )
+                    _raise_navigation_infrastructure(hidden_oracle_evidence)
+                    distinguish_preexisting_risks(hidden_oracle_evidence, source_risks)
+                    (ctx.file_comm.dir / f"hidden_oracle_evidence_round_{round_num}.json").write_text(
+                        json.dumps(hidden_oracle_evidence, ensure_ascii=False, indent=2) + "\n")
+                    invalid_hidden = [
+                        str(item.get("check_id", "unknown"))
+                        for item in hidden_oracle_evidence.get("checks") or []
+                        if isinstance(item, dict)
+                        and item.get("status")
+                        in {"invalid_test_contract", "no_action_contract"}
+                    ]
+                    if invalid_hidden:
+                        raise EvaluationInfrastructureError(
+                            "Harness-owned hidden oracle is invalid for checks "
+                            + ", ".join(invalid_hidden)
+                        )
+                observed_test_failure = (
+                    _has_observed_valid_test_failure(browser_evidence)
+                    or _has_observed_valid_test_failure(hidden_oracle_evidence)
+                    or _has_observed_valid_test_failure(accepted_tape_evidence)
                     or (guard_result is not None and guard_result.get("passed") is not True)
                 )
-                if reproduced_failure:
+                if observed_test_failure:
                     passed, grades, ev_stats = build_deterministic_failure_grades(
                         file_comm=ctx.file_comm,
                         round_num=round_num,
                         sprint_num=sprint_num,
                         sprint_context=sprint_ctx,
-                        ui_checks=ctx.sprint_state.ui_checks_for_sprint(sprint_num),
+                        ui_checks=visible_checks,
                         edit_guard=guard_result,
                     )
                 else:
@@ -1171,11 +1474,11 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                                 ctx.config, ctx.file_comm, ctx.workdir,
                                 round_num=round_num, app_url=app_stack.frontend_url, edit_guard=guard_result,
                             ),
-                            timeout=180,
+                            timeout=ctx.config.agent_phase_timeout_seconds,
                         )
                     except asyncio.TimeoutError as exc:
                         raise EvaluationInfrastructureError(
-                            "Evaluator exceeded its 180s hard timeout; refusing to fabricate a repair "
+                            f"Evaluator exceeded its {ctx.config.agent_phase_timeout_seconds}s hard timeout; refusing to fabricate a repair "
                             "from an incomplete evaluation."
                         ) from exc
                 conflicts = _action_contract_grade_conflicts(ctx.file_comm, round_num, grades)
@@ -1222,11 +1525,60 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                             + str(guard_result.get("violations") or guard_result.get("reason")
                                   or "the independent scope audit did not pass")
                         )
-                        grades.setdefault("repair_instructions", []).append(
-                            "Restore every out-of-scope DOM/ARIA surface, or narrow the edit to the declared roots."
+                        instructions = grades.setdefault("repair_instructions", [])
+                        violations = guard_result.get("violations") or []
+                        for violation in violations:
+                            if not isinstance(violation, dict):
+                                continue
+                            if violation.get("kind") == "expected_addition_missing":
+                                selector = str(violation.get("fragment") or "").split("::", 1)[-1]
+                                instruction = (
+                                    "Implement the missing requested target element "
+                                    f"{selector}; the browser checks passed but this exact "
+                                    "planned DOM postcondition was absent from the guard snapshot."
+                                )
+                                if instruction not in instructions:
+                                    instructions.append(instruction)
+                        generic = (
+                            "Restore every out-of-scope DOM/ARIA surface, or narrow the edit "
+                            "to the declared roots."
                         )
+                        if not violations and generic not in instructions:
+                            instructions.append(generic)
             finally:
                 await app_stack.close()
+
+    hidden_oracle_failure = _has_observed_valid_test_failure(hidden_oracle_evidence)
+    if hidden_oracle_evidence is not None:
+        failed_hidden_ids = [
+            str(item.get("check_id", "unknown"))
+            for item in hidden_oracle_evidence.get("checks") or []
+            if isinstance(item, dict) and item.get("status") not in {"ok", "blocked_by_setup"}
+        ]
+        grades["hidden_oracle"] = {
+            "status": "failed" if failed_hidden_ids else "passed",
+            "failed_check_ids": failed_hidden_ids,
+            "evidence_ref": f".harness/hidden_oracle_evidence_round_{round_num}.json",
+        }
+        if failed_hidden_ids:
+            passed = False
+            grades["sprint_passed"] = False
+            grades["regression_passed"] = False
+            grades["overall_passed"] = False
+            grades.setdefault("phase_results", {})["ui_functionality"] = "fail"
+            grades.setdefault("bugs_found", []).append(
+                "Harness-owned hidden browser oracle failed: "
+                + ", ".join(failed_hidden_ids)
+            )
+            grades.setdefault("repair_instructions", []).append(
+                "Repair the reproduced user-visible behavior without exposing or targeting hidden evaluator details."
+            )
+            _append_hidden_risk_repairs(
+                grades=grades,
+                hidden_checks=hidden_checks,
+                hidden_evidence=hidden_oracle_evidence,
+                failed_check_ids=failed_hidden_ids,
+            )
 
     # A semantic scope violation or a failed real browser click is a reproduced
     # defect, even when the evaluator left unrelated checks unverified.
@@ -1237,7 +1589,9 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
         "Observed browser_click evidence failed:" in str(item)
         for item in (grades.get("bugs_found") or [])
     )
-    if not passed and evaluation_is_inconclusive(grades) and not (concrete_guard_failure or trace_click_failure):
+    if not passed and evaluation_is_inconclusive(grades) and not (
+        concrete_guard_failure or trace_click_failure or hidden_oracle_failure
+    ):
         reason = (
             "Evaluator did not reproduce a concrete defect; all negative findings "
             "are explicitly unverified. Retry evaluation instead of repairing code."
@@ -1262,16 +1616,30 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
 
     vs_started = time.perf_counter()
     vs_stats = None
-    # A reproduced browser failure already establishes a repair source.  A
+    # An observed valid browser failure already establishes a repair source. A
     # costly visual review cannot turn that failure into an accepted edit and
     # should not delay the next repair round.
-    visual_ready = _non_visual_gates_passed(
-        grades, browser_evidence, accepted_tape_evidence, guard_result
-    )
     edit_card = read_edit_card(ctx.file_comm.dir)
     needs_visual = visual_evidence_required(
         edit_card, has_image_input=_task_has_image_input(ctx.workdir)
     )
+    is_edit_task = read_edit_task_contract(ctx.workdir) is not None
+    visual_ready = _non_visual_gates_passed(
+        grades, browser_evidence, accepted_tape_evidence, guard_result
+    )
+    if (
+        not visual_ready
+        and is_edit_task
+        and ctx.config.edit_collect_visual_failures_before_repair
+    ):
+        visual_ready = _edit_visual_diagnostics_ready(
+            grades, browser_evidence, accepted_tape_evidence, guard_result
+        )
+    grades["visual_evidence_decision"] = {
+        "owner": "harness", "task_mode": "edit" if is_edit_task else "generate",
+        "originality_required": not is_edit_task or ctx.config.edit_originality_required,
+        "reason": "Product Session novelty belongs to the product direction, not each atomic Edit.",
+    }
     if ctx.config.evaluator_mode == "full" and startup_error is None and visual_ready and needs_visual:
         async with _agent_phase_session(ctx, phase_name=f"visual review round {round_num}"):
             try:
@@ -1306,20 +1674,31 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     passed = _determine_passed(grades)
 
     if passed:
-        try:
-            minimality = await certify_round_minimality(
-                run_dir=ctx.workdir,
-                config=ctx.config,
-                round_num=round_num,
-                sprint_num=sprint_num,
-                checks=ctx.sprint_state.ui_checks_for_sprint(sprint_num),
-                visual_accepted=(grades.get("phase_results") or {}).get("appearance") == "pass",
-            )
-        except asyncio.TimeoutError:
+        if not ctx.config.minimality_guard_enabled:
+            minimality = {"status": "skipped_by_user_policy", "reason": "minimality_guard_disabled"}
+        elif not _counterfactual_minimality_is_sound(
+            grades,
+            is_edit=read_edit_task_contract(ctx.workdir) is not None,
+        ):
             minimality = {
-                "status": "inconclusive",
-                "reason": "minimality_oracle_hard_timeout",
+                "status": "not_applicable",
+                "reason": "typed_counterfactual_oracle_incomplete",
             }
+        else:
+            try:
+                minimality = await certify_round_minimality(
+                    run_dir=ctx.workdir,
+                    config=ctx.config,
+                    round_num=round_num,
+                    sprint_num=sprint_num,
+                    checks=[*visible_checks, *hidden_checks],
+                    visual_accepted=(grades.get("phase_results") or {}).get("appearance") == "pass",
+                )
+            except asyncio.TimeoutError:
+                minimality = {
+                    "status": "inconclusive",
+                    "reason": "minimality_oracle_hard_timeout",
+                }
         if minimality is not None:
             summaries: dict[str, Any] = {}
             for kind, certificate in (minimality.get("certificates") or {}).items():
@@ -1340,7 +1719,12 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
             # edit when the round merely reverted earlier collateral churn.
             gate = summaries.get("edit") or summaries.get("repair")
             gate_status = gate.get("status") if isinstance(gate, dict) else None
-            if gate_status in {"non_minimal", "candidate_failed"}:
+            repairable_complexity = (
+                gate_status == "inconclusive"
+                and isinstance(gate, dict)
+                and gate.get("reason") == "too_many_atomic_changes"
+            )
+            if gate_status in {"non_minimal", "candidate_failed"} or repairable_complexity:
                 passed = False
                 grades["regression_passed"] = False
                 grades["overall_passed"] = False
@@ -1353,8 +1737,13 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                     message += f". Removable change atoms: {redundant}"
                 grades.setdefault("regressions_found", []).append(message)
                 grades.setdefault("repair_instructions", []).append(
-                    "Remove the redundant atomic changes identified in the minimality "
-                    "certificate while preserving the passing browser and DOM/ARIA contracts."
+                    (
+                        "Consolidate the implementation below the configured atomic-change "
+                        "limit while preserving the passing browser and DOM/ARIA contracts."
+                        if repairable_complexity
+                        else "Remove the redundant atomic changes identified in the minimality "
+                        "certificate while preserving the passing browser and DOM/ARIA contracts."
+                    )
                 )
             elif gate_status not in {None, "certified", "not_applicable"}:
                 grades["evaluation_infrastructure_failure"] = {

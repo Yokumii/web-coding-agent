@@ -266,7 +266,7 @@ check shares its feature ID. For persistence, perform the state-producing
 action, use `reload`, then finish with a typed DOM/ARIA/storage assertion. Do
 not bundle several requested outcomes behind one vague assertion.
 
-Every authored check MUST contain 1 to 4 related typed assertions and MUST end
+Every authored check MUST contain 1 to 8 related typed assertions and MUST end
 with a typed assertion. Model-authored JavaScript (`evaluate`) is forbidden. Use the dedicated
 interaction action first, then finish with the narrowest observable assertion:
 `assert_visible`/`assert_hidden` for presence, `assert_text` with `match` set to

@@ -188,7 +188,7 @@ def browser_target_outcome(
             evidence={"reason": "target_contract_has_no_assertion"},
         )
     observed = evidence.get("checks") or []
-    if any(item.get("status") in {"invalid_test_contract", "no_action_contract"} for item in observed):
+    if any(item.get("status") in {"invalid_test_contract", "no_action_contract", "navigation_failed"} for item in observed):
         return OracleOutcome(
             status="infrastructure_error", target_passed=False,
             preservation_passed=False,
@@ -516,11 +516,17 @@ async def certify_round_minimality(
         if isinstance(record, dict) and int(record.get("sprint") or 0) == sprint_num
     ]
     records.sort(key=lambda item: int(item.get("round") or 0))
-    repair_baseline = run_dir / ".harness" / repair_baseline_name(round_num)
+    sprint_baseline_path = run_dir / ".harness" / sprint_baseline_name(sprint_num)
+    repair_baseline_path = run_dir / ".harness" / repair_baseline_name(round_num)
+    # An explicit Edit must always prove preservation against its accepted
+    # source checkpoint.  The repair snapshot is the failed candidate and is
+    # useful only when no accepted sprint baseline exists (for example, a
+    # first-sprint Generate repair).  Comparing an Edit to its failed repair
+    # snapshot makes collateral damage look like part of the contract.
     baseline = _read_json(
-        repair_baseline
-        if repair_baseline.is_file()
-        else run_dir / ".harness" / sprint_baseline_name(sprint_num),
+        sprint_baseline_path
+        if sprint_baseline_path.is_file()
+        else repair_baseline_path,
         None,
     )
     scope = _read_json(

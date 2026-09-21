@@ -15,7 +15,9 @@ TYPED_ASSERTION_ACTIONS = frozenset(
         "assert_focus",
         "assert_hash",
         "assert_hidden",
+        "assert_in_view",
         "assert_property",
+        "assert_scroll",
         "assert_no_console_errors",
         "assert_storage_value",
         "assert_text",
@@ -25,17 +27,27 @@ TYPED_ASSERTION_ACTIONS = frozenset(
     }
 )
 
+# Harness-owned assertions are intentionally excluded from
+# ``TYPED_ASSERTION_ACTIONS``.  The Edit Planner may author the public typed
+# assertions above, while these target-blind risk checks are materialized by
+# the Harness after planning and withheld from the implementation model.
+HARNESS_ASSERTION_ACTIONS = frozenset({"assert_webcompass_risk"})
+
 # ``evaluate`` remains executable only so historical tapes can be replayed and
 # audited.  New planner output is required to end in one of the bounded typed
 # assertions above; model-authored JavaScript is not a current contract format.
 LEGACY_ASSERTION_ACTIONS = frozenset({"evaluate"})
-ASSERTION_UI_ACTIONS = TYPED_ASSERTION_ACTIONS | LEGACY_ASSERTION_ACTIONS
+ASSERTION_UI_ACTIONS = (
+    TYPED_ASSERTION_ACTIONS | HARNESS_ASSERTION_ACTIONS | LEGACY_ASSERTION_ACTIONS
+)
 
 SUPPORTED_UI_ACTIONS = frozenset(
     {
         *TYPED_ASSERTION_ACTIONS,
+        *HARNESS_ASSERTION_ACTIONS,
         "assert_form_valid",
         "click",
+        "capture_attribute",
         "drag_and_drop",
         "emulate_media",
         "evaluate",
@@ -45,6 +57,7 @@ SUPPORTED_UI_ACTIONS = frozenset(
         "reload",
         "scroll",
         "select_option",
+        "set_hash",
         "set_storage_value",
         "set_input_files",
         "set_viewport",
@@ -54,21 +67,25 @@ SUPPORTED_UI_ACTIONS = frozenset(
 
 _ACTION_FIELDS = {
     "assert_aria": {"selector", "attribute", "value"},
-    "assert_attribute": {"selector", "name", "value"},
+    "assert_attribute": {"selector", "name", "value", "match", "snapshot"},
     "assert_count": {"selector", "count"},
     "assert_computed_style": {"selector", "property", "value", "match"},
     "assert_focus": {"selector"},
     "assert_hash": {"value", "match"},
     "assert_form_valid": {"selector"},
     "assert_hidden": {"selector"},
+    "assert_in_view": {"selector"},
     "assert_property": {"selector", "name", "value"},
+    "assert_scroll": {"y", "snapshot", "tolerance"},
     "assert_no_console_errors": set(),
     "assert_storage_value": {"storage", "key", "value", "match"},
     "assert_text": {"selector", "value", "match"},
     "assert_url": {"value", "match"},
-    "assert_value": {"selector", "value"},
+    "assert_value": {"selector", "value", "match", "snapshot", "capture_as"},
     "assert_visible": {"selector"},
-    "click": {"selector", "button"},
+    "assert_webcompass_risk": {"selector", "defect_type"},
+    "click": {"selector", "button", "capture_scroll_as"},
+    "capture_attribute": {"selector", "name", "snapshot"},
     "drag_and_drop": {"source_selector", "target_selector"},
     "emulate_media": {"media", "color_scheme"},
     "evaluate": {"expression"},
@@ -78,6 +95,7 @@ _ACTION_FIELDS = {
     "reload": set(),
     "scroll": {"y"},
     "select_option": {"selector", "value"},
+    "set_hash": {"value"},
     "set_storage_value": {"storage", "key", "value", "encoding"},
     "set_input_files": {"selector", "files"},
     "set_viewport": {"width", "height"},
@@ -145,10 +163,12 @@ def validate_ui_action(step: dict[str, Any]) -> None:
         "assert_focus",
         "assert_form_valid",
         "assert_hidden",
+        "assert_in_view",
         "assert_property",
         "assert_text",
         "assert_value",
         "assert_visible",
+        "assert_webcompass_risk",
         "click",
         "fill",
         "hover",
@@ -165,10 +185,42 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             )
         if not isinstance(step.get("value"), (str, bool)):
             raise ActionContractError("assert_aria requires string or boolean value")
+    elif action == "assert_webcompass_risk":
+        defect_type = _non_empty_string(step, "defect_type", action)
+        # Keep the browser action contract independent from the protocol
+        # serializer while matching WebCompass's closed repair taxonomy.
+        if defect_type not in {
+            "Occlusion",
+            "Crowding",
+            "Text Overlap",
+            "Alignment",
+            "Color Contrast",
+            "Overflow",
+            "Sizing Proportion",
+            "Loss of Interactivity",
+            "Semantic Error",
+            "Nesting Error",
+            "Missing Attributes",
+        }:
+            raise ActionContractError(
+                "assert_webcompass_risk defect_type must use the official WebCompass taxonomy"
+            )
     elif action == "assert_attribute":
         _non_empty_string(step, "name", action)
-        if not isinstance(step.get("value"), (str, bool, int, float)):
+        has_value = "value" in step
+        has_snapshot = "snapshot" in step
+        if has_value == has_snapshot:
+            raise ActionContractError(
+                "assert_attribute requires exactly one of value or snapshot"
+            )
+        if has_value and not isinstance(step.get("value"), (str, bool, int, float)):
             raise ActionContractError("assert_attribute requires scalar value")
+        if has_snapshot:
+            _non_empty_string(step, "snapshot", action)
+        if step.get("match", "exact") not in {"exact", "contains", "nonempty"}:
+            raise ActionContractError(
+                "assert_attribute match must be exact, contains, or nonempty"
+            )
     elif action == "assert_count":
         _bounded_int(step, "count", action, minimum=0, maximum=10_000)
     elif action == "assert_computed_style":
@@ -203,6 +255,19 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             )
         if not isinstance(step.get("value"), (str, bool, int, float)) and step.get("value") is not None:
             raise ActionContractError("assert_property requires scalar or null value")
+    elif action == "assert_scroll":
+        has_y = "y" in step
+        has_snapshot = "snapshot" in step
+        if has_y == has_snapshot:
+            raise ActionContractError(
+                "assert_scroll requires exactly one of y or snapshot"
+            )
+        if has_y:
+            _bounded_int(step, "y", action, minimum=0, maximum=1_000_000)
+        else:
+            _non_empty_string(step, "snapshot", action)
+        if "tolerance" in step:
+            _bounded_int(step, "tolerance", action, minimum=0, maximum=100)
     elif action == "assert_storage_value":
         if step.get("storage") not in {"local", "session"}:
             raise ActionContractError("assert_storage_value storage must be local or session")
@@ -221,31 +286,73 @@ def validate_ui_action(step: dict[str, Any]) -> None:
                     "assert_url fragments are unsupported for new contracts; use an owned pathname route"
                 )
         elif action == "assert_hash":
-            expected_hash = _non_empty_string(step, "value", action)
-            segments = expected_hash.removeprefix("#").split("/")
-            if (
-                not expected_hash.startswith("#/")
-                or "\\" in expected_hash
-                or "?" in expected_hash
-                or "://" in expected_hash
-                or any(segment in {".", ".."} for segment in segments)
-            ):
+            expected_hash = step.get("value")
+            if not isinstance(expected_hash, str):
+                raise ActionContractError("assert_hash requires string value")
+            if step.get("match") == "nonempty":
+                if expected_hash != "":
+                    raise ActionContractError(
+                        "a nonempty assert_hash uses an empty placeholder value"
+                    )
+            elif expected_hash:
+                if (
+                    len(expected_hash.encode("utf-8")) > 2_048
+                    or "\\" in expected_hash
+                    or "://" in expected_hash
+                    or any(ord(character) < 32 for character in expected_hash)
+                ):
+                    raise ActionContractError(
+                        "assert_hash value must be a bounded URL fragment or safe substring"
+                    )
+                if (
+                    step.get("match", "exact") == "exact"
+                    and not expected_hash.startswith("#")
+                ):
+                    raise ActionContractError(
+                        "an exact assert_hash value must start with '#'"
+                    )
+            elif step.get("match", "exact") != "exact":
                 raise ActionContractError(
-                    "assert_hash value must be one bounded hash-router path such as '#/report'"
+                    "an empty assert_hash value requires exact matching"
                 )
         elif not isinstance(step.get("value"), (str, int, float)):
             raise ActionContractError("assert_text requires scalar value")
-        if step.get("match", "exact") not in {"exact", "contains"}:
+        allowed_matches = (
+            {"exact", "contains", "nonempty"}
+            if action in {"assert_text", "assert_hash"}
+            else {"exact", "contains"}
+        )
+        if step.get("match", "exact") not in allowed_matches:
             raise ActionContractError(f"{action} match must be exact or contains")
     elif action == "assert_value":
-        if not isinstance(step.get("value"), (str, int, float)):
+        mode = step.get("match", "exact")
+        if mode not in {"exact", "contains", "nonempty"}:
+            raise ActionContractError("assert_value match must be exact, contains, or nonempty")
+        if "snapshot" in step:
+            _non_empty_string(step, "snapshot", action)
+            if "value" in step or mode != "exact":
+                raise ActionContractError("assert_value snapshot requires exact matching without value")
+        elif mode == "nonempty":
+            if step.get("value", "") != "":
+                raise ActionContractError("assert_value nonempty requires an empty placeholder value")
+        elif not isinstance(step.get("value"), (str, int, float)):
             raise ActionContractError("assert_value requires scalar value")
+        elif mode == "contains" and str(step["value"]) == "":
+            raise ActionContractError("assert_value contains requires a nonempty value")
+        if "capture_as" in step:
+            _non_empty_string(step, "capture_as", action)
     elif action == "set_viewport":
         _bounded_int(step, "width", action, minimum=240, maximum=4_096)
         _bounded_int(step, "height", action, minimum=200, maximum=4_096)
     elif action == "click":
         if step.get("button", "left") not in {"left", "right", "middle"}:
             raise ActionContractError("click button must be left, right, or middle")
+        if "capture_scroll_as" in step:
+            _non_empty_string(step, "capture_scroll_as", action)
+    elif action == "capture_attribute":
+        _non_empty_string(step, "selector", action)
+        _non_empty_string(step, "name", action)
+        _non_empty_string(step, "snapshot", action)
     elif action == "drag_and_drop":
         _non_empty_string(step, "source_selector", action)
         _non_empty_string(step, "target_selector", action)
@@ -269,6 +376,16 @@ def validate_ui_action(step: dict[str, Any]) -> None:
     elif action in {"fill", "select_option"}:
         if "value" not in step or not isinstance(step["value"], (str, int, float)):
             raise ActionContractError(f"{action} requires scalar value")
+    elif action == "set_hash":
+        value = _non_empty_string(step, "value", action)
+        if (
+            not value.startswith("#")
+            or len(value.encode("utf-8")) > 2_048
+            or "\\" in value
+            or "://" in value
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ActionContractError("set_hash requires a bounded same-page URL fragment")
     elif action == "set_storage_value":
         if step.get("storage") not in {"local", "session"}:
             raise ActionContractError("set_storage_value storage must be local or session")
@@ -371,6 +488,7 @@ def validate_ui_action_sequence(actions: list[dict[str, Any]]) -> None:
 __all__ = [
     "ASSERTION_UI_ACTIONS",
     "ActionContractError",
+    "HARNESS_ASSERTION_ACTIONS",
     "LEGACY_ASSERTION_ACTIONS",
     "SUPPORTED_UI_ACTIONS",
     "TYPED_ASSERTION_ACTIONS",

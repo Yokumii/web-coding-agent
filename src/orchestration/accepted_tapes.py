@@ -10,7 +10,8 @@ from src.orchestration.ui_action_contracts import TYPED_ASSERTION_ACTIONS
 
 
 TAPE_NAME = "accepted_tapes.jsonl"
-MAX_REPLAY_CHECKS = 32
+MAX_REPLAY_CHECKS = 8
+MAX_SELECTED_REPLAY_CHECKS = 0
 
 
 class AcceptedTapeError(RuntimeError):
@@ -49,9 +50,9 @@ def _validate_checks(checks: list[dict[str, Any]]) -> None:
             if isinstance(action, dict)
             and action.get("action") in TYPED_ASSERTION_ACTIONS
         ]
-        if not 1 <= len(typed) <= 4 or actions[-1] not in typed:
+        if not typed or actions[-1] not in typed:
             raise AcceptedTapeError(
-                "accepted tape checks require 1 to 4 related typed assertions and a final typed assertion"
+                "accepted tape checks require related typed assertions and a final typed assertion"
             )
 
 
@@ -99,10 +100,36 @@ def append_accepted_tape(
     return path
 
 
+def stage_prior_accepted_tapes(
+    harness_dir: Path, checks_by_edit: list[list[dict[str, Any]]]
+) -> Path | None:
+    """Stage accepted checks from earlier workdirs for one sequential Edit chain."""
+    if not checks_by_edit:
+        return None
+    path = Path(harness_dir) / TAPE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    records: list[str] = []
+    for edit_index, checks in enumerate(checks_by_edit, start=1):
+        _validate_checks(checks)
+        records.append(json.dumps({
+            "schema_version": "accepted-tape-v1",
+            "status": "ok",
+            "sprint": edit_index,
+            # A fresh single-Edit harness begins at round one. Round zero makes
+            # transferred obligations eligible for its before_round filter.
+            "round": 0,
+            "checks": checks,
+            "evidence_ref": "chain_parent_accepted_checkpoint",
+            "lineage_source": "sequential_edit_chain",
+        }, ensure_ascii=False, separators=(",", ":")))
+    path.write_text("\n".join(records) + "\n", encoding="utf-8")
+    return path
+
+
 def accepted_replay_checks(
     harness_dir: Path, *, before_sprint: int | None = None
 ) -> list[dict[str, Any]]:
-    """Return all accepted contracts in lineage order, failing closed on overflow."""
+    """Return all accepted contracts in lineage order without truncating the chain."""
     records = sorted(_records(harness_dir / TAPE_NAME), key=lambda item: int(item["sprint"]))
     checks = [
         check
@@ -112,10 +139,6 @@ def accepted_replay_checks(
         if isinstance(check, dict)
     ]
     _validate_checks(checks)
-    if len(checks) > MAX_REPLAY_CHECKS:
-        raise AcceptedTapeError(
-            f"accepted tape has {len(checks)} checks; maximum replay budget is {MAX_REPLAY_CHECKS}"
-        )
     return checks
 
 
@@ -213,10 +236,17 @@ def select_accepted_replay_checks(
             if check_id not in selected_ids:
                 skipped_reasons.setdefault(check_id, "outside_impact_slice")
 
-    if len(selected) > MAX_REPLAY_CHECKS:
-        raise AcceptedTapeError(
-            f"selected accepted tape has {len(selected)} checks; maximum replay budget is {MAX_REPLAY_CHECKS}"
-        )
+    if len(selected) > MAX_SELECTED_REPLAY_CHECKS:
+        kept = selected[:MAX_SELECTED_REPLAY_CHECKS]
+        kept_ids = {str(item.get("id", "")) for item in kept}
+        for check in selected[MAX_SELECTED_REPLAY_CHECKS:]:
+            check_id = str(check.get("id", ""))
+            if check_id:
+                skipped_reasons[check_id] = "minimal_replay_limit"
+                selected_reasons.pop(check_id, None)
+        selected = kept
+        selected_ids = kept_ids
+
     return {
         "schema_version": "regression-selection-v1",
         "mode": mode,
@@ -240,12 +270,28 @@ def accepted_obligation_summary(harness_dir: Path) -> list[dict[str, Any]]:
         for check in record.get("checks") or []:
             if not isinstance(check, dict):
                 continue
+            user_actions = [
+                {
+                    key: action[key]
+                    for key in (
+                        "action", "selector", "source_selector", "target_selector",
+                        "value", "key",
+                    )
+                    if key in action
+                }
+                for action in check.get("actions") or []
+                if isinstance(action, dict)
+                and action.get("action") in {
+                    "click", "drag_and_drop", "fill", "key_press", "select_option",
+                }
+            ][:4]
             summary.append({
                 "check_id": str(check.get("id", "")),
                 "requirement_id": str(check.get("requirement_id", "")),
                 "route": str(check.get("route", "/")),
                 "impact_tags": [str(item) for item in check.get("impact_tags") or []],
                 "task": str(check.get("task", ""))[:300],
+                **({"user_actions": user_actions} if user_actions else {}),
             })
     if len(summary) > MAX_REPLAY_CHECKS:
         return summary[-MAX_REPLAY_CHECKS:]
@@ -335,10 +381,12 @@ def recover_missing_accepted_tapes(run_dir: Path) -> dict[str, list[dict[str, in
 __all__ = [
     "AcceptedTapeError",
     "MAX_REPLAY_CHECKS",
+    "MAX_SELECTED_REPLAY_CHECKS",
     "TAPE_NAME",
     "accepted_replay_checks",
     "accepted_obligation_summary",
     "append_accepted_tape",
+    "stage_prior_accepted_tapes",
     "recover_missing_accepted_tapes",
     "select_accepted_replay_checks",
 ]

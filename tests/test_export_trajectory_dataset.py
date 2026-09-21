@@ -4,9 +4,14 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from scripts.export_trajectory_dataset import (
+    _accepted_tape_rounds,
     _accepted_tape_replay_passed,
+    _is_real_project_failure,
     _minimal_path_provenance,
+    _repair_task_descriptions,
     _resolved_round_commits,
     _strict_mutation_evidence_passed,
     append_jsonl_records,
@@ -14,6 +19,27 @@ from scripts.export_trajectory_dataset import (
     export_run,
     to_v2_records,
 )
+
+
+def test_hidden_source_edit_risk_failure_is_a_typed_natural_repair_candidate():
+    grade = {
+        "overall_passed": False,
+        "hidden_oracle": {
+            "status": "failed",
+            "failed_check_ids": ["RISK-01-OVERFLOW"],
+        },
+        "repair_task_descriptions": [{
+            "task_type": "Overflow",
+            "description": (
+                "Overflow reproduced after the normal Edit: "
+                "viewport-horizontal-overflow at html."
+            ),
+            "evidence_ids": ["RISK-01-OVERFLOW"],
+        }],
+    }
+
+    assert _is_real_project_failure(grade) is True
+    assert _repair_task_descriptions(grade) == grade["repair_task_descriptions"]
 
 
 def _git(frontend: Path, *args: str) -> None:
@@ -176,6 +202,34 @@ def test_round_commit_resolution_prefers_build_provenance_over_commit_position(
     )
 
     assert resolved == {1: sprint_one, 2: sprint_two}
+
+
+def test_transferred_tapes_require_replay_but_do_not_hide_local_acceptance(tmp_path: Path):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    _write_strict_acceptance(harness, [(2, 1)])
+    path = harness / "accepted_tapes.jsonl"
+    current = path.read_text()
+    parent = {
+        "schema_version": "accepted-tape-v1", "status": "ok",
+        "sprint": 1, "round": 0,
+        "lineage_source": "sequential_edit_chain",
+        "evidence_ref": "chain_parent_accepted_checkpoint",
+        "checks": [{"id": "q1__saved", "route": "/", "actions": [
+            {"action": "assert_visible", "selector": "#saved"}
+        ]}],
+    }
+    path.write_text(json.dumps(parent) + "\n" + current)
+    assert _accepted_tape_rounds(harness) == {2}
+    assert not _accepted_tape_replay_passed(harness, round_num=2, sprint_num=1)
+    evidence = harness / "accepted_tape_replay_round_2.json"
+    _write_json(evidence, {"checks": [{"check_id": "q1__saved", "status": "ok"}]})
+    assert _accepted_tape_replay_passed(harness, round_num=2, sprint_num=1)
+    _write_json(evidence, {"checks": [{"check_id": "q1__saved", "status": "action_failed"}]})
+    assert not _accepted_tape_replay_passed(harness, round_num=2, sprint_num=1)
+    parent["round"] = 1
+    path.write_text(json.dumps(parent) + "\n" + current)
+    assert _accepted_tape_rounds(harness) == set()
 
 
 def test_later_checkpoint_requires_prior_accepted_tape_replay(tmp_path: Path):
@@ -344,7 +398,8 @@ def test_evidence_only_checkpoint_reuses_last_matching_mutation_ledger(tmp_path:
     assert provenance["touched_paths"] == ["frontend/library.js"]
 
 
-def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path):
+@pytest.mark.parametrize("repair_metadata_source", ["evaluator", "repair_generator"])
+def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path, repair_metadata_source):
     run_dir = tmp_path / "natural_case"
     frontend = run_dir / "frontend"
     harness = run_dir / ".harness"
@@ -371,8 +426,16 @@ def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path)
     _write_json(harness / "grade_round_1.json", {
         "round": 1, "sprint": 1, "overall_passed": False,
         "mode_recommendation": "repair", "criteria": {"functionality": {"notes": "Search button is broken"}},
-        "ui_checks": [{"status": "fail", "notes": "Search button is broken"}],
+        "ui_checks": [{
+            "check_id": "UI-001", "status": "fail",
+            "notes": "Search button is broken",
+        }],
         "repair_instructions": ["Connect the search button to the filtering state."],
+        "repair_task_descriptions": [{
+            "task_type": "Loss of Interactivity",
+            "description": "The search button does not respond to a normal click.",
+            "evidence_ids": ["UI-001"],
+        }],
     })
     _write_json(harness / "grade_round_2.json", {
         "round": 2, "sprint": 1, "overall_passed": True, "mode_recommendation": "generate_next_sprint",
@@ -395,6 +458,15 @@ def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path)
     )
     _write_runtime_failure(harness, 1)
 
+    if repair_metadata_source == "repair_generator":
+        grade_path = harness / "grade_round_1.json"
+        failed = json.loads(grade_path.read_text())
+        labels = failed.pop("repair_task_descriptions")
+        _write_json(grade_path, failed)
+        _write_json(harness / "harness_state.json", {"supplied_atomic_plan": True})
+        _write_json(harness / "repair_metadata_round_2.json", {
+            "source": "same_repair_model_response", "round": 2, "repair_task_descriptions": labels})
+
     records = export_run(run_dir)
 
     assert [record["task"] for record in records] == [
@@ -414,10 +486,15 @@ def test_export_run_builds_generate_edit_and_real_repair_records(tmp_path: Path)
     assert edit["label_modified_files"][0]["task_type"] == "Search Autocomplete"
     assert edit["quality"]["task_descriptions"] == []
     repair = next(record for record in records if record["task"] == "text-repair")
-    assert "Search button is broken" in repair["description"]
+    if repair_metadata_source == "repair_generator":
+        assert "The search button does not respond to a normal click." in repair["description"]
+    else:
+        assert "Search button is broken" in repair["description"]
     assert repair["instruction"]["src_code"][0]["code"] == "<main>broken</main>"
     assert len(repair["images"]["src_screenshot"]) == 1
     assert repair["quality"]["same_sprint_recovery"] is True
+    assert repair["task_type"] == ["Loss of Interactivity"]
+    assert repair["quality"]["defect_injection"] is False
 
 
 def test_export_run_does_not_publish_partial_generate_mainline(tmp_path: Path):
@@ -479,6 +556,8 @@ def test_export_run_treats_accepted_seed_baseline_as_first_forward_edit(tmp_path
 
     assert [record["task"] for record in records] == ["text-editing"]
     assert records[0]["trajectory"]["source_commit"] == baseline
+    assert records[0]["quality"]["edit_kind"] == "atomic_edit"
+    assert records[0]["quality"]["task_count"] == 1
 
 
 def test_user_image_input_flows_into_image_edit_v2(tmp_path: Path):
@@ -514,12 +593,14 @@ def test_user_image_input_flows_into_image_edit_v2(tmp_path: Path):
     converted = to_v2_records(records)
 
     assert len(converted["image-edit.v2"]) == 1
+    assert converted["image-edit.v2"][0]["edit_kind"] == "atomic_edit"
     staged = converted["image-edit.v2"][0]["input_images"]
     assert len(staged) == 1
     assert Path(staged[0]).is_file()
 
 
-def test_new_policy_excludes_forward_edit_without_certified_minimality(tmp_path: Path):
+@pytest.mark.parametrize("plan_version", ["minimal-path-plan-v3", "minimal-path-plan-v6"])
+def test_new_policy_excludes_forward_edit_without_certified_minimality(tmp_path: Path, plan_version):
     run_dir = tmp_path / "forward_guarded"
     frontend = run_dir / "frontend"
     harness = run_dir / ".harness"
@@ -545,7 +626,19 @@ def test_new_policy_excludes_forward_edit_without_certified_minimality(tmp_path:
         write_certificates=False,
     )
 
+    plan_path = harness / "minimal_path_plan_round_1.json"
+    plan = json.loads(plan_path.read_text())
+    _write_json(plan_path, {**plan, "schema_version": plan_version})
     assert export_run(run_dir) == []
+    exempt = export_run(run_dir, require_minimality=False)
+    assert [record["task"] for record in exempt] == ["text-editing"]
+    assert exempt[0]["quality"]["counterfactual_minimality"]["status"] == "skipped_by_user_policy"
+    assert apply_patches(exempt[0]["instruction"]["src_code"], exempt[0]["label_modified_files"]) == exempt[0]["reference"]["dst_code"]
+    grade_path = harness / "grade_round_1.json"
+    grade = json.loads(grade_path.read_text())
+    _write_json(grade_path, {**grade, "overall_passed": False})
+    assert export_run(run_dir, require_minimality=False) == []
+    _write_json(grade_path, grade)
 
     _write_json(harness / "minimality_round_1_edit.json", {"status": "certified"})
     records = export_run(run_dir)
@@ -553,7 +646,7 @@ def test_new_policy_excludes_forward_edit_without_certified_minimality(tmp_path:
     assert records[0]["quality"]["counterfactual_minimality"][0]["status"] == "certified"
 
 
-def test_export_run_aggregates_consecutive_forward_sprints(tmp_path: Path):
+def test_export_run_aggregates_four_forward_sprints_as_compound_edit(tmp_path: Path):
     run_dir = tmp_path / "forward_aggregate"
     frontend = run_dir / "frontend"
     harness = run_dir / ".harness"
@@ -564,16 +657,22 @@ def test_export_run_aggregates_consecutive_forward_sprints(tmp_path: Path):
     baseline = subprocess.run(["git", "rev-parse", "HEAD"], cwd=frontend, text=True, check=True, capture_output=True).stdout.strip()
     _commit(frontend, "feat: add controls", "<main>controls</main>")
     _commit(frontend, "feat: add mobile layout", "<main>controls mobile</main>")
+    _commit(frontend, "feat: add search", "<main>controls mobile search</main>")
+    _commit(frontend, "feat: add cart", "<main>controls mobile search cart</main>")
     _write_json(run_dir / "seed_manifest.json", {"baseline_commit": baseline})
     _write_json(harness / "sprint_plan.json", {"sprints": [
         {"number": 1, "title": "Controls", "goal": "Controls", "deliverables": []},
         {"number": 2, "title": "Mobile", "goal": "Mobile", "deliverables": []},
+        {"number": 3, "title": "Search", "goal": "Search", "deliverables": []},
+        {"number": 4, "title": "Cart", "goal": "Cart", "deliverables": []},
     ]})
     _write_json(harness / "feature_list.json", {"features": [
         {"id": "F1", "name": "View controls", "description": "Add controls.", "sprint": 1},
         {"id": "F2", "name": "Responsive layout", "description": "Add mobile layout.", "sprint": 2},
+        {"id": "F3", "name": "Search", "description": "Add search.", "sprint": 3},
+        {"id": "F4", "name": "Shopping cart", "description": "Add a cart.", "sprint": 4},
     ]})
-    for round_num, sprint_num in ((1, 1), (2, 2)):
+    for round_num, sprint_num in ((1, 1), (2, 2), (3, 3), (4, 4)):
         _write_json(harness / f"grade_round_{round_num}.json", {
             "round": round_num, "sprint": sprint_num, "overall_passed": True,
             "target_exit_criteria_results": [{"critical": True, "passed": True, "notes": "Observed control behavior."}],
@@ -581,17 +680,21 @@ def test_export_run_aggregates_consecutive_forward_sprints(tmp_path: Path):
         })
     _write_strict_acceptance(
         harness,
-        [(1, 1), (2, 2)],
-        mutation_kinds={1: "edit", 2: "edit"},
+        [(1, 1), (2, 2), (3, 3), (4, 4)],
+        mutation_kinds={1: "edit", 2: "edit", 3: "edit", 4: "edit"},
     )
 
     records = export_run(run_dir)
 
     assert [record["task"] for record in records] == ["text-editing"]
     edit = records[0]
-    assert edit["task_type"] == ["View controls", "Responsive layout"]
-    assert edit["quality"]["accepted_sprints"] == [1, 2]
-    assert edit["reference"]["dst_code"][0]["code"] == "<main>controls mobile</main>"
+    assert edit["task_type"] == [
+        "View controls", "Responsive layout", "Search", "Shopping cart"
+    ]
+    assert edit["quality"]["edit_kind"] == "compound_edit"
+    assert edit["quality"]["task_count"] == 4
+    assert edit["quality"]["accepted_sprints"] == [1, 2, 3, 4]
+    assert edit["reference"]["dst_code"][0]["code"] == "<main>controls mobile search cart</main>"
     assert apply_patches(edit["instruction"]["src_code"], edit["label_modified_files"]) == edit["reference"]["dst_code"]
 
 
@@ -659,6 +762,59 @@ def test_make_patches_uses_local_context_instead_of_whole_file():
     assert patches[0]["search"] != before
     assert "old value" in patches[0]["search"]
     assert apply_patches(src, patches) == dst
+
+
+def test_make_patches_expands_context_instead_of_using_whole_file():
+    from scripts.export_trajectory_dataset import apply_patches, make_patches
+
+    before = (
+        "first section\n"
+        "shared label\n"
+        "old value\n"
+        "shared footer\n"
+        "second section\n"
+        "shared label\n"
+        "old value\n"
+        "shared footer\n"
+        "end\n"
+    )
+    after = before.replace("second section\nshared label\nold value", "second section\nshared label\nnew value")
+    src = [{"path": "app.js", "code": before}]
+    dst = [{"path": "app.js", "code": after}]
+
+    patches = make_patches(src, dst, "Interaction")
+
+    assert len(patches) == 1
+    assert patches[0]["search"] != before
+    assert before.count(patches[0]["search"]) == 1
+    assert apply_patches(src, patches) == dst
+
+
+def test_make_patches_rejects_edit_that_only_has_a_whole_file_anchor():
+    from scripts.export_trajectory_dataset import make_patches
+
+    src = [{"path": "app.js", "code": "aaaa"}]
+    dst = [{"path": "app.js", "code": "bbbb"}]
+
+    with pytest.raises(ValueError, match="no unique bounded local Search/Replace"):
+        make_patches(src, dst, "Interaction")
+
+
+def test_apply_patches_rejects_non_unique_search():
+    from scripts.export_trajectory_dataset import apply_patches
+
+    src = [{"path": "app.js", "code": "same\nsame\n"}]
+    patches = [
+        {
+            "path": "app.js",
+            "search": "same\n",
+            "replace": "changed\n",
+            "task_type": "Interaction",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="patch search is not unique"):
+        apply_patches(src, patches)
 
 
 def test_make_patches_uses_explicit_create_file_operation():
@@ -814,13 +970,21 @@ def test_v2_repair_contract_hides_diagnosis_and_requires_paired_images():
 
     record = {
         "instance_id": "natural__repair", "task": "text-repair",
-        "task_type": ["Interaction"],
+        "task_type": ["Overflow", "Color Contrast", "Loss of Interactivity", "Missing Attributes"],
         "description": "Repair the exact button bug described by the evaluator.",
         "instruction": {"src_code": [{"path": "app.js", "code": "broken()"}]},
-        "label_modified_files": [{"path": "app.js", "search": "broken()", "replace": "fixed()", "task_type": "Interaction"}],
+        "label_modified_files": [{"path": "app.js", "search": "broken()", "replace": "fixed()", "task_type": "Loss of Interactivity"}],
         "images": {"src_screenshot": [], "dst_screenshot": []},
         "trajectory": {"source_commit": "abc", "destination_commit": "def"},
-        "quality": {"confirmed_failure_evidence": ["button is broken"]},
+        "quality": {
+            "confirmed_failure_evidence": ["button is broken"],
+            "repair_task_descriptions": [
+                {"task_type": task_type, "description": f"Observed defect {index}", "evidence_ids": ["UI-001"]}
+                for index, task_type in enumerate([
+                    "Overflow", "Color Contrast", "Loss of Interactivity", "Missing Attributes"
+                ])
+            ],
+        },
     }
 
     converted = to_v2_records([record])
@@ -829,6 +993,29 @@ def test_v2_repair_contract_hides_diagnosis_and_requires_paired_images():
     assert text["instruction"] == [{"path": "app.js", "code": "broken()"}]
     assert "description" not in text["instruction"]
     assert converted["image-repair.v2"] == []
+
+
+def test_v2_repair_rejects_unclassified_or_too_small_natural_failure():
+    from scripts.export_trajectory_dataset import to_v2_records
+
+    record = {
+        "instance_id": "natural__single_repair", "task": "text-repair",
+        "task_type": ["Loss of Interactivity"],
+        "instruction": {"src_code": [{"path": "app.js", "code": "broken()"}]},
+        "label_modified_files": [{
+            "path": "app.js", "search": "broken()", "replace": "fixed()",
+            "task_type": "Loss of Interactivity",
+        }],
+        "images": {"src_screenshot": [], "dst_screenshot": []},
+        "trajectory": {"source_commit": "abc", "destination_commit": "def"},
+        "quality": {"repair_task_descriptions": [{
+            "task_type": "Loss of Interactivity",
+            "description": "One naturally observed issue.",
+            "evidence_ids": ["UI-001"],
+        }]},
+    }
+
+    assert to_v2_records([record])["text-repair.v2"] == []
 
 
 def test_scope_guard_failure_is_not_a_project_repair_candidate():
@@ -855,15 +1042,22 @@ def test_scope_failure_does_not_hide_a_reproduced_ui_repair_candidate():
     }) is True
 
 
-def test_export_quality_uses_reverse_construction_one_to_seven_task_contract():
-    from scripts.export_trajectory_dataset import _quality_tier
+def test_export_quality_uses_atomic_and_compound_task_contract():
+    from scripts.export_trajectory_dataset import _edit_kind, _quality_tier
 
     patch = [{"path": "app.js", "search": "old", "replace": "new"}]
     assert _quality_tier("text-editing", patch, ["Navigation"])[0] == "benchmark_aligned"
-    assert _quality_tier("text-editing", patch, [str(index) for index in range(7)])[0] == "benchmark_aligned"
-    assert "edit_task_count_outside_1_to_7" in _quality_tier(
-        "text-editing", patch, [str(index) for index in range(8)]
-    )[1]
+    assert _edit_kind(["Navigation"]) == "atomic_edit"
+    for task_count in (4, 12):
+        task_types = [str(index) for index in range(task_count)]
+        assert _edit_kind(task_types) == "compound_edit"
+        assert _quality_tier("text-editing", patch, task_types)[0] == "benchmark_aligned"
+    for task_count in (2, 3, 13):
+        task_types = [str(index) for index in range(task_count)]
+        assert _edit_kind(task_types) is None
+        assert "edit_task_count_not_1_or_4_to_12" in _quality_tier(
+            "text-editing", patch, task_types
+        )[1]
 
 
 def test_unverified_failure_wording_is_not_a_project_repair_candidate():
@@ -909,4 +1103,192 @@ def test_v2_edit_uses_planner_feature_descriptions_not_sprint_summary():
     assert converted["text-edit.v2"][0]["instruction"]["description"] == [
         {"task_type": "Reading aids", "description": "Add a concise summary."}
     ]
+    assert converted["text-edit.v2"][0]["edit_kind"] == "atomic_edit"
+    assert converted["text-edit.v2"][0]["metadata"]["edit_kind"] == "atomic_edit"
     assert converted["text-edit.v2"][0]["metadata"]["input_contract"]["all_files_included"] is True
+
+
+def test_v2_edit_rejects_two_task_bundle():
+    from scripts.export_trajectory_dataset import to_v2_records
+
+    record = {
+        "instance_id": "invalid__two_tasks",
+        "source_project": "/source",
+        "task": "text-editing",
+        "task_type": ["Search", "Navigation"],
+        "description": "Two tasks are neither atomic nor compound.",
+        "instruction": {"src_code": [{"path": "index.html", "code": "before"}]},
+        "label_modified_files": [
+            {"path": "index.html", "search": "before", "replace": "after", "task_type": "Search"}
+        ],
+        "images": {"src_screenshot": [], "dst_screenshot": []},
+        "trajectory": {"source_commit": "abc", "destination_commit": "def"},
+        "quality": {
+            "task_descriptions": [
+                {"task_type": "Search", "description": "Add search."},
+                {"task_type": "Navigation", "description": "Add navigation."},
+            ]
+        },
+    }
+
+    assert to_v2_records([record])["text-edit.v2"] == []
+
+
+def test_session_exports_actual_classification_and_bound_final_query(tmp_path, monkeypatch):
+    import copy
+    import hashlib
+    from scripts import export_trajectory_dataset as module
+    files = [{"path": "index.html", "code": "<main>Accepted product</main>"}]
+    sha = hashlib.sha256(json.dumps(files, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    grade_path = tmp_path / 'grade.json'
+    _write_json(grade_path, {"overall_passed": True})
+    edits = [{"edit_id": f"q{i}", "instruction": f"Add feature {i}.", "source_version": f"s{i-1}",
+              "target_version": f"s{i}", "classification": {"primary": {"taxonomy": "extension", "type": "Planning"}},
+              "execution": {"status": "completed", "workdir": str(tmp_path / f'q{i}'), "evaluation": str(grade_path)}} for i in range(1,5)]
+    session = {"schema_version": "product_edit_session_v1", "session_id": "session1", "edits": edits,
+               "selection": {"edit_count": 4}, "current_state": {"state_id": "s4", "sha256": sha}}
+    path = tmp_path / 'session.json'
+    _write_json(path, session)
+    def export(run_dir, *, require_minimality):
+        assert require_minimality is False
+        return [module._base_record(run_dir=run_dir, instance_id=run_dir.name, task="text-editing", task_types=['old'],
+            description='old', src_code=files, dst_code=files, patches=[], src_images=[], dst_images=[],
+            source_commit='a', destination_commit='b')]
+    monkeypatch.setattr(module, 'export_run', export)
+    records, report = module.export_product_session(path)
+    assert report['counts']['text-editing'] == 4
+    assert report['generation_status'] == 'waiting_for_final_query'
+    assert records[0]['description'] == edits[0]['instruction']
+    assert records[0]['task_type'] == ['Planning']
+    assert len({row['instance_id'] for row in records}) == 4
+    (tmp_path/'dataset').mkdir()
+    query = {'schema_version':'product-final-query-v1','source_sha256':sha,'state_id':'s4',
+             'edit_ids':[e['edit_id'] for e in edits], 'instruction':'Create the complete product.', 'model':'gpt-5.5'}
+    _write_json(tmp_path/'dataset/final_query.json', query)
+    records, report = module.export_product_session(path)
+    assert report['counts']['text-generation'] == 1
+    assert records[-1]['instruction']['src_code'] == []
+    assert records[-1]['reference']['dst_code'] == files
+    assert append_jsonl_records(tmp_path/'records.jsonl',records) == 5
+    assert append_jsonl_records(tmp_path/'records.jsonl',records) == 0
+    _write_json(tmp_path/'dataset/final_query.json',{**query,'source_sha256':'changed'})
+    with pytest.raises(ValueError, match='final Generate query'):
+        module.export_product_session(path)
+    broken = copy.deepcopy(session)
+    broken['edits'][0]['execution']['status'] = 'pending'
+    _write_json(path,broken)
+    with pytest.raises(ValueError,match='continuous prefix'):
+        module.export_product_session(path)
+
+
+def test_session_exports_one_generate_per_bound_accepted_state(tmp_path, monkeypatch):
+    import hashlib
+    from scripts import export_trajectory_dataset as module
+    files = [[{'path':'index.html', 'code':f'<main>State {i}</main>'}] for i in range(3)]
+    grade = tmp_path/'grade.json'
+    _write_json(grade, {'overall_passed':True})
+    edits = [{'edit_id':f'q{i}', 'instruction':f'Add capability {i}.', 'source_version':f's{i-1}',
+              'target_version':f's{i}', 'classification':{'primary':{'taxonomy':'extension','type':'Planning'}},
+              'execution':{'status':'completed','workdir':str(tmp_path/f'q{i}'),'evaluation':str(grade)}}
+             for i in (1,2)]
+    session = {'schema_version':'product_edit_session_v1','session_id':'stateful',
+               'generation_policy':'each_accepted_state','edits':edits,'selection':{'edit_count':4}}
+    path = tmp_path/'session.json'
+    _write_json(path, session)
+    def export(run_dir, **_):
+        i = int(run_dir.name[1:])
+        return [module._base_record(run_dir=run_dir,instance_id=run_dir.name,task='text-editing',
+            task_types=['Planning'],description='edit',src_code=files[i-1],dst_code=files[i],patches=[],
+            src_images=[],dst_images=[],source_commit=f'c{i-1}',destination_commit=f'c{i}')]
+    monkeypatch.setattr(module, 'export_run', export)
+    def query(i):
+        return {'schema_version':'product-state-query-v1','instruction':f'Create state {i}.',
+                'source_sha256':hashlib.sha256(json.dumps(files[i],sort_keys=True,ensure_ascii=False).encode()).hexdigest(),
+                'state_id':f's{i}','edit_ids':[f'q{j}' for j in range(1,i+1)],'model':'gpt-5.5'}
+    folder = tmp_path/'dataset/generate_queries'
+    folder.mkdir(parents=True)
+    _write_json(folder/'q1.json', query(1))
+    rows, report = module.export_product_session(path)
+    assert report['counts'] == {'text-editing':2,'text-generation':1,'text-repair':0}
+    assert report['generation_status'] == 'waiting_for_state_queries'
+    _write_json(folder/'q2.json', query(2))
+    rows, report = module.export_product_session(path)
+    generated = [r for r in rows if r['task']=='text-generation']
+    assert [r['reference']['dst_code'] for r in generated] == files[1:]
+    assert all(r['instruction']['src_code']==[] for r in generated)
+    assert report['counts']['text-generation'] == 2
+    assert append_jsonl_records(tmp_path/'records.jsonl', rows) == 4
+    assert append_jsonl_records(tmp_path/'records.jsonl', rows) == 0
+    # Final-state compatibility artifact must not produce an extra Generate.
+    session['selection']['edit_count'] = 2
+    _write_json(path, session)
+    _write_json(tmp_path/'dataset/final_query.json', query(2))
+    assert module.export_product_session(path)[1]['counts']['text-generation'] == 2
+    for changed in ({'source_sha256':'wrong'}, {'state_id':'s1'}, {'edit_ids':['q1','q2','q3']}):
+        _write_json(folder/'q2.json', {**query(2), **changed})
+        with pytest.raises(ValueError, match='state Generate query'):
+            module.export_product_session(path)
+
+
+def test_historical_risk_export_rejects_unexecuted_audit_and_table_box_false_positive():
+    grade={'hidden_oracle':{'status':'failed','failed_check_ids':['risk']},
+           'repair_task_descriptions':[{'task_type':'Crowding','description':'Old risk failure','evidence_ids':['risk']}]}
+    assert _repair_task_descriptions(grade,hidden_evidence={'checks':[{'check_id':'risk','steps':[
+        {'action':'click','ok':False,'output':'not clickable'}]}]})==[]
+    actual={'defect_type':'Crowding','passed':False,'issues':[{'kind':'less-than-2px-gap','element':'cell',
+        'element_path':'#report > table:nth-of-type(1) > tbody:nth-of-type(1) > tr:nth-of-type(1)'}]}
+    evidence={'checks':[{'check_id':'risk','steps':[{'action':'assert_webcompass_risk','ok':False,'output':{'actual':actual}}]}]}
+    assert _repair_task_descriptions(grade,hidden_evidence=evidence)==[]
+    actual['issues']=[{'kind':'less-than-2px-gap','element':'button','element_path':'#report > button:nth-of-type(1)'}]
+    assert _repair_task_descriptions(grade,hidden_evidence=evidence)[0]['task_type']=='Crowding'
+
+
+def test_trace_commit_provenance_covers_rechecks_without_build(tmp_path):
+    from scripts.export_trajectory_dataset import _git as git_output
+    frontend=tmp_path/'frontend';harness=tmp_path/'.harness';frontend.mkdir();(harness/'traces').mkdir(parents=True)
+    _git(frontend,'init','-b','main');_git(frontend,'config','user.name','test');_git(frontend,'config','user.email','test@example.com')
+    _commit(frontend,'chore: seed','<main>seed</main>')
+    _commit(frontend,'feat: report','<main>report</main>'); first=git_output(frontend,'rev-parse','HEAD').strip()
+    _commit(frontend,'fix: action','<main>report action</main>'); second=git_output(frontend,'rev-parse','HEAD').strip()
+    _commit(frontend,'fix: sort','<main>sorted</main>'); third=git_output(frontend,'rev-parse','HEAD').strip()
+    for n,items in [(1,[(first,'feat: report'),(second,'fix: action')]),(3,[(third,'fix: sort')])]:
+        (harness/'traces'/f'generator_round_{n}.jsonl').write_text(''.join(json.dumps({
+            'event':'tool','name':'run_command','ok':True,'output':f'[main {commit[:7]}] {subject}\n'})+'\n' for commit,subject in items))
+    assert _resolved_round_commits(harness=harness,frontend=frontend,grade_rounds={1,2,3})=={1:second,2:second,3:third}
+
+
+def test_session_reconciliation_keeps_backup_and_other_sessions(tmp_path):
+    from scripts.export_trajectory_dataset import reconcile_session_records
+    path=tmp_path/'records.jsonl'
+    other={'instance_id':'other','trajectory':{'session_id':'other'}}
+    old={'instance_id':'stale','trajectory':{'session_id':'target'}}
+    before=''.join(json.dumps(record)+'\n' for record in [other,old]);path.write_text(before)
+    current={'instance_id':'current','quality':{'session_id':'target'}}
+    assert reconcile_session_records(path,[current],'target')==1
+    assert [json.loads(line) for line in path.read_text().splitlines()]==[other,current]
+    assert next(tmp_path.glob('records.before-*.jsonl')).read_text()==before
+    assert reconcile_session_records(path,[current],'target')==0
+    assert len(list(tmp_path.glob('records.before-*.jsonl')))==1
+
+
+def test_complete_check_with_more_than_four_assertions_is_exportable(tmp_path):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    _write_strict_acceptance(harness, [(1, 1)])
+    path = harness / "accepted_tapes.jsonl"
+    tape = json.loads(path.read_text())
+    tape["checks"][0]["actions"] += [
+        {"action": "assert_visible", "selector": f"#item-{i}"} for i in range(5)]
+    path.write_text(json.dumps(tape) + "\n")
+    assert _accepted_tape_rounds(harness) == {1}
+
+
+def test_product_session_export_uses_build_provenance_without_minimality_ledger(tmp_path):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    _write_json(harness / "harness_state.json", {"supplied_atomic_plan": True})
+    _write_json(harness / "round_build_map.json", {
+        "2": {"source_commit": "before", "destination_commit": "after"}})
+    assert _strict_mutation_evidence_passed(harness, 2, "edit", require_minimality=False)
+    assert not _strict_mutation_evidence_passed(harness, 1, "edit", require_minimality=False)
+    assert not _strict_mutation_evidence_passed(harness, 2, "edit", require_minimality=True)

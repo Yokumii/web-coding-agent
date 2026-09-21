@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import shutil
+import json
 import time
 from pathlib import Path
 from typing import Any
 
 from src.config import HarnessConfig
+from src.agents.edit_planner import refresh_atomic_edit_plan
 from src.agents.planner import recover_trace_proven_planner_checkpoint
 from src.orchestration.checkpoints import (
     CheckpointTransaction,
@@ -15,6 +17,13 @@ from src.orchestration.checkpoints import (
     restore_resume_state,
 )
 from src.orchestration.cost_tracker import CostTracker
+from src.orchestration.browser_evidence import BROWSER_EVIDENCE_POLICY_VERSION
+from src.orchestration.atomic_edit_plan import (
+    materialize_atomic_edit_compatibility_bundle,
+    read_atomic_edit_plan,
+    write_atomic_edit_plan,
+)
+from src.orchestration.accepted_tapes import stage_prior_accepted_tapes
 from src.orchestration.file_comm import FileComm
 from src.orchestration.edit_task_contract import (
     normalize_target_routes,
@@ -22,6 +31,8 @@ from src.orchestration.edit_task_contract import (
     read_edit_task_contract,
     resolve_task_mode,
 )
+from src.orchestration.edit_card import materialize_edit_card
+from src.orchestration.edit_risk_tests import materialize_edit_risk_tests, SOURCE_RISK_POLICY_VERSION
 from src.orchestration.phases import (
     HarnessContext,
     Verdict,
@@ -30,12 +41,16 @@ from src.orchestration.phases import (
     run_evaluate_phase,
     run_planner_phase,
 )
+from src.orchestration.hidden_oracle_checks import write_hidden_oracle_checks
+from src.orchestration.preimplementation_validation import (
+    freeze_preimplementation_validation,
+)
 from src.orchestration.sprint_state import SprintState
 from src.orchestration.target_profile import detect_target_profile
 from src.orchestration.task_inputs import (
-    load_task_input_manifest,
     stage_task_inputs,
     task_input_source_hashes,
+    task_inputs_match,
 )
 from src.utils.logger import get_logger
 
@@ -108,12 +123,20 @@ async def run_harness(
     task_mode: str = "auto",
     input_paths: list[Path] | None = None,
     target_routes: list[str] | None = None,
+    atomic_plan: dict[str, Any] | None = None,
+    hidden_oracle_checks: list[dict[str, Any]] | None = None,
+    prior_accepted_checks: list[list[dict[str, Any]]] | None = None,
+    chain_metadata: dict[str, Any] | None = None,
 ) -> None:
-    """执行完整的 Planner → Generator → Evaluator 主循环。"""
+    """执行 Planner → target-blind Validate → Generator → Evaluator 主循环。"""
     start = time.time()
     workdir.mkdir(parents=True, exist_ok=True)
     input_paths = list(input_paths or [])
     target_routes = normalize_target_routes(target_routes or [])
+    if resume and (atomic_plan is not None or hidden_oracle_checks or prior_accepted_checks or chain_metadata):
+        raise ResumeError(
+            "structured Edit plan/oracle inputs are staged only on a fresh run"
+        )
     # Validate external inputs before a fresh-run reset can discard prior
     # harness artifacts. Staging happens only after the task mode is accepted.
     if input_paths:
@@ -122,16 +145,43 @@ async def run_harness(
     cost_tracker = CostTracker(config.max_budget_usd)
 
     existing_state = file_comm.read_state()
+    resumed_plan_changed = False
+    supplied_atomic_plan = False
     if resume and not existing_state:
         recovered_planner = recover_trace_proven_planner_checkpoint(file_comm, config)
         if recovered_planner is not None:
             recovered_metrics = {"planner": recovered_planner.to_dict()}
+            edit_freeze = None
+            edit_contract = read_edit_task_contract(workdir)
+            if edit_contract is not None:
+                # Recovery must freeze the same normalized plan that ordinary
+                # planning and subsequent resumes consume.
+                refresh_atomic_edit_plan(
+                    file_comm=file_comm, user_prompt=user_prompt, config=config,
+                )
+                materialize_edit_card(
+                    harness_dir=file_comm.dir,
+                    instruction_delta=user_prompt,
+                    edit_contract=edit_contract,
+                    sprint_plan=file_comm.read_sprint_plan() or {},
+                    verification_plan=file_comm.read_ui_verification_plan() or {},
+                )
+                materialize_edit_risk_tests(
+                    workdir=workdir,
+                    instruction_delta=user_prompt,
+                    applicable_states=config.edit_webcompass_defect_checks,
+                )
+                edit_freeze = freeze_preimplementation_validation(
+                    workdir=workdir,
+                    file_comm=file_comm,
+                    instruction_delta=user_prompt,
+                )
             CheckpointTransaction(
                 file_comm=file_comm,
                 prompt=user_prompt,
                 costs={"planner": recovered_planner.cost_usd},
                 phase_metrics=recovered_metrics,
-            ).record_plan_completed()
+            ).record_plan_completed(edit_freeze=edit_freeze)
             existing_state = file_comm.read_state()
             logger.info(
                 "[bold blue]Planner[/] recovered a valid trace-proven planning bundle; "
@@ -153,29 +203,115 @@ async def run_harness(
                 f"resume task mode {task_mode!r} conflicts with persisted {resolved_task_mode!r} run"
             )
         if input_paths:
-            previous_inputs = load_task_input_manifest(workdir)
-            previous_hashes = [item.get("sha256") for item in previous_inputs.get("inputs", [])]
-            if previous_hashes != task_input_source_hashes(input_paths):
+            if not task_inputs_match(workdir, input_paths):
                 raise ResumeError("resume inputs differ from the persisted task input manifest")
         if target_routes:
             persisted_routes = list((contract or {}).get("requested_target_routes") or [])
             if target_routes != persisted_routes:
                 raise ResumeError("resume target routes differ from the persisted Edit contract")
+        if resolved_task_mode == "edit":
+            atomic_plan_path = file_comm.dir / "atomic_edit_plan.json"
+            plan_before = (
+                atomic_plan_path.read_bytes() if atomic_plan_path.is_file() else b""
+            )
+            if not existing_state.get("supplied_atomic_plan"):
+                refresh_atomic_edit_plan(
+                    file_comm=file_comm,
+                    user_prompt=user_prompt,
+                    config=config,
+                )
+            resumed_plan_changed = (
+                atomic_plan_path.is_file()
+                and atomic_plan_path.read_bytes() != plan_before
+            )
         phase_metrics = _copy_metrics(existing_state.get("phase_metrics"))
         skip_until_phase = existing_state.get("last_completed_phase")
         logger.info(f"[bold]Harness resuming[/] from '{skip_until_phase}'")
     else:
+        retained_tapes = None
         if resume:
             logger.warning("[bold]Resume requested but no checkpoint found.[/]")
+            persisted_contract = read_edit_task_contract(workdir)
+            if persisted_contract:
+                persisted_routes = list(persisted_contract.get("requested_target_routes") or [])
+                if target_routes and target_routes != persisted_routes:
+                    raise ResumeError("resume target routes differ from the persisted Edit contract")
+                target_routes = persisted_routes
+                chain_metadata = persisted_contract.get("chain_metadata")
+                tapes_path = file_comm.dir / "accepted_tapes.jsonl"
+                if tapes_path.exists():
+                    retained_tapes = tapes_path.read_bytes()
         file_comm.reset_run_artifacts()
+        if retained_tapes is not None:
+            (file_comm.dir / "accepted_tapes.jsonl").write_bytes(retained_tapes)
         resolved_task_mode = resolve_task_mode(workdir, task_mode)
         if resolved_task_mode == "edit":
-            prepare_edit_task_contract(
-                workdir, requested_target_routes=target_routes
+            edit_contract = prepare_edit_task_contract(
+                workdir, requested_target_routes=target_routes, chain_metadata=chain_metadata
             )
+            if atomic_plan is not None:
+                write_atomic_edit_plan(
+                    file_comm.dir, atomic_plan, instruction_delta=user_prompt, preserve_actions=True
+                )
+                validated_plan = read_atomic_edit_plan(file_comm.dir)
+                if validated_plan is None:
+                    raise ValueError("supplied atomic Edit plan was not persisted")
+                materialize_atomic_edit_compatibility_bundle(
+                    file_comm=file_comm,
+                    instruction_delta=user_prompt,
+                    plan=validated_plan,
+                )
+                file_comm.write_accepted_sprints(
+                    {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+                )
+                materialize_edit_card(
+                    allow_navigation_entry=True,
+                    harness_dir=file_comm.dir,
+                    instruction_delta=user_prompt,
+                    edit_contract=edit_contract,
+                    sprint_plan=file_comm.read_sprint_plan() or {},
+                    verification_plan=file_comm.read_ui_verification_plan() or {},
+                )
+                materialize_edit_risk_tests(
+                    workdir=workdir,
+                    instruction_delta=user_prompt,
+                    applicable_states=config.edit_webcompass_defect_checks,
+                )
+                edit_freeze = freeze_preimplementation_validation(
+                    workdir=workdir,
+                    file_comm=file_comm,
+                    instruction_delta=user_prompt,
+                )
+                CheckpointTransaction(
+                    file_comm=file_comm,
+                    prompt=user_prompt,
+                    costs={},
+                    phase_metrics={},
+                ).record_plan_completed(edit_freeze=edit_freeze)
+                supplied_state = file_comm.read_state() or {}
+                supplied_state["supplied_atomic_plan"] = True
+                file_comm.write_state(supplied_state)
+                supplied_atomic_plan = True
+            if hidden_oracle_checks:
+                oracle_routes = list(edit_contract.get("requested_target_routes") or [])
+                if not oracle_routes:
+                    oracle_routes = sorted({
+                        str(item.get("route") or "/")
+                        for item in hidden_oracle_checks
+                        if isinstance(item, dict)
+                    })
+                write_hidden_oracle_checks(
+                    file_comm.dir,
+                    hidden_oracle_checks,
+                    target_routes=oracle_routes,
+                )
+            if prior_accepted_checks:
+                stage_prior_accepted_tapes(file_comm.dir, prior_accepted_checks)
             keep_frontend = True
         elif target_routes:
             raise ValueError("--target-route is valid only for Edit tasks")
+        elif atomic_plan is not None or hidden_oracle_checks or prior_accepted_checks or chain_metadata:
+            raise ValueError("structured Edit plan/oracle inputs require task_mode=edit")
         else:
             _reset_generate_edit_frames(file_comm)
         stage_task_inputs(workdir, input_paths)
@@ -183,8 +319,8 @@ async def run_harness(
         if not keep_frontend:
             _reset_frontend_dir(workdir)
         phase_metrics = {}
-        skip_until_phase = None
-        existing_state = None
+        skip_until_phase = "plan" if supplied_atomic_plan else None
+        existing_state = file_comm.read_state() if supplied_atomic_plan else None
         logger.info(f"[bold]Harness started[/] — prompt: {user_prompt[:80]}...")
 
     logger.info(f"Workdir: {workdir}")
@@ -205,10 +341,6 @@ async def run_harness(
 
     if not _is_planner_checkpoint(skip_until_phase):
         await run_planner_phase(ctx)
-        if plan_only:
-            logger.info("[bold]--plan-only mode:[/] stopping after planner")
-            _print_summary(cost_tracker, time.time() - start, 0, True)
-            return
         if cost_tracker.is_over_budget():
             logger.warning("[bold red]Budget exceeded after planning. Stopping.[/]")
             return
@@ -218,7 +350,13 @@ async def run_harness(
             )
             return
     else:
-        logger.info("[bold cyan]PHASE 1: PLAN[/] — [dim]skipped (checkpoint)[/]")
+        reason = "supplied atomic plan" if supplied_atomic_plan else "checkpoint"
+        logger.info(f"[bold cyan]PHASE 1: PLAN[/] — [dim]skipped ({reason})[/]")
+
+    if plan_only:
+        logger.info("[bold]--plan-only mode:[/] stopping after plan materialization")
+        _print_summary(cost_tracker, time.time() - start, 0, True)
+        return
 
     requested_design_mode = (
         str(existing_state.get("requested_design_mode") or config.design_mode)
@@ -241,6 +379,45 @@ async def run_harness(
     )
 
     start_round = _resolve_start_round(skip_until_phase, existing_state)
+    risk_policy_changed = False
+    missing_interaction_captures = False
+    browser_policy_changed = False
+    if (resolved_task_mode == "edit" and existing_state
+            and existing_state.get("last_verdict") == "failed_review"
+            and str(skip_until_phase).startswith("evaluate_r")):
+        previous_evidence = file_comm.dir / f"hidden_oracle_evidence_round_{existing_state['round_num']}.json"
+        if previous_evidence.is_file():
+            old_policy = json.loads(previous_evidence.read_text()).get("source_risk_baseline", {}).get("policy_version")
+            risk_policy_changed = old_policy != SOURCE_RISK_POLICY_VERSION
+        previous_grade = file_comm.read_grades(existing_state["round_num"]) or {}
+        previous_actions = file_comm.dir / f"browser_evidence_round_{existing_state['round_num']}.json"
+        if previous_actions.is_file() and existing_state.get("supplied_atomic_plan"):
+            browser_policy_changed = json.loads(previous_actions.read_text()).get("policy_version") != BROWSER_EVIDENCE_POLICY_VERSION
+        if previous_actions.is_file() and (previous_grade.get("phase_results") or {}).get("appearance") == "fail":
+            action_evidence = json.loads(previous_actions.read_text())
+            missing_interaction_captures = bool(action_evidence.get("checks")) and not any(
+                item.get("screenshot") for item in action_evidence.get("checks", []))
+    if (
+        (resumed_plan_changed or risk_policy_changed or missing_interaction_captures)
+        and existing_state
+        and existing_state.get("last_verdict") == "failed_review"
+    ):
+        skip_until_phase = f"build_r{start_round}"
+        logger.info(
+            "[bold cyan]Edit checks or visual evidence need refreshing on resume; "
+            "re-evaluating the existing candidate before another paid Repair.[/]"
+        )
+    if browser_policy_changed:
+        start_round = int(existing_state["round_num"])
+        history = file_comm.dir / "evidence_history" / f"round_{start_round}_before_{BROWSER_EVIDENCE_POLICY_VERSION}"
+        history.mkdir(parents=True, exist_ok=True)
+        for name in (f"browser_evidence_round_{start_round}.json", f"grade_round_{start_round}.json",
+                     f"repair_packet_round_{start_round}.json", "harness_state.json"):
+            source = file_comm.dir / name
+            if source.is_file() and not (history / name).exists():
+                shutil.copy2(source, history / name)
+        skip_until_phase = f"build_r{start_round}"
+        logger.info("Browser assertion policy changed; rechecking the existing round without another build or Repair.")
     if ctx.sprint_state.current_target > ctx.sprint_state.total_sprints > 0:
         logger.info("[bold green]All sprints already accepted.[/]")
         _print_summary(cost_tracker, time.time() - start, max(start_round - 1, 0), True)

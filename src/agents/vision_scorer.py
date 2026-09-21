@@ -4,8 +4,10 @@ import asyncio
 import base64
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from src.agents.sdk_runner import AgentRunStats
 from src.config import HarnessConfig
@@ -240,17 +242,41 @@ def _perform_visual_review_request(
         review_context=review_context,
         reference_image_paths=task_input_image_paths(workdir),
     )
+    if not config.edit_originality_required:
+        messages[0]["content"] += (
+            "\nThis Product Session uses ordinary atomic feature Edits. Novelty belongs to the "
+            "overall product direction. Report originality descriptively, but do not demand "
+            "novel styling or recommend redesign merely to make this Edit distinctive. "
+            "Judge its clarity, visual quality, usability and consistency with the existing product."
+        )
 
     started = time.perf_counter()
-    result: CompletionResult = completion(
-        messages=messages,
-        model=_provider_model_string(config),
-        api_key=config.evaluator_vision_api_key,
-        api_base=config.evaluator_vision_base_url or None,
-        max_tokens=config.evaluator_vision_max_tokens,
-        num_retries=getattr(config, "evaluator_vision_max_retries", 3),
-        timeout=getattr(config, "evaluator_vision_timeout_seconds", 300),
-    )
+    if urlsplit(config.evaluator_vision_base_url or "").hostname == "api.tokenwave.us":
+        # Reuse the native streaming transport and its explicit TokenWave proxy.
+        # Reasoning models must not receive the legacy temperature=0 default.
+        from src.agents.openai_runner import OpenAIHTTPClient
+        native_config = replace(config,
+            openai_api_key=config.evaluator_vision_api_key,
+            openai_base_url=config.evaluator_vision_base_url,
+        )
+        response = asyncio.run(OpenAIHTTPClient(
+            native_config, config.evaluator_vision_timeout_seconds,
+        ).complete(model=config.evaluator_vision_model, messages=messages,
+                   max_tokens=config.evaluator_vision_max_tokens))
+        result = CompletionResult(
+            text=response["choices"][0]["message"].get("content") or "",
+            usage=response.get("usage") or {}, raw=response,
+        )
+    else:
+        result = completion(
+            messages=messages,
+            model=_provider_model_string(config),
+            api_key=config.evaluator_vision_api_key,
+            api_base=config.evaluator_vision_base_url or None,
+            max_tokens=config.evaluator_vision_max_tokens,
+            num_retries=getattr(config, "evaluator_vision_max_retries", 3),
+            timeout=getattr(config, "evaluator_vision_timeout_seconds", 300),
+        )
     duration_ms = int((time.perf_counter() - started) * 1000)
 
     review = extract_json_object(result.text)

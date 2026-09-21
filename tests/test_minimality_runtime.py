@@ -94,6 +94,65 @@ def test_later_generate_sprint_gets_an_edit_certificate(monkeypatch, tmp_path: P
     assert calls[0]["destination_commit"] == "accepted-sprint-two"
 
 
+def test_repaired_edit_minimality_uses_accepted_source_dom_baseline(
+    monkeypatch, tmp_path: Path
+):
+    harness = tmp_path / ".harness"
+    harness.mkdir()
+    accepted_baseline = {"version": 3, "routes": ["/"], "roots": ["accepted"]}
+    failed_candidate = {"version": 3, "routes": ["/"], "roots": ["corrupt"]}
+    (harness / "minimality_policy.json").write_text(json.dumps({
+        "enabled": True, "max_atomic_changes": 12,
+    }))
+    (harness / "round_build_map.json").write_text(json.dumps({
+        "1": {
+            "round": 1, "sprint": 1, "mode": "generate",
+            "source_commit": "accepted-source",
+            "destination_commit": "failed-edit",
+        },
+        "2": {
+            "round": 2, "sprint": 1, "mode": "repair",
+            "source_commit": "failed-edit",
+            "destination_commit": "accepted-destination",
+        },
+    }))
+    (harness / "edit_dom_source_sprint_1.json").write_text(
+        json.dumps(accepted_baseline)
+    )
+    (harness / "repair_dom_source_round_2.json").write_text(
+        json.dumps(failed_candidate)
+    )
+    (harness / "grade_round_1.json").write_text(json.dumps({
+        "sprint": 1,
+        "overall_passed": False,
+        "phase_results": {"source_inspection": "fail"},
+        "edit_guard": {"passed": False},
+    }))
+
+    calls: list[dict] = []
+
+    async def fake_certify_commit_pair(**kwargs):
+        calls.append(kwargs)
+        return {"status": "certified"}
+
+    monkeypatch.setattr(
+        "src.orchestration.minimality_runtime.certify_commit_pair",
+        fake_certify_commit_pair,
+    )
+
+    result = asyncio.run(certify_round_minimality(
+        run_dir=tmp_path,
+        config=HarnessConfig(),
+        round_num=2,
+        sprint_num=1,
+        checks=[],
+    ))
+
+    assert result["status"] == "ok"
+    assert [call["kind"] for call in calls] == ["edit", "repair"]
+    assert all(call["baseline"] == accepted_baseline for call in calls)
+
+
 def test_browser_target_outcome_requires_executable_assertions():
     checks = [{"id": "c1", "actions": [{"action": "evaluate", "expression": "true"}]}]
     evidence = {"checks": [{"check_id": "c1", "status": "ok", "steps": [

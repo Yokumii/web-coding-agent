@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from src.orchestration.edit_task_contract import chain_obligations
 
 
 EDIT_CARD_NAME = "edit_card.json"
@@ -66,6 +67,7 @@ def materialize_edit_card(
     edit_contract: dict[str, Any],
     sprint_plan: dict[str, Any],
     verification_plan: dict[str, Any],
+    allow_navigation_entry: bool = False,
 ) -> dict[str, Any]:
     """Bind planner semantics to exact routes/checks without another model call."""
     if int(sprint_plan.get("total_sprints") or 0) != 1 or len(sprint_plan.get("sprints") or []) != 1:
@@ -82,7 +84,14 @@ def materialize_edit_card(
 
     requested_routes = _unique_strings(edit_contract.get("requested_target_routes") or [])
     check_routes = _unique_strings([check.get("route", "/") for check in checks])
-    if requested_routes and not set(check_routes) <= set(requested_routes):
+    allowed_entries = set(requested_routes)
+    if allow_navigation_entry:
+        frontend = harness_dir.parent / "frontend"
+        allowed_entries.update("/" + path.relative_to(frontend).as_posix()
+                               for path in frontend.rglob("*")
+                               if path.is_file() and path.suffix.lower() in {".html", ".htm"})
+        allowed_entries.add("/")
+    if requested_routes and not set(check_routes) <= allowed_entries:
         raise ValueError("Edit verification routes exceed the requested target routes.")
     target_routes = requested_routes or check_routes
     impact_tags = _unique_strings([
@@ -109,6 +118,7 @@ def materialize_edit_card(
         "owner": "harness",
         "status": "blocked" if conflicts else "ready",
         "instruction_delta": instruction_delta,
+        "chain_obligations": chain_obligations(edit_contract),
         "target_routes": target_routes,
         "target_feature_ids": _unique_strings(sprint.get("feature_ids") or []),
         "target_check_ids": _unique_strings([check.get("id") for check in checks]),

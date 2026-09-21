@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,7 +20,9 @@ if str(_REPO_ROOT) not in sys.path:
 from src.orchestration.task_inputs import task_input_image_paths
 from src.orchestration.accepted_tapes import select_accepted_replay_checks
 from src.orchestration.edit_card import read_edit_card
+from src.orchestration.minimal_path_guidance import SUPPORTED_PLAN_VERSIONS
 from src.orchestration.ui_action_contracts import TYPED_ASSERTION_ACTIONS
+from src.orchestration.webcompass_protocol import REPAIR_TYPES
 
 
 CODE_EXTENSIONS = {
@@ -27,6 +31,9 @@ CODE_EXTENSIONS = {
     ".wxml", ".wxss",
 }
 IGNORED_CODE_FILES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+ATOMIC_EDIT_TASK_COUNT = 1
+COMPOUND_EDIT_MIN_TASKS = 4
+COMPOUND_EDIT_MAX_TASKS = 12
 INFRA_FAILURE_MARKERS = (
     "vision scorer unavailable",
     "request timed out",
@@ -119,6 +126,10 @@ def make_patches(
                 }
             )
             continue
+        try:
+            localized = _localized_changes(before, after)
+        except ValueError as exc:
+            raise ValueError(f"cannot export local exact patch for {path}: {exc}") from exc
         patches.extend(
             {
                 "path": path,
@@ -126,7 +137,7 @@ def make_patches(
                 "replace": replace,
                 "task_type": task_type,
             }
-            for search, replace in _localized_changes(before, after)
+            for search, replace in localized
         )
     return patches
 
@@ -134,20 +145,64 @@ def make_patches(
 def _localized_changes(
     before: str, after: str, context_lines: int = 1
 ) -> list[tuple[str, str]]:
-    """Return independent exact hunks instead of one broad file replacement."""
+    """Return replayable, unique local hunks or fail closed.
+
+    A whole-file Search/Replace makes an otherwise small Edit look like a full
+    rewrite and destroys the unchanged-region signal.  Grow local context only
+    far enough to make every search unique.  A bounded character fallback
+    supports minified or single-line sources without permitting a full-file
+    replacement.
+    """
     old = before.splitlines(keepends=True)
     new = after.splitlines(keepends=True)
-    matcher = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
-    changes: list[tuple[str, str]] = []
-    for group in matcher.get_grouped_opcodes(n=context_lines):
-        old_start, old_end = group[0][1], group[-1][2]
-        new_start, new_end = group[0][3], group[-1][4]
-        search = "".join(old[old_start:old_end])
-        replace = "".join(new[new_start:new_end])
-        if not search or before.count(search) != 1:
-            return [(before, after)]
-        changes.append((search, replace))
-    return changes or [(before, after)]
+    def candidate(
+        old_units: Any,
+        new_units: Any,
+        context: int,
+    ) -> list[tuple[str, str]] | None:
+        # get_grouped_opcodes() trims the cached boundary opcodes in place, so
+        # each context attempt needs a fresh matcher.
+        sequence_matcher = difflib.SequenceMatcher(
+            a=old_units, b=new_units, autojunk=False
+        )
+        changes: list[tuple[str, str]] = []
+        current = before
+        for group in sequence_matcher.get_grouped_opcodes(n=context):
+            old_start, old_end = group[0][1], group[-1][2]
+            new_start, new_end = group[0][3], group[-1][4]
+            search = "".join(old_units[old_start:old_end])
+            replace = "".join(new_units[new_start:new_end])
+            if (
+                not search
+                or search == before
+                or before.count(search) != 1
+                or current.count(search) != 1
+            ):
+                return None
+            current = current.replace(search, replace, 1)
+            changes.append((search, replace))
+        if changes and current == after:
+            return changes
+        return None
+
+    max_line_context = min(max(len(old), len(new)), 64)
+    for context in range(max(1, context_lines), max_line_context + 1):
+        changes = candidate(old, new, context)
+        if changes is not None:
+            return changes
+
+    # Line-granularity cannot localize edits inside a single long/minified line.
+    # Keep this deliberately bounded: beyond this point the record should be
+    # rejected and regenerated instead of disguising a broad rewrite as a patch.
+    max_char_context = min(max(len(before), len(after)), 256)
+    for context in range(1, max_char_context + 1):
+        changes = candidate(before, after, context)
+        if changes is not None:
+            return changes
+
+    raise ValueError(
+        "no unique bounded local Search/Replace exists; regenerate a narrower edit"
+    )
 
 
 def apply_patches(
@@ -170,8 +225,10 @@ def apply_patches(
             raise ValueError(f"replace patch has no exact search: {path}")
         if search == "" and path not in code:
             code[path] = patch["replace"]
-        elif search in current:
+        elif current.count(search) == 1:
             code[path] = current.replace(search, patch["replace"], 1)
+        elif search in current:
+            raise ValueError(f"patch search is not unique: {path}")
         else:
             raise ValueError(f"patch search not found: {path}")
     return [{"path": path, "code": code[path]} for path in sorted(code)]
@@ -202,6 +259,15 @@ def _patch_stats(patches: list[dict[str, str]]) -> dict[str, Any]:
     }
 
 
+def _edit_kind(task_types: list[str]) -> str | None:
+    task_count = len(task_types)
+    if task_count == ATOMIC_EDIT_TASK_COUNT:
+        return "atomic_edit"
+    if COMPOUND_EDIT_MIN_TASKS <= task_count <= COMPOUND_EDIT_MAX_TASKS:
+        return "compound_edit"
+    return None
+
+
 def _quality_tier(task: str, patches: list[dict[str, str]], task_types: list[str]) -> tuple[str, list[str]]:
     stats = _patch_stats(patches)
     reasons: list[str] = []
@@ -213,10 +279,8 @@ def _quality_tier(task: str, patches: list[dict[str, str]], task_types: list[str
     ):
         reasons.append("empty_search_not_reverse_compatible")
     if task == "text-editing":
-        # Match the formal reverse-construction quota: task counts cycle
-        # uniformly across 1..7, so a focused one-task edit is valid data.
-        if not 1 <= len(task_types) <= 7:
-            reasons.append("edit_task_count_outside_1_to_7")
+        if _edit_kind(task_types) is None:
+            reasons.append("edit_task_count_not_1_or_4_to_12")
         if stats["changed_file_count"] > 8:
             reasons.append("edit_changes_too_many_files")
         if stats["total_patch_lines"] > 2500:
@@ -330,7 +394,7 @@ def _is_real_project_failure(grade: dict[str, Any]) -> bool:
             isinstance(item, dict) and item.get("critical") is True
             and item.get("passed") is False
             for item in grade.get("target_exit_criteria_results") or []
-        )
+        ) or bool((grade.get("hidden_oracle") or {}).get("failed_check_ids"))
         if not reproduced_critical:
             return False
     text = json.dumps(grade, ensure_ascii=False).lower()
@@ -487,12 +551,22 @@ def _accepted_tape_records(harness: Path) -> list[dict[str, Any]]:
             if (
                 not isinstance(actions, list)
                 or not actions
-                or not 1 <= assertion_count <= 4
+                or assertion_count < 1
                 or not isinstance(actions[-1], dict)
                 or actions[-1].get("action") not in TYPED_ASSERTION_ACTIONS
             ):
                 return []
         evidence_ref = str(record.get("evidence_ref") or "")
+        if (
+            record.get("round") == 0
+            and record.get("lineage_source") == "sequential_edit_chain"
+            and evidence_ref == "chain_parent_accepted_checkpoint"
+        ):
+            # Transferred obligations are not local accepted checkpoints. Keep
+            # them for the final-state replay gate, which verifies their IDs
+            # and actual results in this workdir.
+            accepted.append(record)
+            continue
         if not evidence_ref.startswith(".harness/browser_evidence_round_"):
             return []
         evidence = _read_json(harness.parent / evidence_ref, {})
@@ -507,7 +581,7 @@ def _accepted_tape_records(harness: Path) -> list[dict[str, Any]]:
 
 
 def _accepted_tape_rounds(harness: Path) -> set[int]:
-    return {int(record["round"]) for record in _accepted_tape_records(harness)}
+    return {int(record["round"]) for record in _accepted_tape_records(harness) if record["round"] > 0}
 
 
 def _accepted_tape_replay_passed(
@@ -554,9 +628,13 @@ def _accepted_tape_replay_passed(
 
 
 def _strict_mutation_evidence_passed(
-    harness: Path, round_num: int, kind: str
+    harness: Path, round_num: int, kind: str, *, require_minimality: bool = True
 ) -> bool:
-    if not _minimality_export_passed(harness, round_num, kind):
+    if not require_minimality and _read_json(harness / "harness_state.json", {}).get("supplied_atomic_plan"):
+        build = _read_json(harness / "round_build_map.json", {}).get(str(round_num), {})
+        return bool(build.get("source_commit") and build.get("destination_commit")
+                    and build["source_commit"] != build["destination_commit"])
+    if require_minimality and not _minimality_export_passed(harness, round_num, kind):
         return False
 
     if not _minimal_path_artifacts_ready(harness, round_num):
@@ -569,7 +647,7 @@ def _minimal_path_artifacts_ready(harness: Path, round_num: int) -> bool:
     plan = _read_json(harness / f"minimal_path_plan_round_{round_num}.json", {})
     scope = _read_json(harness / f"edit_scope_round_{round_num}.json", {})
     if (
-        plan.get("schema_version") != "minimal-path-plan-v3"
+        plan.get("schema_version") not in SUPPORTED_PLAN_VERSIONS - {"minimal-path-plan-v1", "minimal-path-plan-v2"}
         or plan.get("owner") != "harness"
         or plan.get("status") != "ready"
         or scope.get("schema_version") != "edit-scope-v4"
@@ -758,6 +836,18 @@ def _confirmed_failure_evidence(grade: dict[str, Any]) -> list[str]:
             item = criteria.get(name) or {}
             if item.get("passed") is False and _is_confirmed_failure_text(item.get("notes")):
                 evidence.append(f"{name}: {str(item['notes']).strip()}")
+    failed_hidden_ids = {
+        str(value)
+        for value in (grade.get("hidden_oracle") or {}).get("failed_check_ids") or []
+        if str(value)
+    }
+    for item in grade.get("repair_task_descriptions") or []:
+        if not isinstance(item, dict) or item.get("task_type") not in REPAIR_TYPES:
+            continue
+        evidence_ids = {str(value) for value in item.get("evidence_ids") or []}
+        description = str(item.get("description") or "").strip()
+        if evidence_ids & failed_hidden_ids and _is_confirmed_failure_text(description):
+            evidence.append(description)
     return list(dict.fromkeys(evidence))
 
 
@@ -771,6 +861,105 @@ def _repair_description(grade: dict[str, Any]) -> str:
     lines.extend(f"- Evidence: {item}" for item in evidence)
     lines.extend(f"- Required fix: {item}" for item in instructions)
     return "\n".join(lines)
+
+
+def _repair_task_descriptions(
+    grade: dict[str, Any], *, hidden_evidence: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate evidence-grounded, post-hoc labels for observed failures."""
+    allowed_evidence_ids = {
+        str(item.get("check_id"))
+        for item in grade.get("ui_checks") or []
+        if isinstance(item, dict)
+        and str(item.get("status", "")).lower() == "fail"
+        and item.get("check_id")
+    } | {
+        str(item.get("criterion_id"))
+        for item in grade.get("target_exit_criteria_results") or []
+        if isinstance(item, dict)
+        and item.get("passed") is False
+        and item.get("criterion_id")
+    }
+    functionality = (grade.get("criteria") or {}).get("functionality") or {}
+    if isinstance(functionality, dict) and functionality.get("passed") is False:
+        allowed_evidence_ids.add("FUNCTIONALITY")
+    hidden_oracle = grade.get("hidden_oracle") or {}
+    if isinstance(hidden_oracle, dict) and hidden_oracle.get("status") == "failed":
+        allowed_evidence_ids.update(
+            str(value).strip()
+            for value in hidden_oracle.get("failed_check_ids") or []
+            if str(value).strip()
+        )
+
+    result: list[dict[str, Any]] = []
+    used_locations: set[tuple[str, str, str]] = set()
+    observed_risks = {str(item.get("check_id")): item for item in (hidden_evidence or {}).get("checks", [])}
+    risk_ids = set(hidden_oracle.get("failed_check_ids") or [])
+    for item in grade.get("repair_task_descriptions") or []:
+        if not isinstance(item, dict):
+            continue
+        task_type = str(item.get("task_type") or "").strip()
+        description = str(item.get("description") or "").strip()
+        evidence_ids = [
+            str(value).strip()
+            for value in item.get("evidence_ids") or []
+            if str(value).strip()
+        ]
+        if (
+            task_type not in REPAIR_TYPES
+            or not description
+            or not evidence_ids
+            or any(value not in allowed_evidence_ids for value in evidence_ids)
+        ):
+            continue
+        if hidden_evidence is not None and any(value in risk_ids for value in evidence_ids):
+            issues = []
+            for evidence_id in evidence_ids:
+                for step in observed_risks.get(evidence_id, {}).get("steps", []):
+                    output = step.get("output")
+                    actual = output.get("actual") if isinstance(output, dict) else None
+                    if (step.get("action") != "assert_webcompass_risk" or step.get("ok") is not False
+                            or not isinstance(actual, dict) or actual.get("defect_type") != task_type
+                            or actual.get("passed") is not False):
+                        continue
+                    for issue in actual.get("issues") or []:
+                        # Apply the corrected table-box detector semantics to historical evidence.
+                        if (task_type == "Crowding" and issue.get("kind") == "less-than-2px-gap"
+                                and re.search(r"(?:^| > )(?:tr|th|td)(?::nth-of-type\(\d+\))?$",
+                                              str(issue.get("element_path") or ""))):
+                            continue
+                        issues.append(issue)
+            locations = item.get("issue_locations") or []
+            if locations:
+                requested = {(str(loc.get("element_path")), str(loc.get("kind"))) for loc in locations}
+                observed = {(str(issue.get("element_path")), str(issue.get("kind"))) for issue in issues}
+                if not requested <= observed:
+                    continue
+                signatures = {(task_type, path, kind) for path, kind in requested}
+                if signatures & used_locations:
+                    continue
+                used_locations.update(signatures)
+                issues = [issue for issue in issues if (str(issue.get("element_path")), str(issue.get("kind"))) in requested]
+            if not issues:
+                continue
+            if task_type == "Missing Attributes" and item.get("issue_locations"):
+                # Different controls need separate attribute changes even when
+                # the model puts their locations in one category-level entry.
+                points = {(str(issue.get("element_path")), str(issue.get("kind"))): issue for issue in issues}
+                for issue in points.values():
+                    result.append({"task_type": task_type,
+                        "description": f"{issue['kind']} at {issue.get('element', issue['element_path'])}.",
+                        "evidence_ids": list(dict.fromkeys(evidence_ids))})
+                continue
+            description = task_type + " reproduced after the normal Edit: " + "; ".join(
+                f"{issue.get('kind', 'defect')} at {issue.get('element', 'target surface')}" for issue in issues
+            ) + "."
+        result.append({
+            "task_type": task_type,
+            "description": description,
+            "evidence_ids": list(dict.fromkeys(evidence_ids)),
+        })
+    return result
 
 
 def _base_record(
@@ -806,6 +995,9 @@ def _base_record(
         "trajectory": {
             "source_commit": source_commit,
             "destination_commit": destination_commit,
+            "chain_metadata": _read_json(
+                run_dir / ".harness" / "edit_task_contract.json", {}
+            ).get("chain_metadata"),
         },
         "quality": quality or {},
     }
@@ -836,6 +1028,28 @@ def to_v2_records(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
             continue
         src_code = record["instruction"]["src_code"]
         patches = record["label_modified_files"]
+        edit_kind = _edit_kind(record["task_type"]) if task == "text-editing" else None
+        declared_edit_kind = (record.get("quality") or {}).get("edit_kind")
+        if task == "text-editing" and (
+            edit_kind is None
+            or declared_edit_kind not in {None, edit_kind}
+        ):
+            continue
+        repair_descriptions = (
+            (record.get("quality") or {}).get("repair_task_descriptions") or []
+            if task == "text-repair"
+            else []
+        )
+        if task == "text-repair" and (
+            not 4 <= len(repair_descriptions) <= 12
+            or record["task_type"]
+            != [item.get("task_type") for item in repair_descriptions]
+            or any(task_type not in REPAIR_TYPES for task_type in record["task_type"])
+        ):
+            # Native trajectories may contain fewer naturally observed issues.
+            # The strict WebCompass-shaped view admits only a naturally
+            # occurring 4--12 issue bundle with evidence-grounded labels.
+            continue
         # The reverse release requires every patch search to be non-empty and
         # unique. Forward records with file-creation patches remain useful
         # natural trajectories, but must not silently enter the v2-aligned set.
@@ -849,6 +1063,7 @@ def to_v2_records(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
             "instance_id": record["instance_id"],
             "status": "ok",
             "task_type": record["task_type"],
+            **({"edit_kind": edit_kind} if edit_kind else {}),
             "page_type": "forward_harness",
             "file_manifest": _v2_file_manifest(src_code),
             "resources": [],
@@ -857,6 +1072,7 @@ def to_v2_records(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
             "release_schema_reference": "webcoding-sft-v2",
             "source_project": record.get("source_project", ""),
             "task_count": len(record["task_type"]),
+            **({"edit_kind": edit_kind} if edit_kind else {}),
             "patch_count": len(patches),
             "patch_count_by_task": {
                 task_type: sum(patch.get("task_type") == task_type for patch in patches)
@@ -866,10 +1082,13 @@ def to_v2_records(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any
             "input_contract": {"max_prompt_tokens": 40000, "all_files_included": True},
             "construction_model": "qwen3.6-plus",
             "construction_source": "forward_harness",
+            "chain_metadata": record["trajectory"].get("chain_metadata"),
             "source_commit": record["trajectory"]["source_commit"],
             "destination_commit": record["trajectory"]["destination_commit"],
             "quality": record.get("quality", {}),
         }
+        if repair_descriptions:
+            metadata["repair_task_descriptions"] = repair_descriptions
         if task == "text-editing":
             descriptions = record.get("quality", {}).get("task_descriptions", [])
             if not descriptions:
@@ -954,12 +1173,70 @@ def append_jsonl_records(path: Path, records: list[dict[str, Any]]) -> int:
     return len(pending)
 
 
+def reconcile_session_records(path: Path, records: list[dict[str, Any]], session_id: str) -> int:
+    """Refresh this Session's derived records while retaining prior exports as backups."""
+    original = path.read_bytes() if path.is_file() else b""
+    existing = [json.loads(line) for line in original.decode().splitlines() if line.strip()]
+    def belongs(record):
+        owner = (record.get("trajectory") or {}).get("session_id") or (record.get("quality") or {}).get("session_id")
+        return owner == session_id
+    if any(not belongs(record) for record in records):
+        raise ValueError("Session export contains a record owned by another Session")
+    others = [record for record in existing if not belongs(record)]
+    updated = others + records
+    ids = [record["instance_id"] for record in updated]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Session export would duplicate a record identity")
+    if existing == updated:
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if original:
+        backup = path.with_name(f"{path.stem}.before-{hashlib.sha256(original).hexdigest()[:12]}{path.suffix}")
+        if not backup.exists():
+            backup.write_bytes(original)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w") as handle:
+        for record in updated:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    previous_ids = {record["instance_id"] for record in existing}
+    return sum(record["instance_id"] not in previous_ids for record in records)
+
+
 def _resolved_round_commits(
     *, harness: Path, frontend: Path, grade_rounds: set[int]
 ) -> dict[int, str]:
     """Resolve evaluated rounds from persisted build provenance before heuristics."""
     explicit = _read_json(harness / "round_commit_map.json", {})
     build_map = _read_json(harness / "round_build_map.json", {})
+    # Older minimality-disabled runs omitted the build map. Recover real Git
+    # commit outputs from native tool traces, including multiple commits in a
+    # build and evaluated rounds which did not build at all.
+    build_map = dict(build_map) if isinstance(build_map, dict) else {}
+    for round_num in sorted(grade_rounds):
+        if isinstance(build_map.get(str(round_num)), dict) and build_map[str(round_num)].get("destination_commit"):
+            continue
+        trace = harness / "traces" / f"generator_round_{round_num}.jsonl"
+        traced_commits = []
+        if not trace.is_file():
+            continue
+        for line in trace.read_text().splitlines():
+            event = json.loads(line)
+            if event.get("event") != "tool" or event.get("name") != "run_command" or event.get("ok") is not True:
+                continue
+            for match in re.finditer(r"^\[[^\]\n]+ ([0-9a-f]{7,40})\] (.+)$", str(event.get("output", "")), re.MULTILINE):
+                commit = _git(frontend, "rev-parse", "--verify", match[1] + "^{commit}").strip()
+                if _git(frontend, "show", "-s", "--format=%s", commit).strip() != match[2].strip():
+                    raise ValueError(f"trace commit subject mismatch in round {round_num}")
+                _git(frontend, "merge-base", "--is-ancestor", commit, "HEAD")
+                if commit not in traced_commits:
+                    traced_commits.append(commit)
+        if traced_commits:
+            parents = _git(frontend, "rev-list", "--parents", "-n", "1", traced_commits[0]).split()
+            build_map[str(round_num)] = {"destination_commit": traced_commits[-1],
+                "source_commit": parents[1] if len(parents) > 1 else None}
     resolved: dict[int, str] = {}
     for round_num in sorted(grade_rounds):
         mapped = explicit.get(str(round_num)) if isinstance(explicit, dict) else None
@@ -1001,7 +1278,7 @@ def _resolved_round_commits(
     return resolved
 
 
-def export_run(run_dir: Path) -> list[dict[str, Any]]:
+def export_run(run_dir: Path, *, require_minimality: bool = True) -> list[dict[str, Any]]:
     harness = run_dir / ".harness"
     frontend = run_dir / "frontend"
     grades = _round_files(harness, "grade")
@@ -1058,11 +1335,11 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
             # user-visible edit trajectory from the frozen source project.
             if sprint_num != len(accepted) + 1:
                 break
-            if not _strict_mutation_evidence_passed(harness, round_num, "edit"):
+            if not _strict_mutation_evidence_passed(harness, round_num, "edit", require_minimality=require_minimality):
                 break
             commit = round_commit[round_num]
             source_commit = accepted[-1][2] if accepted else forward_baseline
-            if not _minimality_pair_matches(
+            if require_minimality and not _minimality_pair_matches(
                 harness,
                 round_num,
                 "edit",
@@ -1083,7 +1360,7 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
             accepted.append((sprint_num, round_num, commit))
             previous_code = destination_code
 
-        if patch_chain and accepted:
+        if patch_chain and accepted and _edit_kind(task_types) is not None:
             first_sprint, _, _ = accepted[0]
             last_sprint, last_round, destination_commit = accepted[-1]
             if apply_patches(source_code, patch_chain) != previous_code:
@@ -1091,6 +1368,8 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
             tier, rejection_reasons = _quality_tier(
                 "text-editing", patch_chain, task_types
             )
+            edit_kind = _edit_kind(task_types)
+            assert edit_kind is not None
             suffix = (
                 f"s{first_sprint:02d}"
                 if first_sprint == last_sprint
@@ -1106,6 +1385,8 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
                 source_commit=forward_baseline, destination_commit=destination_commit,
                 quality={
                     "trajectory_role": "canonical_edit",
+                    "edit_kind": edit_kind,
+                    "task_count": len(task_types),
                     "parent_trajectory_id": trajectory_id,
                     "source_checkpoint_id": f"seed@{forward_baseline}",
                     "target_checkpoint_id": f"accepted_sprint_{last_sprint}@{destination_commit}",
@@ -1224,11 +1505,11 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
             # New-policy runs must prove that the accepted incremental build is
             # an irreducible Edit; legacy runs without a policy retain their
             # historical compatibility.
-            if not _strict_mutation_evidence_passed(harness, round_num, "edit"):
+            if not _strict_mutation_evidence_passed(harness, round_num, "edit", require_minimality=require_minimality):
                 continue
             src_code = code_at_commit(frontend, previous_commit)
             dst_code = code_at_commit(frontend, commit)
-            if not _minimality_pair_matches(
+            if require_minimality and not _minimality_pair_matches(
                 harness,
                 round_num,
                 "edit",
@@ -1237,6 +1518,9 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
             ):
                 continue
             task_types = _task_types(harness, sprint_num)
+            edit_kind = _edit_kind(task_types)
+            if edit_kind is None:
+                continue
             patches = make_patches(src_code, dst_code, task_types[0])
             if not patches:
                 continue
@@ -1256,6 +1540,8 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
                 source_commit=previous_commit, destination_commit=commit,
                 quality={
                     "trajectory_role": "canonical_edit",
+                    "edit_kind": edit_kind,
+                    "task_count": len(task_types),
                     "parent_trajectory_id": trajectory_id,
                     "source_checkpoint_id": (
                         f"accepted_sprint_{previous_sprint}@{previous_commit}"
@@ -1302,10 +1588,10 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
         if destination is None:
             continue
         dst_round, _ = destination
-        if not _strict_mutation_evidence_passed(harness, dst_round, "repair"):
+        if not _strict_mutation_evidence_passed(harness, dst_round, "repair", require_minimality=require_minimality):
             continue
         src_commit, dst_commit = round_commit[failed_round], round_commit[dst_round]
-        if not _minimality_pair_matches(
+        if require_minimality and not _minimality_pair_matches(
             harness,
             dst_round,
             "repair",
@@ -1316,7 +1602,20 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
             continue
         src_code = code_at_commit(frontend, src_commit)
         dst_code = code_at_commit(frontend, dst_commit)
-        task_types = _task_types(harness, sprint_num)
+        labeled_grade = grade
+        if _read_json(harness / "harness_state.json", {}).get("supplied_atomic_plan"):
+            metadata = _read_json(harness / f"repair_metadata_round_{dst_round}.json", {})
+            if metadata.get("repair_task_descriptions"):
+                labeled_grade = {**grade, "repair_task_descriptions": metadata["repair_task_descriptions"]}
+        repair_task_descriptions = _repair_task_descriptions(
+            labeled_grade, hidden_evidence=_read_json(harness / f"hidden_oracle_evidence_round_{failed_round}.json", {}),
+        )
+        if not repair_task_descriptions:
+            # The failure remains in the Harness trajectory, but a strict
+            # dataset export must not relabel the Sprint's Edit types as Repair
+            # defects or fabricate a WebCompass category.
+            continue
+        task_types = [item["task_type"] for item in repair_task_descriptions]
         patches = make_patches(src_code, dst_code, task_types[0])
         if not patches:
             continue
@@ -1324,6 +1623,10 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
             raise ValueError("repair patches do not reproduce destination code")
         evidence = _confirmed_failure_evidence(grade)
         description = _repair_description(grade)
+        if labeled_grade is not grade:
+            description = "Repair the following reproduced project defects:\n" + "\n".join(
+                f"- {item['description']}" for item in repair_task_descriptions
+            )
         tier, rejection_reasons = _quality_tier(
             "text-repair", patches, task_types
         )
@@ -1342,6 +1645,10 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
                 "target_checkpoint_id": f"accepted_sprint_{sprint_num}@{dst_commit}",
                 "checkpoint_index": sprint_num,
                 "confirmed_failure_evidence": evidence,
+                "repair_origin": "observed_edit_failure",
+                "defect_injection": False,
+                "taxonomy_assignment": "post_hoc_evidence_grounded",
+                "repair_task_descriptions": repair_task_descriptions,
                 "same_sprint_recovery": True,
                 "destination_checkpoint_passed": True,
                 "changed_files": sorted({patch["path"] for patch in patches}),
@@ -1363,18 +1670,188 @@ def export_run(run_dir: Path) -> list[dict[str, Any]]:
     # Canonical Edit is the data mainline. Natural Repair follows because it is
     # a failure-to-recovery view over the same Edit attempt; cumulative Generate
     # views are emitted last and must be counted separately by trajectory_role.
+    if not require_minimality:
+        for record in records:
+            record["quality"]["counterfactual_minimality"] = {
+                "status": "skipped_by_user_policy", "required_for_export": False,
+            }
     task_order = {"text-editing": 0, "text-repair": 1, "text-generation": 2}
     return sorted(records, key=lambda item: task_order.get(str(item.get("task")), 9))
 
 
+def export_product_session(session_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Export accepted steps under the user's temporary minimality exemption."""
+    session = _read_json(session_path, {})
+    if session.get("schema_version") != "product_edit_session_v1":
+        raise ValueError("expected product_edit_session_v1")
+    records: list[dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
+    pending = False
+    prior_target = None
+    for edit in session["edits"]:
+        execution = edit.get("execution") or {}
+        if execution.get("status") != "completed":
+            pending = True
+            continue
+        if pending:
+            raise ValueError("completed Session steps must form a continuous prefix")
+        run_dir = Path(execution["workdir"])
+        grade = _read_json(Path(execution["evaluation"]), {})
+        if grade.get("overall_passed") is not True:
+            raise ValueError(f"{edit['edit_id']}: completed step has no passing grade")
+        step_records = export_run(run_dir, require_minimality=False)
+        current_edits = [record for record in step_records if record["task"] == "text-editing"]
+        if len(current_edits) > 1:
+            raise ValueError("one Session capability must export one atomic Edit")
+        if current_edits:
+            current = current_edits[0]
+            if prior_target is not None and current["instruction"]["src_code"] != prior_target:
+                raise ValueError("Session source does not match the preceding accepted target")
+            prior_target = current["reference"]["dst_code"]
+        else:
+            prior_target = None
+        for record in step_records:
+            record["instance_id"] = session["session_id"] + "__" + record["instance_id"]
+            record["trajectory"].update(
+                session_id=session["session_id"], edit_id=edit["edit_id"],
+                source_version=edit["source_version"], target_version=edit["target_version"],
+                chain_metadata=edit,
+            )
+            if record["task"] == "text-editing":
+                label = edit["classification"]["primary"]["type"]
+                record["task_type"] = [label]
+                record["description"] = edit["instruction"]
+                record["instruction"]["description"] = edit["instruction"]
+                record["quality"]["classification"] = edit["classification"]
+                record["quality"]["task_descriptions"] = [{
+                    "task_type": label, "description": edit["instruction"]
+                }]
+                for patch in record["label_modified_files"]:
+                    patch["task_type"] = label
+            records.append(record)
+        reports.append({
+            "edit_id": edit["edit_id"], "workdir": str(run_dir),
+            "execution_status": "completed", "record_count": len(step_records),
+            "export_status": "exported" if step_records else "no_eligible_records",
+            "evaluation": execution["evaluation"],
+            "local_accepted_rounds": sorted(_accepted_tape_rounds(run_dir / ".harness")),
+            "minimality_certificate": grade.get("minimality_certificate"),
+        })
+    generation_status = "waiting_for_complete_session"
+    query_path = session_path.parent / "dataset/final_query.json"
+    if session.get("generation_policy") == "each_accepted_state":
+        edit_records = {row["trajectory"]["edit_id"]: row for row in records if row["task"] == "text-editing"}
+        missing = []
+        for index, report in enumerate(reports, 1):
+            edit = session["edits"][index - 1]
+            query_path = session_path.parent / "dataset/generate_queries" / f"{edit['edit_id']}.json"
+            record = edit_records.get(edit["edit_id"])
+            if record is None or not query_path.is_file():
+                missing.append(edit["edit_id"])
+                report["generation_status"] = "waiting_for_query_or_edit_export"
+                continue
+            query = _read_json(query_path, {})
+            files = record["reference"]["dst_code"]
+            content_hash = hashlib.sha256(json.dumps(files, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            prefix = [e["edit_id"] for e in session["edits"][:index]]
+            if (query.get("schema_version") != "product-state-query-v1"
+                or query.get("source_sha256") != content_hash
+                or query.get("state_id") != edit["target_version"]
+                or query.get("edit_ids") != prefix
+                or not isinstance(query.get("instruction"), str) or not query["instruction"].strip()):
+                raise ValueError(f"{edit['edit_id']}: state Generate query must match its accepted source and prefix")
+            final = index == session["selection"]["edit_count"]
+            generated = _base_record(
+                run_dir=Path(edit["execution"]["workdir"]),
+                instance_id=session["session_id"] + "__generate_" + edit["target_version"], task="text-generation",
+                task_types=[], description=query["instruction"], src_code=[], dst_code=files,
+                patches=[], src_images=[], dst_images=record["images"]["dst_screenshot"],
+                source_commit=None, destination_commit=record["trajectory"]["destination_commit"],
+                quality={"trajectory_role": "complete_generate" if final else "checkpoint_generate",
+                         "session_id": session["session_id"], "accepted_edit_ids": prefix,
+                         "state_id": edit["target_version"], "query_artifact": str(query_path),
+                         "query_model": query["model"], "destination_checkpoint_passed": True})
+            generated["trajectory"].update(session_id=session["session_id"], edit_id=edit["edit_id"],
+                                           target_version=edit["target_version"])
+            records.append(generated)
+            report["generation_status"] = "exported"
+        generation_status = "waiting_for_state_queries" if missing or not reports else "exported"
+    elif len(reports) == session["selection"]["edit_count"]:
+        generation_status = "waiting_for_final_query"
+        if query_path.is_file():
+            query = _read_json(query_path, {})
+            edit_records = [record for record in records if record["task"] == "text-editing"]
+            if len(edit_records) != len(reports):
+                generation_status = "waiting_for_accepted_edit_exports"
+            else:
+                final = edit_records[-1]
+                files = final["reference"]["dst_code"]
+                content_hash = hashlib.sha256(json.dumps(files, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                if (query.get("schema_version") != "product-final-query-v1"
+                    or query.get("source_sha256") != content_hash
+                    or query.get("source_sha256") != session["current_state"]["sha256"]
+                    or query.get("state_id") != session["current_state"]["state_id"]
+                    or query.get("edit_ids") != [edit["edit_id"] for edit in session["edits"]]
+                    or not isinstance(query.get("instruction"), str) or not query["instruction"].strip()):
+                    raise ValueError("final Generate query must match the accepted final source and complete chain")
+                records.append(_base_record(
+                    run_dir=Path(session["edits"][-1]["execution"]["workdir"]),
+                    instance_id=session["session_id"] + "__complete_generate", task="text-generation",
+                    task_types=[], description=query["instruction"], src_code=[], dst_code=files,
+                    patches=[], src_images=[], dst_images=final["images"]["dst_screenshot"],
+                    source_commit=None, destination_commit=final["trajectory"]["destination_commit"],
+                    quality={"trajectory_role": "complete_generate", "session_id": session["session_id"],
+                             "accepted_edit_ids": query["edit_ids"], "query_artifact": str(query_path),
+                             "query_model": query["model"], "destination_checkpoint_passed": True},
+                ))
+                generation_status = "exported"
+    report = {
+        "schema_version": "product-session-export-v1", "policy": "harness_accepted_minimality_skipped",
+        "session_id": session["session_id"], "session": str(session_path.resolve()),
+        "planned_steps": session["selection"]["edit_count"], "completed_steps": len(reports),
+        "steps": reports,
+        "counts": {task: sum(record["task"] == task for record in records)
+                   for task in ("text-editing", "text-generation", "text-repair")},
+        "generation_status": generation_status,
+    }
+    return records, report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-dir", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--run-dir", type=Path)
+    source.add_argument("--session", type=Path)
+    source.add_argument("--merge-six-outputs", type=Path, nargs="+")
     parser.add_argument("--output-jsonl", type=Path, required=True)
+    parser.add_argument("--session-report", type=Path)
     parser.add_argument("--v2-output-dir", type=Path)
+    parser.add_argument("--six-output-dir", type=Path)
     args = parser.parse_args()
-    records = export_run(args.run_dir)
-    appended = append_jsonl_records(args.output_jsonl, records)
+    if args.merge_six_outputs:
+        from scripts.export_session_six_tasks import merge_batch_indexes
+        merged = merge_batch_indexes(args.merge_six_outputs, args.output_jsonl)
+        print(json.dumps(merged["counts"]))
+        return
+    if args.session:
+        if args.v2_output_dir:
+            parser.error("Session exports retain native classification; legacy v2 conversion is not supported")
+        records, report = export_product_session(args.session)
+        appended = reconcile_session_records(args.output_jsonl, records, report["session_id"])
+        import asyncio
+        from scripts.export_session_six_tasks import export_six_tasks
+        report["six_tasks"] = asyncio.run(export_six_tasks(
+            records, _read_json(args.session, {}),
+            args.six_output_dir or args.output_jsonl.parent / "six_tasks",
+            _REPO_ROOT / "src/orchestration/webcompass_subtask_distribution.json"))
+        report_path = args.session_report or args.output_jsonl.with_suffix(".report.json")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = report_path.with_suffix(report_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        temporary.replace(report_path)
+    else:
+        records = export_run(args.run_dir)
+        appended = append_jsonl_records(args.output_jsonl, records)
     if args.v2_output_dir:
         args.v2_output_dir.mkdir(parents=True, exist_ok=True)
         for name, rows in to_v2_records(records).items():
@@ -1383,7 +1860,8 @@ def main() -> None:
     counts = {task: sum(record["task"] == task for record in records) for task in (
         "text-generation", "text-editing", "text-repair"
     )}
-    print(json.dumps({"records": len(records), "appended": appended, **counts}, ensure_ascii=False))
+    print(json.dumps({"records": len(records), "appended": appended, **counts,
+                      **({"six_tasks": report["six_tasks"]["counts"]} if args.session else {})}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

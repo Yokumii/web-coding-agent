@@ -84,14 +84,94 @@ class OpenAIToolExecutor:
             self.mutation_policy.observe_result(
                 name, args, ok=result.ok, output=result.output
             )
+            if (
+                result.ok
+                and result.changed
+                and name in {"write_file", "apply_patch"}
+                and str(args.get("path") or "").replace("\\", "/").startswith(
+                    "frontend/"
+                )
+                and callable(
+                    getattr(self.mutation_policy, "observe_validation", None)
+                )
+            ):
+                validation_ok, validation_output = await self._validate_source_mutation(
+                    str(args["path"])
+                )
+                self.mutation_policy.observe_validation(
+                    ok=validation_ok,
+                    output=validation_output,
+                    tool="harness_auto_validation",
+                )
+                if validation_ok:
+                    result.output += "\nHarness validation passed after this mutation."
+                else:
+                    return ToolResult(
+                        False,
+                        result.output
+                        + "\nHarness validation failed after this mutation:\n"
+                        + validation_output,
+                        changed=True,
+                    )
         return result
+
+    async def _validate_source_mutation(self, relative_path: str) -> tuple[bool, str]:
+        """Run zero-model-token checks at a minimal-path mutation boundary."""
+
+        frontend = self.workdir / "frontend"
+        outputs: list[str] = []
+        if (frontend / ".git").is_dir():
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "diff",
+                "--check",
+                cwd=frontend,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            output, _ = await asyncio.wait_for(
+                proc.communicate(), self.command_timeout
+            )
+            text = output.decode(errors="replace")
+            if text:
+                outputs.append(text)
+            if proc.returncode != 0:
+                return False, "".join(outputs) or "git diff --check failed"
+        target = self._path(relative_path)
+        if target.suffix.lower() in {".js", ".mjs", ".cjs"} and target.is_file():
+            proc = await asyncio.create_subprocess_exec(
+                "node",
+                "--check",
+                str(target),
+                cwd=frontend,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            output, _ = await asyncio.wait_for(
+                proc.communicate(), self.command_timeout
+            )
+            text = output.decode(errors="replace")
+            if text:
+                outputs.append(text)
+            if proc.returncode != 0:
+                return False, "".join(outputs) or "node --check failed"
+        return True, "".join(outputs)
+
+    def _source_read_path(self, value: str) -> Path:
+        path = self._path(value)
+        if not path.exists():
+            candidate = self._path(str(Path("frontend") / path.relative_to(self.workdir)))
+            if candidate.is_file():
+                return candidate
+        return path
 
     async def _execute_unobserved(
         self, name: str, args: dict[str, Any]
     ) -> ToolResult:
         try:
             if name == "read_file":
-                content = self._path(args["path"]).read_text(errors="replace")
+                resolved_path = self._source_read_path(args["path"])
+                content = resolved_path.read_text(errors="replace")
                 start_line = args.get("start_line")
                 end_line = args.get("end_line")
                 if start_line is not None or end_line is not None:
@@ -109,6 +189,8 @@ class OpenAIToolExecutor:
                         + "\n\n[read_file truncated at 32000 characters; use start_line/end_line "
                         "or an allowlisted sed command to inspect another focused range.]\n"
                     )
+                if resolved_path != self._path(args["path"]):
+                    content = f"Resolved frontend source path: {resolved_path}\n" + content
                 return ToolResult(True, content)
             if name == "write_file":
                 path = self._path(args["path"]); before = path.read_text(errors="replace") if path.exists() else None
@@ -126,11 +208,14 @@ class OpenAIToolExecutor:
                 base = self._path(args.get("path", ".")); pattern = args.get("glob", "**/*")
                 return ToolResult(True, "\n".join(str(p.relative_to(self.workdir)) for p in list(base.glob(pattern))[:1000]))
             if name == "search_files":
-                base = self._path(args.get("path", "."))
+                base = self._source_read_path(args.get("path", "."))
                 proc = await asyncio.create_subprocess_exec("rg", "-n", "--", args["query"], str(base), cwd=self.workdir,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
                 out, _ = await asyncio.wait_for(proc.communicate(), self.command_timeout)
-                return ToolResult(proc.returncode in {0, 1}, out.decode(errors="replace")[:100_000])
+                output = out.decode(errors="replace")[:100_000]
+                if base != self._path(args.get("path", ".")):
+                    output = f"Resolved frontend source path: {base}\n" + output
+                return ToolResult(proc.returncode in {0, 1}, output)
             if name == "run_command":
                 if not self.allow_bash: raise ValueError("Bash tool is disabled")
                 # stdout/stderr are already combined by the executor. Drop only these

@@ -1,8 +1,11 @@
 """Dedicated system prompt for a fresh, bounded Repair session."""
 
 REPAIR_SYSTEM_PROMPT = """\
+Repair every reproduced defect in the supplied failure packet together in this one response.
+Multiple defects and multiple locations of the same defect type belong to the same Repair,
+not separate repair rounds. Preserve the requested Edit and unrelated behavior.
 You are a frontend repair engineer. This is a fresh, short-context Repair call, not a request
-to rediscover or redesign the product. The user prompt contains the reproduced failures, the
+to rediscover or redesign the product. The user prompt contains the observed valid-test failures, the
 Harness-selected source windows, and the allowed source cone.
 
 Make the smallest source transition that resolves every identified failure while preserving

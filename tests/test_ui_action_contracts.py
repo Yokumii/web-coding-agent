@@ -33,10 +33,87 @@ def test_new_url_assertions_reject_hash_router_state():
         )
 
 
+def test_nonempty_text_and_attribute_assertions_are_bounded():
+    validate_ui_action(
+        {"action": "assert_text", "selector": "#title", "value": "", "match": "nonempty"}
+    )
+    validate_ui_action({"action": "assert_hash", "value": "", "match": "nonempty"})
+    validate_ui_action({"action": "assert_scroll", "y": 200, "tolerance": 2})
+    validate_ui_action({"action": "assert_in_view", "selector": "#driver"})
+    validate_ui_action({"action": "click", "selector": "#card", "capture_scroll_as": "before-detail"})
+    validate_ui_action({"action": "assert_scroll", "snapshot": "before-detail", "tolerance": 2})
+    validate_ui_action(
+        {
+            "action": "assert_attribute",
+            "selector": "#detail",
+            "name": "data-id",
+            "value": "",
+            "match": "nonempty",
+        }
+    )
+
+
+def test_scroll_assertion_requires_one_expected_source():
+    with pytest.raises(ActionContractError, match="exactly one"):
+        validate_ui_action({"action": "assert_scroll"})
+    with pytest.raises(ActionContractError, match="exactly one"):
+        validate_ui_action({
+            "action": "assert_scroll",
+            "y": 200,
+            "snapshot": "before-detail",
+        })
+
+
+def test_input_value_snapshot_and_match_contract():
+    validate_ui_action({"action": "assert_value", "selector": "#filter", "match": "nonempty", "capture_as": "before"})
+    validate_ui_action({"action": "assert_value", "selector": "#filter", "snapshot": "before"})
+    validate_ui_action({"action": "assert_value", "selector": "#filter", "value": "", "match": "exact"})
+    for fields in ({"snapshot": "before", "value": "x"}, {"snapshot": "before", "match": "nonempty"}, {"value": "", "match": "contains"}, {"match": "unknown"}, {"match": "nonempty", "capture_as": ""}):
+        with pytest.raises(ActionContractError):
+            validate_ui_action({"action": "assert_value", "selector": "#filter", **fields})
+
+
+def test_attribute_snapshot_actions_require_one_expected_source():
+    validate_ui_action(
+        {
+            "action": "capture_attribute",
+            "selector": "#card",
+            "name": "data-id",
+            "snapshot": "first-card-id",
+        }
+    )
+    validate_ui_action(
+        {
+            "action": "assert_attribute",
+            "selector": "#card",
+            "name": "data-id",
+            "snapshot": "first-card-id",
+        }
+    )
+    with pytest.raises(ActionContractError, match="exactly one"):
+        validate_ui_action(
+            {
+                "action": "assert_attribute",
+                "selector": "#card",
+                "name": "data-id",
+                "value": "artifact-1",
+                "snapshot": "first-card-id",
+            }
+        )
+
+
 def test_hash_assertions_and_storage_fixtures_are_bounded():
+    validate_ui_action({"action": "set_hash", "value": "#audio-studio-driver"})
     validate_ui_action(
         {"action": "assert_hash", "value": "#/library", "match": "exact"}
     )
+    validate_ui_action(
+        {"action": "assert_hash", "value": "#type=Timepiece", "match": "exact"}
+    )
+    validate_ui_action(
+        {"action": "assert_hash", "value": "Timepiece", "match": "contains"}
+    )
+    validate_ui_action({"action": "assert_hash", "value": ""})
     validate_ui_action(
         {
             "action": "set_storage_value",
@@ -46,10 +123,12 @@ def test_hash_assertions_and_storage_fixtures_are_bounded():
             "encoding": "json",
         }
     )
-    with pytest.raises(ActionContractError, match="hash-router path"):
+    with pytest.raises(ActionContractError, match="bounded URL fragment"):
         validate_ui_action(
             {"action": "assert_hash", "value": "https://example.com/#/library"}
         )
+    with pytest.raises(ActionContractError, match="same-page URL fragment"):
+        validate_ui_action({"action": "set_hash", "value": "https://example.com/#bad"})
     with pytest.raises(ActionContractError, match="32768-byte"):
         validate_ui_action(
             {
@@ -164,3 +243,18 @@ def test_assert_property_allows_only_bounded_browser_state():
                 "value": "anything",
             }
         )
+
+
+def test_harness_webcompass_risk_assertion_uses_closed_taxonomy():
+    validate_ui_action({
+        "action": "assert_webcompass_risk",
+        "selector": "[data-testid='dialog']",
+        "defect_type": "Occlusion",
+    })
+
+    with pytest.raises(ActionContractError, match="official WebCompass taxonomy"):
+        validate_ui_action({
+            "action": "assert_webcompass_risk",
+            "selector": "body",
+            "defect_type": "Generic Visual Bug",
+        })

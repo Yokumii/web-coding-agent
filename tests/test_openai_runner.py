@@ -74,6 +74,40 @@ def test_browser_screenshot_schema_exposes_distinct_page_positions():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("complete", [True, False])
+async def test_tokenwave_stream_preserves_text_tools_usage_and_rejects_truncation(monkeypatch, complete):
+    import httpx
+    original = httpx.AsyncClient
+    requests = []
+    chunks = [
+        {"choices":[{"index":0,"delta":{"content":"Ready ","tool_calls":[{"index":0,"id":"call_1",
+            "function":{"name":"read_file","arguments":'{"path":'}}]}}]},
+        {"choices":[{"index":0,"delta":{"content":"now","tool_calls":[{"index":0,
+            "function":{"arguments":'"app.js"}'}}]},"finish_reason":"tool_calls"}]},
+        {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}},
+    ]
+    def respond(request):
+        requests.append(json.loads(request.content))
+        body = "".join("data: " + json.dumps(item) + "\n\n" for item in chunks)
+        return httpx.Response(200, text=body + ("data: [DONE]\n\n" if complete else ""),
+                              headers={"content-type":"text/event-stream"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAIHTTPClient(HarnessConfig(openai_base_url="https://api.tokenwave.us/v1",
+                                           openai_api_key="test-key"), 20)
+    if not complete:
+        with pytest.raises(RuntimeError, match="DONE marker"):
+            await client.complete(model="gpt-5.5", messages=[])
+    else:
+        result = await client.complete(model="gpt-5.5", messages=[])
+        message = result["choices"][0]["message"]
+        assert message["content"] == "Ready now"
+        assert message["tool_calls"][0]["function"] == {"name":"read_file", "arguments":'{"path":"app.js"}'}
+        assert result["usage"] == {"prompt_tokens":7,"completion_tokens":3}
+    assert len(requests) == 1
+    assert requests[0]["stream"] is True
+
+
+@pytest.mark.anyio
 async def test_openai_http_client_never_retries_a_transport_error(monkeypatch):
     import httpx
 
@@ -131,6 +165,49 @@ async def test_openai_http_client_never_retries_qwen_burst_limit(monkeypatch):
 
     with pytest.raises(httpx.HTTPStatusError, match="429"):
         await OpenAIHTTPClient(config, 20).complete(model="qwen-test", messages=[])
+    assert attempts == 1
+
+
+@pytest.mark.anyio
+async def test_openai_http_client_reports_non_json_success_without_retry(monkeypatch):
+    import httpx
+
+    attempts = 0
+
+    class Response:
+        status_code = 200
+        text = "upstream protocol mismatch"
+        is_error = False
+        headers = {"content-type": "text/plain"}
+        request = httpx.Request("POST", "https://example.test/chat/completions")
+
+        def json(self):
+            raise json.JSONDecodeError("Expecting value", self.text, 0)
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
+    config = HarnessConfig(
+        openai_base_url="https://example.test", openai_api_key="test-key"
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="non-JSON.*status=200.*content-type=text/plain",
+    ):
+        await OpenAIHTTPClient(config, 20).complete(
+            model="qwen-test", messages=[]
+        )
     assert attempts == 1
 
 
@@ -375,6 +452,18 @@ async def test_generator_allows_diagnosis_until_true_final_chance(tmp_path: Path
 
 
 @pytest.mark.anyio
+async def test_frontend_git_location_is_explicit_in_native_guidance(tmp_path):
+    (tmp_path/'frontend/.git').mkdir(parents=True)
+    client = CapturingFakeClient([reply(content='done')])
+    await run_openai_agent(prompt='build', config=HarnessConfig(), workdir=tmp_path,
+        model='gpt-5.5', system_prompt='system', max_turns=2, allow_bash=True, client=client)
+    system = client.requests[0]['messages'][0]['content']
+    assert 'cd frontend && git status --short' in system
+    assert 'does not persist between tool calls' in system
+    assert 'does not support git -C' in system
+
+
+@pytest.mark.anyio
 async def test_repeated_identical_tool_call_is_stopped(tmp_path: Path):
     call = [{"id": "1", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"missing"}'}}]
     client = FakeClient([reply(tool_calls=call), reply(tool_calls=call), reply(tool_calls=call)])
@@ -384,6 +473,34 @@ async def test_repeated_identical_tool_call_is_stopped(tmp_path: Path):
             system_prompt="system", max_turns=10, allow_bash=False, client=client,
             limits=OpenAIRunLimits(repeat_limit=3),
         )
+
+
+@pytest.mark.anyio
+async def test_unchanged_visible_read_is_suppressed_before_repeat_breaker(tmp_path: Path):
+    (tmp_path / "source.js").write_text("const value = 1;\n")
+    repeated = lambda call_id: [{
+        "id": call_id,
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"source.js"}'},
+    }]
+    client = CapturingFakeClient([
+        reply(tool_calls=repeated("r1")),
+        reply(tool_calls=repeated("r2")),
+        reply(content="done"),
+    ])
+
+    await run_openai_agent(
+        prompt="inspect", config=HarnessConfig(), workdir=tmp_path,
+        model="deepseek-chat", system_prompt="system", max_turns=4,
+        allow_bash=False, client=client,
+    )
+
+    tool_messages = [
+        message for message in client.requests[-1]["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert "const value = 1" in tool_messages[0]["content"]
+    assert tool_messages[1]["content"].startswith("UNCHANGED_READ_SUPPRESSED")
 
 
 @pytest.mark.anyio
@@ -594,3 +711,35 @@ async def test_evaluator_repeated_budget_guidance_does_not_trip_error_breaker(
     )
 
     assert text == "done"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", ["completed", "incomplete"])
+async def test_tokenwave_responses_recovery_preserves_prompt_and_usage(monkeypatch, status):
+    import httpx
+    original = httpx.AsyncClient
+    monkeypatch.delenv("TOKENWAVE_API_PROXY", raising=False)
+    def respond(request):
+        assert request.url.path == "/v1/responses"
+        body = json.loads(request.content)
+        assert body["model"] == "gpt-5.5"
+        assert body["instructions"] == "Return JSON"
+        assert body["input"] == [{"role":"user","content":"Current source"}]
+        assert body["max_output_tokens"] == 12000 and body["store"] is False
+        event = {"type":"response." + status, "response": {"status":status,
+            "output":[{"type":"message","content":[{"type":"output_text","text":"{}"}]}],
+            "usage":{"input_tokens":19,"output_tokens":7,"total_tokens":26}}}
+        return httpx.Response(200,text="data: " + json.dumps(event) + "\n\n")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs))
+    client = OpenAIHTTPClient(HarnessConfig(openai_base_url="https://api.tokenwave.us/v1", openai_api_key="test"),20)
+    call = dict(model="gpt-5.5",messages=[{"role":"system","content":"Return JSON"},
+                                        {"role":"user","content":"Current source"}],
+                max_tokens=12000,_protocol="responses")
+    if status == "incomplete":
+        with pytest.raises(RuntimeError,match="without a completed response"):
+            await client.complete(**call)
+    else:
+        result = await client.complete(**call)
+        assert result["choices"][0]["message"]["content"] == "{}"
+        assert result["usage"]["prompt_tokens"] == 19
+        assert result["usage"]["completion_tokens"] == 7

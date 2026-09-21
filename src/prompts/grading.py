@@ -97,6 +97,11 @@ def check_grades(grades: dict) -> bool:
         return False
 
     for criterion in CRITERIA:
+        decision = grades.get("visual_evidence_decision") or {}
+        if (criterion.name == "originality" and decision.get("owner") == "harness"
+                and decision.get("task_mode") == "edit"
+                and decision.get("originality_required") is False):
+            continue
         score_data = criteria_block.get(criterion.name)
         if not isinstance(score_data, dict):
             return False
@@ -110,6 +115,33 @@ def check_grades(grades: dict) -> bool:
         if score_float < criterion.threshold:
             return False
     return True
+
+
+def _check_applicable_grades(grades: dict[str, Any]) -> bool:
+    """Do not turn omitted visual review into an unevidenced Edit repair.
+
+    The Harness, not the model, writes ``visual_evidence_decision``.  When it
+    explicitly marks a behavior-only Edit as not requiring pixels, the three
+    visual-owned rubric dimensions are descriptive and cannot reject otherwise
+    passing browser, source, and regression evidence.
+    """
+    decision = grades.get("visual_evidence_decision")
+    if not (
+        isinstance(decision, dict)
+        and decision.get("status") == "not_required"
+        and str((grades.get("phase_results") or {}).get("appearance", "")).lower()
+        == "skipped"
+    ):
+        return check_grades(grades)
+    criteria = grades.get("criteria")
+    functionality = criteria.get("functionality") if isinstance(criteria, dict) else None
+    score = functionality.get("score") if isinstance(functionality, dict) else None
+    return (
+        isinstance(score, (int, float))
+        and not isinstance(score, bool)
+        and math.isfinite(float(score))
+        and float(score) >= criterion_threshold("functionality")
+    )
 
 
 def parse_tristate(value: Any) -> bool | None:
@@ -143,7 +175,7 @@ def _has_failed_critical_ui_checks(grades: dict[str, Any]) -> bool:
 
 def _only_unverified_partial_blockers(grades: dict[str, Any]) -> bool:
     """Accept when the sole negative signal is evaluator coverage uncertainty."""
-    if not check_grades(grades) or _has_failed_critical_exit_criteria(grades):
+    if not _check_applicable_grades(grades) or _has_failed_critical_exit_criteria(grades):
         return False
     phase_results = grades.get("phase_results") or {}
     if any(str(value).lower() == "fail" for value in phase_results.values()):
@@ -223,9 +255,9 @@ def determine_passed(grades: dict[str, Any] | None) -> bool:
 
     overall_passed = parse_tristate(grades.get("overall_passed"))
     if overall_passed is not None:
-        return overall_passed and check_grades(grades)
+        return overall_passed and _check_applicable_grades(grades)
 
-    return check_grades(grades)
+    return _check_applicable_grades(grades)
 
 
 def visual_review_failure(
@@ -295,6 +327,8 @@ def apply_visual_review_scores(
                 str(merged_criteria.get(name, {}).get("notes", "")).strip()
                 for name in VISION_OWNED_CRITERIA
                 if merged_criteria.get(name, {}).get("passed") is False
+                and not (name == "originality" and
+                    (merged.get("visual_evidence_decision") or {}).get("originality_required") is False)
             ]
             if isinstance(merged_criteria, dict)
             else []

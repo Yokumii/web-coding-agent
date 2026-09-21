@@ -1,5 +1,7 @@
 # Web Coding Agent
 
+Product Session policy (2026-09-13): temporarily skip counterfactual patch minimality. The Session bridge sets `minimality_guard_enabled=False`; Session exports record `skipped_by_user_policy`. Each Edit runs one instruction-authored user flow plus deterministic checks for the applicable WebCompass 11 defect classes in its target regions and related states. The detection stage collects all observable failures before one Repair call, then repeats the same checks. Acceptance is deterministic; no independent model judge is added. Each Edit permits one LLM implementation call and at most one evidence-driven LLM Repair (`edit_max_rounds=2`); a second failed browser evaluation stops that Edit. The autonomous Session controller exports accepted Edit/natural Repair records after each step and synthesizes a standalone final Generate request from the accepted descendant before final export. Normal progression and diagnosed transient recovery run without Codex supervision. The bridge also disables the per-Edit originality gate: novelty belongs to the product direction, while raw scores remain recorded. Build provenance is retained independently of minimality; Session exports reconcile the current Session snapshot and back up replaced exports.
+
 **English** | [简体中文](README.zh-CN.md)
 
 This repository is a simple reproduction of the frontend-oriented half of [Anthropic's long-running harness design work](https://www.anthropic.com/engineering/harness-design-long-running-apps).
@@ -30,6 +32,15 @@ Dataset acquisition, reverse/controlled construction, and release assembly can r
 in separate repositories; integrations use explicit paths and schemas rather than a
 required sibling-directory layout.
 
+### Product-session integration
+
+`scripts/run_product_session_step.py` accepts one externally generated Edit plus the current
+source project/evaluation and prior accepted checks. It calls the existing Harness and returns
+the completed project, grade and checks to the upstream product-session planner. That planner
+samples 4–12 steps and generates the next instruction only after the actual preceding result.
+The adapter adds no new evaluation or trajectory-export stage. Live end-to-end validation of
+this integration is pending valid TokenWave credentials; its wiring tests pass.
+
 ### Current Edit-led data objective
 
 The canonical production unit is an accepted state transition:
@@ -41,8 +52,12 @@ then continues through the same Edit path.
 The accepted Edit history derives two other data views. Accumulated requirements through
 an accepted checkpoint make it a `checkpoint_generate` candidate; materialization is
 selective rather than automatic. Accumulated full requirements through the terminal
-checkpoint yield one `complete_generate`. A real,
-browser-reproduced failure followed by same-Sprint recovery yields `natural_repair`.
+checkpoint yield one `complete_generate`. A real failure observed by a valid browser
+test, followed by same-Sprint recovery, yields `natural_repair`.
+Repair categories are assigned only after that real failure is observed and only
+when evaluator evidence supports an official WebCompass type. The Harness never
+selects a Repair type up front, injects a defect, or retries an Edit merely to
+fill category quotas; the resulting Repair distribution is allowed to be uneven.
 All records share lineage IDs and are never inferred from filenames or heuristic task
 classifiers.
 
@@ -59,6 +74,37 @@ round starts a fresh Repair call with no prior conversation: exact failed action
 reduced to selector-level repair directives plus a newly selected current-code window.
 Native OpenAI-compatible atomic edits use one exact-patch request per cycle; complex
 dependency-widening cases retain the bounded tool path.
+
+### Core technical path
+
+The Planner/Generator/Evaluator loop, Playwright execution, screenshots, and retry control
+are standard agent infrastructure; they are not claimed as project novelty. The technical
+focus is the interaction of six Edit-specific mechanisms:
+
+1. **Tests before code:** prioritize Harness-owned WebCompass defect audits, with compact
+   Planner-authored setup/completion flows, then fingerprint the authoritative copies
+   before the Generator runs.
+2. **Separate read context from write scope:** give the model every dependency required for
+   correctness while mechanically restricting mutations to route/surface-owned regions.
+   Context may widen along observed dependencies; write permission does not widen with it.
+3. **Semantic multi-page preservation:** combine route ownership, DOM/ARIA fragment guards,
+   selector-scoped shared CSS rules, and replay of accepted interactions instead of treating
+   a whole-file or whole-screen diff as the edit boundary.
+4. **Failure-to-Repair compilation:** any observed failure from a valid test can start a
+   fresh short-context Repair immediately. Invalid tests and infrastructure failures do not
+   become training defects; WebCompass defect labels are assigned only when the evidence
+   supports them.
+5. **Counterfactual patch necessity:** delete candidate change atoms and replay the target
+   and preservation checks to establish that the source fails, the destination passes, and
+   each retained atom is necessary.
+6. **Edit-led data derivation:** compile adjacent accepted states into canonical Edit,
+   materially distinct cumulative states into Generate, and failed-to-accepted states into
+   natural Repair while retaining one lineage and exact replayable patches.
+
+No individual item above should be presented as unprecedented without a current literature
+comparison. The research claim to test is whether their combination improves Edit success
+and non-target preservation while reducing model-visible source tokens and valid-sample cost
+against an equal-model full-repository baseline.
 
 ## Status
 
@@ -80,21 +126,23 @@ What is implemented:
 - Claude HTTP trace pairs for SDK-backed agent runs: `*.http.jsonl` remains the source trace, and `*.http.html` is generated beside it for browser inspection
 - Local logs for frontend runtime failures
 - Per-phase cost tracking with cumulative planner/generator/evaluator caps plus a hard total-budget cap; append-only trace usage from failed or interrupted attempts is carried into a resumed phase instead of resetting its spend to zero
-- Incremental-Edit DOM contract guard: explicit Edit freezes a verified seed, while Sprint two and later in a Generate run freeze the previous accepted checkpoint. Each semantic frame is sampled twice and unstable routes fail closed. The v4 contract opens at most four deepest target fragments per route while preserving sibling fragments, ARIA state, focusability, and every protected route. This is independent of screenshot/pixel scoring.
+- Incremental-Edit DOM contract guard: explicit Edit freezes a verified seed, while Sprint two and later in a Generate run freeze the previous accepted checkpoint. Each semantic frame is sampled twice and unstable routes fail closed. The v4 contract opens the exact deepest target fragments resolved from the instruction and checks, with a Harness-owned per-route count budget (legacy scopes default to four) while preserving sibling content, ARIA state, focusability, bounded computed styles, and every protected route. This is independent of screenshot/pixel scoring.
 - Harness-owned progressive minimal-path guidance: each executable UI check names an exact same-origin route. Static HTML pages, concrete filesystem routes, explicit literal React Router mappings, and literal vanilla `registerRoute()` hash routes are converted into page ownership and import/link dependency cones. A directory with several HTML entries is treated as a real multi-page sample: every HTML pathname owns its transitive scripts/styles, navigation links do not imply source ownership, and non-target HTML entries remain protected. Both native OpenAI tools and Claude SDK tools enforce a read → exact patch → validation → dependency-widening state machine. A coherent multi-route Edit starts from one ranked entry per target route; route-local files are preferred, off-target files remain closed, and a cross-route shared source opens only when a named target-route object/class/function is mechanically isolated. Target-named additive members may be added to a mechanically isolated shared store/state container, while existing members and unrelated identifiers remain byte/identifier protected. Every patch stays inside its admitted region, whole-file overwrite stays denied, and actual tool outcomes are appended to a ledger.
 - Selector-aware shared CSS protection: a stylesheet owned by target and protected pages stays closed unless the action contract supplies a strong target root that is absent from protected page sources. When opened, every modified top-level CSS rule and every comma-separated selector branch must contain an allowed target ID or `[data-testid]`/`[data-page]` anchor. Functional-pseudo indirection, sibling escape, generic selectors, mixed global edits, modern nested blocks, and at-rule edits fail closed. Repository-native token inventory still guides declarations but does not itself grant stylesheet access.
 - Typed WebCompass browser contracts: the full 40-type 0805 Edit taxonomy has an explicit action-capability profile. New plans cannot author arbitrary browser JavaScript. Bounded hash-router routes and `assert_hash` are supported; `set_storage_value` establishes deterministic local/session-storage fixtures, and `assert_computed_style` checks a small allowlist of rendered properties without screenshot comparison. Each flow ends in one to four related DOM/text/value/count/pathname/hash/computed-style/attribute/ARIA/focus/storage/console assertions. Tab checks require a deterministic starting selector, and initial empty-state checks must precede state-producing flows on their route. Real Chromium also supports hover, right-click, drag-and-drop, in-memory file upload, asynchronous locator waits, reload, viewport changes, and print/color-scheme emulation. Historical `evaluate` contracts remain replayable but are not formal-export evidence.
-- Accepted checkpoint tapes: passing typed flows are appended with requirement/impact metadata. Normal Edit validation replays impacted checks plus one critical sentinel per protected route; every fifth accepted Edit and legacy metadata trigger a full replay. `scripts/recover_accepted_tapes.py` reconstructs a missing tape only from immutable passing browser evidence. A lost accepted interaction is a real regression; malformed or over-budget tape banks are infrastructure failures.
+- Accepted checkpoint tapes: passing typed flows remain stored with requirement/impact metadata for lineage and export. Product Session steps do not add historical browser replays to the current Edit's single browser check. `scripts/recover_accepted_tapes.py` reconstructs a missing tape only from immutable passing browser evidence.
 - Complete seed context for one-shot AIR task generation: up to 48 source files / 140K characters are included without truncation. Larger projects fail closed and must use the tool-reading harness path; partial context is never advertised as `all_files_included`.
 - Counterfactual patch certificates: after normal evaluation passes, exact edit/repair atoms are deleted and replayed in isolated real-browser candidates. The source must fail the target contract, the destination must pass target + frame, and every retained atom must be necessary. Target-local style atoms require an accepted target-route visual review because the functional oracle cannot judge CSS appearance. If only evidence policy changes, a later round keeps the source byte-identical and reuses the last matching applied-and-validated mutation ledger rather than paying the Generator to touch code again. New-policy exports require `certified` evidence with exact source/destination provenance.
+- Target-blind validation freeze: for explicit Edit, the atomic Planner produces executable tests from the instruction, accepted obligations, source UI contract, routes, and user references before Build. Requested page content and interaction behavior receive typed browser assertions; explicit color, typography, layout, spacing, card-style, or responsive changes require independent rendered review. For inline seeds without a supplied UI contract, the Harness extracts a bounded control inventory from the immutable Git baseline and rewrites only uniquely matched setup controls. Explicit instruction cardinalities and zero-result postconditions stay exact. Weak Planner-authored preservation-presence duplicates are omitted because responsive source visibility cannot be guessed; structural/content/style preservation remains owned by the DOM/computed-style guard and prior behavior by accepted-tape replay. The existing plan/execution views and hidden checks remain authoritative; only compact fingerprints are added to `harness_state.json`, so Build and Evaluate reject later drift without creating another validation file or test-body copy.
+- Product Session enables `edit_webcompass_defect_checks`: the single requested-function flow supplies target regions and interaction states for all applicable WebCompass defect checks. Identical state setup is reused across categories. `edit_risk_tests.json` freezes the checks before Build; actual browser evidence and failure screenshots are retained. All reproduced defects are collected into one Repair packet and fixed in at most one Repair call, then the same functional flow and defect checks run again. Source-identical defects are excluded by the cached baseline. No independent model judge or defect injection is used.
 - First-class Edit execution: `--task-mode edit` freezes a clean existing frontend as the accepted Git baseline. A dedicated atomic Planner authors only goal/source anchors/visual policy/typed checks; the Harness derives requirement lineage plus legacy spec/design-token/feature/Sprint views without more model calls. Ordered checks also derive hard DOM topology guidance such as keeping a repeatedly clicked control outside the target it hides. One coherent multi-page/multi-file Edit remains one Sprint; independent changes are split upstream.
-- Evidence-driven short-context Repair: a reproduced deterministic failure bypasses the paid semantic judge and writes `repair_packet_round_N.json`. The next cycle is an independent model call receiving only compact failed action evidence, selector-level derived repair directives, the current allowed source cone, and a fresh bounded source window. An unidentifiable failure cannot start an open-ended Repair.
-- User-supplied multimodal inputs: repeatable `--input` files are content-addressed under `.harness/inputs/`. Bounded text/source inputs are included in task context, while PNG/JPEG/WebP/GIF inputs are sent as native image blocks to Planner and Generator and as labeled references to the visual scorer. They are retained in image-edit v2 exports.
+- Evidence-driven short-context Repair: one observed failure from a valid deterministic test bypasses the paid semantic judge and writes `repair_packet_round_N.json`; no second execution is required. The next cycle is an independent model call receiving only compact failed action evidence, selector-level derived repair directives, the current allowed source cone, and a fresh bounded source window. Invalid tests and infrastructure errors remain outside Repair.
+- User-supplied multimodal inputs: repeatable `--input` files are copied under `.harness/inputs/`. Bounded text/source inputs are included in task context, while PNG/JPEG/WebP/GIF inputs are sent as native image blocks to Planner and Generator and as labeled references to the visual scorer. Only files that actually exist produce a compact routing manifest; input hashes and original absolute paths are not persisted.
 - A provider-agnostic concurrent batch scheduler with per-case ports/timeouts, append-only status records, successful-case resume, optional verified seed preparation, Edit routes, and multimodal inputs.
 - A human-readable folder exporter layered on the strict trajectory exporter; it never reclassifies tasks from commit/sprint heuristics.
-- Strict Edit-first lineage export: canonical Edit pairs come from adjacent accepted checkpoints; `checkpoint_generate` and `complete_generate` are cumulative derived views; `natural_repair` comes only from reproduced failure to same-Sprint recovery. Formal Edit/Repair export requires v4 stable fragment scope, an applied-and-validated minimal-path ledger, a certified counterfactual certificate, typed accepted tape evidence, and reproducible exact patches. JSONL export is append-only and resume-idempotent.
+- Strict Edit-first lineage export: canonical Edit pairs come from accepted checkpoints. `quality.edit_kind=atomic_edit` requires exactly one task; `quality.edit_kind=compound_edit` requires 4–12 tasks accumulated over one continuous accepted trajectory. Bundles with 2–3 or more than 12 tasks are not formal Edit exports. `checkpoint_generate` and `complete_generate` are cumulative derived views; `natural_repair` comes only from an observed valid-test failure followed by same-Sprint recovery. Formal Edit/Repair export requires v4 stable fragment scope, an applied-and-validated minimal-path ledger, a certified counterfactual certificate, typed accepted tape evidence, and reproducible exact patches. JSONL export is append-only and resume-idempotent.
 - Generate materiality curation: strict exports remain immutable, while `scripts/curate_generate_materiality.py` creates a separate release. It retains the first from-zero Generate, requires an explicit human/semantic-review decision for intermediate checkpoints, keeps one terminal `complete_generate`, and removes any checkpoint view with the same destination commit. Code-size thresholds can be evidence but never decide semantic significance by themselves.
-- Native trajectory records represent new files explicitly as `operation=create_file` plus `content`; they never overload an empty search string. Reverse-compatible WebCompass v2 export remains search/replace-only and skips native file-creation records with an explicit quality limitation.
+- Native trajectory records represent new files explicitly as `operation=create_file` plus `content`; they never overload an empty search string. At the strict official-WebCompass export boundary only, a validated `create_file` atom is converted to the protocol's empty-`<search>` new-file block and the converted patch must replay exactly against the full source.
 
 ## Requirements
 
@@ -276,6 +324,11 @@ Multiple
 `--target-route` values are a run-wide allowlist for the single coherent Edit Sprint;
 independent product changes must be split before entering the harness, and other routes
 remain protected.
+An explicitly requested static pathname may be absent from the accepted seed. In that
+case the Harness may plan exactly its corresponding HTML entry as a new file only when
+the Planner emits executable checks for every requested route. This supports converting
+one HTML shell or a hash-routed fake multi-page site into physical pages; all unrequested
+new paths remain closed, and direct pathname navigation is part of acceptance.
 Unresolved routes or planner route drift stop before source mutation.
 
 Edit uses `EDIT_MAX_ROUNDS=10` (or `--edit-max-rounds`) as a ceiling. Passing round one
@@ -283,8 +336,9 @@ stops at round one; a failed round may produce another Repair cycle only when it
 browser/semantic evidence is identifiable. `EDIT_FULL_REPLAY_INTERVAL=5` controls the
 periodic full accepted-tape sweep.
 
-Input files are copied to a content-addressed `.harness/inputs/` location and recorded in
-`.harness/task_inputs.json` with SHA-256, media type, and size. Supported image inputs are
+Input files are copied to `.harness/inputs/` and, only when inputs exist, indexed in a
+compact `.harness/task_inputs.json` with media type, size, and staged relative path. The
+Harness does not persist input hashes or original absolute paths. Supported image inputs are
 PNG, JPEG, WebP, and GIF (20 MiB each); bounded text/source inputs include Markdown,
 JSON/JSONL/YAML/CSV, HTML/CSS, and common JavaScript/TypeScript component files (2 MiB
 each, 50 MiB total). Images are actual model message blocks, not merely filenames.
@@ -366,11 +420,8 @@ real repair round, `.harness/minimality_round_N_repair.json`. The certificate ru
 the planner's executable action contract and the DOM/ARIA frame against patch
 subsets. `non_minimal` becomes a repair signal; `invalid_contract` and
 `inconclusive` are evaluation problems and must not be mislabeled as product bugs.
-The full design rationale, 52-paper review, and calibration results are in
-[`docs/harness_research_and_architecture_20260811.md`](docs/harness_research_and_architecture_20260811.md).
-The read-only physical-machine audit of the six-task 0805 release, its 40 Edit
-types / 11 Repair types, observed cost distribution, and remaining parity gaps is in
-[`docs/0805_harness_capability_audit_20260813.md`](docs/0805_harness_capability_audit_20260813.md).
+The current Product Session, validation, recovery, and six-task export contract is in
+[`docs/synthesis/pipeline.md`](docs/synthesis/pipeline.md).
 
 The generator stop gate also reconciles the committed code diff against successful
 mutations in the minimal-path ledger. This catches indirect changes made by a build tool
@@ -466,6 +517,37 @@ Rerunning skips IDs whose latest status is `ok`; failed and timed-out cases rema
 history and are retried. Use `--resume-harness` to continue partial checkpoints reported
 as `incomplete`. A seed pair is optional, but when used both the source frontend and its
 verification evidence are required.
+
+For one Edit, keep using the top-level `prompt`. For an ordered Edit chain, use
+an inline `edits` list or point `edit_sequence` at a JSON file containing that
+list:
+
+```json
+{"id":"catalog-chain","task_mode":"edit","seed_frontend":"../seeds/catalog","seed_evaluation":"../evidence/catalog.json","edits":[{"id":"q1","instruction":"Add a type filter."},{"id":"q2","instruction":"Add an addressable detail view."}]}
+```
+
+Current v5 sequence files can be referenced through `edit_sequence` with a verified Seed binding.
+Raw sequence/step metadata is retained; version order, backward dependencies and producer-state
+references are validated. Host-state requires/produces and acceptance/preserve reach planning,
+implementation and semantic review; donor provenance stays internal. Relative inputs resolve
+against the sequence file. Changed metadata requires a new run ID/directory when resuming.
+
+The chain is not collapsed into one generation call. Step `q1` is independently
+implemented and accepted before its target is copied as the source of `q2`.
+Both a standalone accepted Edit and every accepted chain step export
+`ground_truth.patch` plus source/target commit and
+tree hashes in the results record; a failed step stops the chain, so later diffs
+cannot be attributed to the wrong instruction.
+
+When typed browser evidence is complete, `EVALUATOR_EVIDENCE_ROUTE=typed` does
+not replay it through a long browser-tool conversation. Behavior-only Edits can
+take the deterministic pass route; otherwise one compact semantic call checks
+instruction coverage from the bounded baseline-to-candidate diff (at most 24K
+characters) plus the executed action evidence. It receives no tools and cannot
+reread the repository or reopen Chromium. If visual evidence is required, the
+Harness then captures it independently and makes one dedicated vision call. A
+observed valid browser or scope failure still short-circuits before either paid
+evaluator call.
 
 Create a folderized human review view only after the strict exporter accepts records:
 
@@ -616,11 +698,14 @@ Given `--workdir ./e2e-test-1`, the harness writes:
 - `./e2e-test-1/.harness/visual_round_N_*.png`: screenshots captured for the vision scorer
 - `./e2e-test-1/.harness/harness_state.json`: resume checkpoint
 - `./e2e-test-1/.harness/edit_task_contract.json`: explicit Edit baseline and route upper bound
+- `./e2e-test-1/.harness/edit_risk_tests.json`: source/Edit-only scoring over all 11 WebCompass repair risks and the bounded selected subset
+- `./e2e-test-1/.harness/hidden_oracle_checks.json`: hidden executable risk checks plus any user-supplied hidden checks
+- `./e2e-test-1/.harness/hidden_oracle_evidence_round_N.json`: real-browser results used to accept the Edit or create a typed natural Repair
 - `./e2e-test-1/.harness/edit_card.json`: one-Sprint Edit delta, requirement relations, impact tags, targets, conflicts, and visual policy
 - `./e2e-test-1/.harness/regression_selection_round_N.json`: impacted historical checks, protected-route sentinels, and selection reasons
 - `./e2e-test-1/.harness/repair_packet_round_N.json`: exact failed evidence and bounded next-Repair scope
-- `./e2e-test-1/.harness/task_inputs.json`: typed input manifest with hashes and staged paths
-- `./e2e-test-1/.harness/inputs/`: content-addressed copies of user task inputs
+- `./e2e-test-1/.harness/task_inputs.json`: compact type/size/path index, created only when task inputs exist
+- `./e2e-test-1/.harness/inputs/`: staged copies of user task inputs
 - `./e2e-test-1/.harness/logs/frontend_round_N.log`: frontend runtime logs
 - `./e2e-test-1/.harness/traces/*.jsonl`: SDK traces for each agent invocation
 
@@ -638,8 +723,8 @@ It grades across four criteria:
 
 Each round routes evidence as follows:
 
-1. Harness-owned Playwright executes typed interaction plus DOM/text/property/attribute/ARIA/focus/storage/console/URL assertions, the semantic fragment guard, and the selected accepted-tape regression slice.
-2. Any reproduced deterministic failure immediately becomes a zero-cost structured grade and Repair packet; the paid semantic evaluator is skipped.
+1. Harness-owned Playwright executes typed interaction plus DOM/text/property/attribute/ARIA/focus/storage/console/URL assertions, the semantic fragment guard, and the selected accepted-tape regression slice. The source-blind Planner receives bounded public output selectors, so filtering and aggregation checks can assert values instead of only container visibility.
+2. Any observed failure from a valid deterministic test immediately becomes a zero-cost structured grade and Repair packet; the paid semantic evaluator is skipped.
 3. When deterministic gates pass, the semantic evaluator can grade remaining product criteria. Screenshot capture and the vision scorer run only when the Edit card requires visual evidence, a conditional check has a visual category, or the task contains image input.
 
 The harness merges the applicable evidence into `grade_round_N.json`, accepts immediately
@@ -769,8 +854,6 @@ uv run python scripts/validate_webcompass_edit_matrix.py
 The matrix keeps accepted, rejected candidate, and infrastructure-error outcomes
 separate. It also exercises protected-route sentinels, target-named shared-state
 additions, computed-style evidence, and a real counterfactual `non_minimal` certificate.
-See [`docs/edit_harness_external_ideas_and_real_matrix_20260828.md`](docs/edit_harness_external_ideas_and_real_matrix_20260828.md)
-for the dated evidence and remaining gaps.
 
 Run the one-case real WebCompass full-source-vs-short-context comparison:
 
@@ -781,9 +864,36 @@ Run the one-case real WebCompass full-source-vs-short-context comparison:
 The runner performs a cache precheck unless explicitly skipped, makes no paid automatic
 request retries, appends one result per arm, supports reusing completed bare/Harness arms,
 and validates both outputs with the same implementation-agnostic DOM interaction contract.
-See [`docs/webcompass_atomic_edit_ab_20260828.md`](docs/webcompass_atomic_edit_ab_20260828.md)
-for the calibrated case, token/cost boundary, and preserved failure evidence.
+
+Run the real one-HTML/hash-router to two-HTML Edit case with Qwen:
+
+```bash
+./scripts/run_single_to_multipage_qwen.sh
+```
+
+The runner first verifies the accepted source's Dashboard filtering and Settings save
+behavior in Chromium, confirms that the two declared pages are only hash routes over one
+physical HTML file, then requests `/` and `/settings.html` as the Edit authorization
+ceiling. Acceptance requires two physical HTML files, direct `/settings.html` loading,
+physical-link navigation, preserved filter/preferences state, and typed DOM/storage/URL
+checks. It allows one Edit build/evaluate round and never retries a failed paid request.
+
+For a preserved run, `--revalidate-run <run-dir>` repeats only local Harness and browser
+evaluation; it makes no Planner or Generator request. `--resume-run <run-dir>` may replay
+an exact model-authored patch that was deferred solely by the post-mutation validation
+barrier, but another paid Generator request stays disabled unless the caller explicitly
+sets `ALLOW_PAID_RESUME_CALL=1` after authorizing that request.
+
+Atomic Edit planning is query-grounded: Planner-authored selectors and storage keys must
+occur in the instruction or an accepted obligation. The Planner cannot invent a
+`data-testid` or localStorage key and then force product code to satisfy its own test.
+Source-specific interaction checks live in a Harness-owned hidden-oracle artifact that is
+used for acceptance and counterfactual minimality but never shown to the Generator. For a
+small multi-file Edit, existing local source windows plus planned new files are handled by
+one JSON patch response, avoiding a tool loop that repeatedly rereads the same files.
 
 ## License
 
 [MIT License](LICENSE).
+
+Product Session六类出口：`export_trajectory_dataset.py --session ... --output-jsonl ...`默认同时生成`dataset/six_tasks/dataset_index.json`，可用`--six-output-dir`指定目录。保留原子Edit及全部4–12步连续窗口、每步Text/Image Generate和有效Text/Image Repair。读取索引中的分片路径；images相对出口根目录。截图和资源绑定Git版本，恢复复用缓存。`--merge-six-outputs <目录...> --output-jsonl <批索引.json>`汇总跨Session分布权重；批入口自动调用。自然Repair按独立问题计数，训练输入隐藏诊断，只公开官方11类定义和N。

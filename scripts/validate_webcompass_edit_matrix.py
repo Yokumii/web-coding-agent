@@ -398,7 +398,7 @@ def parser() -> argparse.ArgumentParser:
         "--dataset",
         type=Path,
         default=repo.parent
-        / "WebCoding_Data/output/0805_supplement_release_cache/text-edit.jsonl.gz",
+        / "output/0805_supplement_release_cache/text-edit.jsonl.gz",
     )
     value.add_argument(
         "--output-root", type=Path, default=repo / "logs/edit_matrix_20260828"

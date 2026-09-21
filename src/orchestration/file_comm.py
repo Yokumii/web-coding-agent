@@ -266,6 +266,9 @@ class FileComm:
         self._path("edit_task_contract.json").unlink(missing_ok=True)
         self._path("edit_card.json").unlink(missing_ok=True)
         self._path("atomic_edit_plan.json").unlink(missing_ok=True)
+        self._path("preimplementation_validation.json").unlink(missing_ok=True)
+        self._path("edit_risk_tests.json").unlink(missing_ok=True)
+        self._path("hidden_oracle_checks.json").unlink(missing_ok=True)
         self._unlink_matching(
             *_ROUND_TEXT_PATTERNS,
             *_ROUND_IMAGE_PATTERNS,

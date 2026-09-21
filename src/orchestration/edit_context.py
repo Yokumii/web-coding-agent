@@ -7,10 +7,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from src.orchestration.minimal_path_guidance import CODE_EXTENSIONS
+from src.orchestration.minimal_path_guidance import CODE_EXTENSIONS, STYLE_EXTENSIONS
 
 
-EDIT_CONTEXT_VERSION = "edit-context-v1"
+EDIT_CONTEXT_VERSION = "edit-context-v2"
+SUPPORTED_EDIT_CONTEXT_VERSIONS = {"edit-context-v1", EDIT_CONTEXT_VERSION}
 _OUTLINE_LINE = re.compile(
     r"<(?:main|section|article|header|footer|nav|form|h[1-6])\b|"
     r"\b(?:id|data-testid|data-page)=|"
@@ -46,6 +47,104 @@ def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return [(start, end) for start, end in merged]
 
 
+def _javascript_related_function_ranges(
+    lines: list[str], focus_lines: list[int]
+) -> list[tuple[int, int]]:
+    """Return hotspot functions plus a bounded two-hop reference graph.
+
+    Fixed line windows can cut out a tiny router function located between two
+    hotspots. A bounded top-level function graph keeps the behavioral path
+    complete without exposing the whole file.
+    """
+    declarations = [
+        (index, match.group(1))
+        for index, line in enumerate(lines, start=1)
+        if (
+            match := re.match(
+                r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
+                line,
+            )
+        )
+    ]
+    if not declarations:
+        return []
+    functions: dict[str, tuple[int, int, str]] = {}
+    for position, (start, name) in enumerate(declarations):
+        end = (
+            declarations[position + 1][0] - 1
+            if position + 1 < len(declarations)
+            else len(lines)
+        )
+        functions[name] = (start, end, "".join(lines[start - 1 : end]))
+    selected = {
+        name
+        for name, (start, end, _body) in functions.items()
+        if any(start <= line <= end for line in focus_lines)
+    }
+    if not selected:
+        return []
+    references = {
+        name: {
+            target
+            for target in functions
+            if target != name and re.search(rf"\b{re.escape(target)}\b", body)
+        }
+        for name, (_start, _end, body) in functions.items()
+    }
+    related = set(selected)
+    frontier = set(selected)
+    for _ in range(2):
+        adjacent = {
+            target
+            for name in frontier
+            for target in references.get(name, set())
+        }
+        adjacent.update(
+            caller
+            for caller, targets in references.items()
+            if targets & frontier
+        )
+        frontier = adjacent - related
+        related.update(frontier)
+        if not frontier:
+            break
+    # Load/save pairs often share storage semantics without calling each other.
+    # Once one exact side is selected, its sibling is part of the same minimal
+    # persistence unit.
+    for name in list(related):
+        pair = re.fullmatch(r"(load|save)([A-Z_$][\w$]*)", name)
+        if pair is None:
+            continue
+        counterpart = ("save" if pair.group(1) == "load" else "load") + pair.group(2)
+        if counterpart in functions:
+            related.add(counterpart)
+    return [(functions[name][0], functions[name][1]) for name in related]
+
+
+def _javascript_complete_range(
+    lines: list[str], start: int, end: int
+) -> tuple[int, int]:
+    """Expand a selected JavaScript range to complete top-level functions."""
+    declarations = [
+        index
+        for index, line in enumerate(lines, start=1)
+        if re.match(
+            r"^\s*(?:export\s+)?(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(",
+            line,
+        )
+    ]
+    for position, function_start in enumerate(declarations):
+        function_end = (
+            declarations[position + 1] - 1
+            if position + 1 < len(declarations)
+            else len(lines)
+        )
+        if function_start <= end and function_end >= start:
+            start = min(start, function_start)
+            end = max(end, function_end)
+    return start, end
+
+
 def _bounded_window(
     lines: list[str], *, start: int, end: int, focus: int, max_chars: int
 ) -> tuple[int, int, str]:
@@ -78,8 +177,8 @@ def ensure_edit_context(
     harness_dir: Path,
     plan: dict[str, Any],
     round_num: int,
-    max_total_chars: int = 12_000,
-    max_file_chars: int = 6_000,
+    max_total_chars: int = 18_000,
+    max_file_chars: int = 12_000,
     context_lines: int = 18,
     source_anchors: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -92,6 +191,24 @@ def ensure_edit_context(
         if isinstance(item, dict) and item.get("path")
     }
     initial_paths = [str(item) for item in cone.get("initial_paths") or []]
+    local_paths = [str(item) for item in cone.get("local_paths") or []]
+    requested_roles = {
+        str(item)
+        for item in (plan.get("target_contract") or {}).get(
+            "requested_source_roles", []
+        )
+    }
+    selected_paths = list(dict.fromkeys(initial_paths + local_paths))
+    if "style" not in requested_roles:
+        # Behavior-only edits need markup and script context, but loading every
+        # connected stylesheet spends tokens and invites gratuitous visual churn.
+        # A typed style failure can still unlock that dependency on a later round.
+        selected_paths = [
+            relative
+            for relative in selected_paths
+            if Path(relative).suffix.lower() not in STYLE_EXTENSIONS
+            or relative in initial_paths
+        ]
     source_anchors = [str(item) for item in source_anchors or [] if str(item).strip()]
     all_files = _source_files(workdir)
     full_source_chars = sum(
@@ -102,11 +219,12 @@ def ensure_edit_context(
     anchored_paths: set[str] = set()
     remaining = max(1, max_total_chars)
     outline_remaining = max(256, min(4_000, max_total_chars // 3))
-    for relative in initial_paths:
+    for relative in selected_paths:
         source = workdir / relative
         if not source.is_file() or remaining <= 0:
             continue
         content = source.read_text(encoding="utf-8", errors="replace")
+        file_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
         lines = content.splitlines(keepends=True)
         candidate_outline_entries = [
             {"line": index, "content": line.rstrip("\r\n")}
@@ -145,7 +263,23 @@ def ensure_edit_context(
                     (max(1, line - context_lines), min(len(lines), line + context_lines))
                     for line in line_numbers[:4]
                 ]
+                + (
+                    _javascript_related_function_ranges(lines, line_numbers[:4])
+                    if source.suffix.lower() in {
+                        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"
+                    }
+                    else []
+                )
             )
+            if source.suffix.lower() in {
+                ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"
+            }:
+                ranges = _merge_ranges(
+                    [
+                        _javascript_complete_range(lines, start, end)
+                        for start, end in ranges
+                    ]
+                )
         used_for_file = 0
         for start, end in ranges:
             snippet = "".join(lines[start - 1 : end])
@@ -164,6 +298,26 @@ def ensure_edit_context(
                     focus=focus,
                     max_chars=allowed,
                 )
+                if source.suffix.lower() in {
+                    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"
+                }:
+                    closed_start, closed_end = _javascript_complete_range(
+                        lines, start, end
+                    )
+                    closed_snippet = "".join(lines[closed_start - 1 : closed_end])
+                    # A small structural-closure overage is cheaper than asking
+                    # the model to repair syntax created by an insertion at a
+                    # truncated function boundary. The overall context budget
+                    # remains hard, and the allowance is capped.
+                    if (
+                        len(closed_snippet) <= remaining
+                        and len(closed_snippet) <= allowed + 2_000
+                    ):
+                        start, end, snippet = (
+                            closed_start,
+                            closed_end,
+                            closed_snippet,
+                        )
             if not snippet:
                 continue
             windows.append(
@@ -171,7 +325,12 @@ def ensure_edit_context(
                     "path": relative,
                     "start_line": start,
                     "end_line": end,
+                    "file_sha256": file_sha256,
                     "sha256": hashlib.sha256(snippet.encode("utf-8")).hexdigest(),
+                    "slice_id": (
+                        f"{relative}:{start}-{end}:"
+                        + hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:12]
+                    ),
                     "content": snippet,
                 }
             )
@@ -220,7 +379,10 @@ def read_edit_context(harness_dir: Path, round_num: int) -> dict[str, Any] | Non
     if not path.is_file():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != EDIT_CONTEXT_VERSION:
+    # v2 adds bounded JavaScript closure metadata but does not change the
+    # renderable window/outline contract. Keeping v1 readable lets an
+    # interrupted Edit or Repair resume without paying to rebuild context.
+    if payload.get("schema_version") not in SUPPORTED_EDIT_CONTEXT_VERSIONS:
         return None
     return payload
 
@@ -230,9 +392,19 @@ def render_edit_context(payload: dict[str, Any] | None) -> str:
         return ""
     blocks = []
     for item in payload.get("source_windows") or []:
+        numbered_content = "".join(
+            f"{line_number:6d} | {line}"
+            for line_number, line in enumerate(
+                str(item["content"]).splitlines(keepends=True),
+                start=int(item["start_line"]),
+            )
+        )
         blocks.append(
-            f"### {item['path']} lines {item['start_line']}-{item['end_line']}\n"
-            f"```\n{item['content']}\n```"
+            f"### {item['path']} lines {item['start_line']}-{item['end_line']} "
+            f"slice_id={item.get('slice_id', 'legacy')} "
+            f"file_sha256={item.get('file_sha256', 'legacy')}\n"
+            "The `NNNN | ` prefix is display-only and is not part of the source bytes.\n"
+            f"```\n{numbered_content}\n```"
         )
     rendered_outline_paths = set(payload.get("rendered_outline_paths") or [])
     for outline in payload.get("source_outlines") or []:
@@ -256,6 +428,7 @@ def render_edit_context(payload: dict[str, Any] | None) -> str:
 
 __all__ = [
     "EDIT_CONTEXT_VERSION",
+    "SUPPORTED_EDIT_CONTEXT_VERSIONS",
     "edit_context_name",
     "ensure_edit_context",
     "read_edit_context",

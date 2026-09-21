@@ -1,27 +1,41 @@
 from __future__ import annotations
 
+import json
+import hashlib
 from pathlib import Path
 
 import pytest
 from claude_agent_sdk.types import ResultMessage
 
 from src.agents.generator import (
+    _MAX_ATOMIC_SEMANTIC_ATTEMPTS,
     _control_topology_invariants,
     _atomic_executor_eligible,
     _build_generator_prompt,
     _checkpoint_interrupted_model_work,
+    _recover_deferred_model_patches,
     _describe_failures,
+    _declared_source_functions,
     _is_scope_contract_only_repair,
     _is_harness_checkpoint_for_round,
     _normalize_atomic_patch_response,
+    _normalize_atomic_new_files,
+    _atomic_new_path_allowed,
+    _atomic_transaction_sort_key,
+    _normalize_atomic_operations,
+    _apply_sha_line_operations,
     _render_control_topology_directives,
     _render_failed_action_directives,
+    _recent_repair_runtime_errors,
     _validate_generator_commits,
+    _validate_javascript_syntax,
     _validate_no_external_runtime_dependencies,
     _validate_minimal_path_final_diff,
     _validate_repair_scope,
     _validate_generator_runnable_files,
     _trace_confirms_commit,
+    _last_replayable_atomic_candidate,
+    _unreferenced_near_duplicate_functions,
     _trace_has_successful_validation,
     _trace_written_frontend_paths,
     run_generator,
@@ -36,6 +50,35 @@ from src.agents._shared import expose_local_claude_skills
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_atomic_edit_generation_has_no_internal_candidate_retry():
+    assert _MAX_ATOMIC_SEMANTIC_ATTEMPTS == 1
+
+
+def test_unplanned_new_path_only_blocks_when_minimality_is_enabled():
+    relaxed = HarnessConfig(minimality_guard_enabled=False)
+    strict = HarnessConfig(minimality_guard_enabled=True)
+
+    assert _atomic_new_path_allowed(relaxed, "frontend/archive.html", set()) is True
+    assert _atomic_new_path_allowed(strict, "frontend/archive.html", set()) is False
+    assert _atomic_new_path_allowed(
+        strict, "frontend/archive.html", {"frontend/archive.html"}
+    ) is True
+
+
+def test_atomic_copy_runs_before_mutating_its_source():
+    transactions = [
+        ("line_edits", "frontend/gallery.html", []),
+        ("copy_from", "frontend/scrapbook.html", {"source":"frontend/gallery.html"}),
+    ]
+    transactions.sort(
+        key=lambda item: _atomic_transaction_sort_key(
+            item, {"frontend/gallery.html"}
+        )
+    )
+
+    assert [item[0] for item in transactions] == ["copy_from", "line_edits"]
 
 
 def _write_generator_context(file_comm: FileComm) -> None:
@@ -95,6 +138,58 @@ def test_trace_confirms_only_the_exact_recorded_commit(tmp_path: Path):
     assert _trace_confirms_commit(trace, "abc1234def567", "feat(form): validate contact form")
     assert not _trace_confirms_commit(trace, "abc1234def567", "feat(form): unrelated")
     assert not _trace_confirms_commit(trace, "def9876", "feat(form): validate contact form")
+
+
+def test_javascript_syntax_check_rejects_broken_esm_js_without_package_type(tmp_path: Path):
+    (tmp_path / "app.js").write_text(
+        "import { value } from './data.js';\nconst state = {};\n};\n"
+    )
+
+    ok, output = _validate_javascript_syntax(tmp_path, "app.js")
+
+    assert ok is False
+    assert "SyntaxError" in output
+
+
+def test_atomic_rejection_feedback_explains_duplicate_declaration_boundary():
+    from src.agents.generator import _atomic_rejection_feedback
+
+    feedback = _atomic_rejection_feedback(
+        RuntimeError("SyntaxError: Identifier 'saveState' has already been declared")
+    )
+
+    assert "multiple saveState declarations in one scope" in feedback
+    assert "deleting a closing brace" in feedback
+    assert "complete original boundary" in feedback
+
+
+def test_last_replayable_atomic_candidate_requires_a_later_local_rejection(tmp_path: Path):
+    trace = tmp_path / "generator.jsonl"
+    trace.write_text(
+        '\n'.join(
+            [
+                json.dumps({"event": "assistant_response", "content": '{"operations":[1]}'}),
+                json.dumps({"event": "run_error", "error": "old guard rejected"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert _last_replayable_atomic_candidate(trace) == '{"operations":[1]}'
+    with trace.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "event": "tool",
+                    "name": "run_command",
+                    "ok": True,
+                    "output": "committed",
+                }
+            )
+            + "\n"
+        )
+    assert _last_replayable_atomic_candidate(trace) == ""
 
 
 def test_final_diff_guard_rejects_indirect_protected_page_change(tmp_path: Path):
@@ -319,6 +414,177 @@ def test_interrupted_checkpoint_requires_trace_recorded_validation(tmp_path: Pat
 
     assert _checkpoint_interrupted_model_work(frontend, file_comm, workdir, 1, "generate") is None
     assert subprocess.run(["git", "status", "--porcelain"], cwd=frontend, text=True, capture_output=True, check=True).stdout == " M main.js\n"
+
+
+def test_paid_resume_calls_are_disabled_by_default():
+    assert HarnessConfig().allow_paid_resume_call is False
+
+
+def test_recovery_replays_only_model_patch_deferred_by_validation_gate(
+    tmp_path: Path,
+):
+    import json
+    import subprocess
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True
+    )
+    (frontend / "app.js").write_text("const route = 'hash';\n", encoding="utf-8")
+    (frontend / "index.html").write_text(
+        '<a href="#/settings">Settings</a>\n', encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "chore: baseline"],
+        cwd=frontend, check=True, capture_output=True,
+    )
+    (frontend / "app.js").write_text("const route = 'physical';\n", encoding="utf-8")
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.dir.mkdir(exist_ok=True)
+    (file_comm.dir / "edit_scope_round_1.json").write_text(
+        json.dumps({"allowed_root_keys": [], "allow_new_roots": True}),
+        encoding="utf-8",
+    )
+    (file_comm.dir / "edit_context_round_1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "edit-context-v1",
+                "source_windows": [
+                    {"path": "frontend/app.js", "content": "const route = 'hash';\n"},
+                    {
+                        "path": "frontend/index.html",
+                        "content": '<a href="#/settings">Settings</a>\n',
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (file_comm.dir / "minimal_path_plan_round_1.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "minimal-path-plan-v3",
+                "round": 1,
+                "source_change_cone": {
+                    "initial_paths": ["frontend/app.js"],
+                    "local_paths": ["frontend/app.js", "frontend/index.html"],
+                    "dependency_paths": [],
+                    "planned_new_paths": [],
+                    "protected_paths": [],
+                    "dependency_edges": [
+                        {"from": "frontend/app.js", "to": "frontend/index.html"}
+                    ],
+                    "guarded_shared_regions": [],
+                },
+                "route_scope": {
+                    "cross_route_shared_paths": [],
+                    "off_target_paths": [],
+                },
+                "budgets": {"max_patch_lines": 20, "max_touched_files": 2},
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace = file_comm.dir / "traces" / "generator_round_1.jsonl"
+    trace.parent.mkdir(parents=True)
+    deferred_args = {
+        "path": "frontend/index.html",
+        "old_text": '<a href="#/settings">Settings</a>',
+        "new_text": '<a href="/settings.html">Settings</a>',
+    }
+    trace.write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "run_start", "model": "qwen-test"}),
+                json.dumps(
+                    {
+                        "event": "assistant",
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "apply_patch",
+                                        "arguments": json.dumps(
+                                            {
+                                                "path": "frontend/app.js",
+                                                "old_text": "const route = 'hash';",
+                                                "new_text": "const route = 'physical';",
+                                            }
+                                        ),
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {"event": "tool", "name": "apply_patch", "ok": True, "output": "patched"}
+                ),
+                json.dumps(
+                    {
+                        "event": "assistant",
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "apply_patch",
+                                        "arguments": json.dumps(deferred_args),
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "tool",
+                        "name": "apply_patch",
+                        "ok": False,
+                        "output": (
+                            "A post-mutation validation attempt is required before the "
+                            "harness widens from frontend/app.js to its dependency "
+                            "frontend/index.html."
+                        ),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "usage",
+                        "cumulative_usage": {"input_tokens": 100, "output_tokens": 20},
+                        "estimated_cost_usd": 0.001,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    recovered = _recover_deferred_model_patches(
+        frontend, file_comm, tmp_path, 1
+    )
+    commit = _checkpoint_interrupted_model_work(
+        frontend, file_comm, tmp_path, 1, "generate"
+    )
+
+    assert recovered == {"index.html"}
+    assert '<a href="/settings.html">' in (frontend / "index.html").read_text()
+    assert commit == subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=frontend, check=True,
+        text=True, capture_output=True,
+    ).stdout.strip()
+    recovery_events = [
+        json.loads(line)
+        for line in trace.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("event") == "harness_recovery_patch"
+    ]
+    assert recovery_events[0]["path"] == "frontend/index.html"
 
 
 def test_interrupted_root_generate_checkpoints_trace_written_untracked_files(tmp_path: Path):
@@ -765,6 +1031,573 @@ def test_atomic_executor_normalizes_existing_file_exact_patches():
     ]
 
 
+def test_atomic_executor_normalizes_planned_new_files():
+    assert _normalize_atomic_new_files(
+        {
+            "new_files": [
+                {
+                    "path": "settings.html",
+                    "content": "<!doctype html>\n<title>Settings</title>\n",
+                }
+            ]
+        }
+    ) == [
+        {
+            "path": "frontend/settings.html",
+            "content": "<!doctype html>\n<title>Settings</title>\n",
+        }
+    ]
+
+
+def test_atomic_exact_patch_operation_preserves_literal_replacements():
+    payload = {'operations': [{'op': 'patches', 'path': 'page.html',
+                              'old_text': '<h2>Before</h2>', 'new_text': '<h2>After</h2>'}]}
+    assert _normalize_atomic_operations(payload) == []
+    assert _normalize_atomic_patch_response(payload) == [
+        {'path': 'frontend/page.html', 'old_text': '<h2>Before</h2>', 'new_text': '<h2>After</h2>'}]
+    payload['operations'].append({'op': 'invented_action'})
+    with pytest.raises(ValueError, match='unsupported atomic operation'):
+        _normalize_atomic_operations(payload)
+
+
+def test_complete_unapplied_response_is_replayed_without_another_model_call(tmp_path):
+    trace = tmp_path/'trace.jsonl'
+    raw = '{"operations":[{"op":"patches"}]}'
+    events = [{'event': 'assistant_response', 'content': raw}, {'event': 'usage', 'request_usage': {}}]
+    trace.write_text(''.join(json.dumps(item)+'\n' for item in events))
+    assert _last_replayable_atomic_candidate(trace) == raw
+    events.append({'event': 'tool', 'name': 'apply_patch', 'ok': True})
+    trace.write_text(''.join(json.dumps(item)+'\n' for item in events))
+    assert _last_replayable_atomic_candidate(trace) == ''
+
+
+def test_atomic_executor_applies_compact_sha_line_protocol_without_old_text():
+    source = "alpha\nbeta\ngamma\n"
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operations = _normalize_atomic_operations({
+        "operations": [
+            {
+                "op": "replace_lines", "path": "main.js", "file_sha256": digest,
+                "start_line": 2, "end_line": 2, "replacement": "BETA\n",
+            },
+            {
+                "op": "insert_after", "path": "main.js", "file_sha256": digest,
+                "after_line": 3, "content": "delta\n",
+            },
+        ]
+    })
+
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        operations,
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert updated == "alpha\nBETA\ngamma\ndelta\n"
+    assert exact_inputs[0]["old_text"] == "beta\n"
+    assert all(item["path"] == "frontend/main.js" for item in exact_inputs)
+
+
+def test_atomic_executor_rejects_html_sibling_inserted_inside_deeper_open_tag():
+    source = (
+        '<section class="cta">\n'
+        '    <div class="links">\n'
+        '        <a href="#">Previous</a>\n'
+        '    </div>\n'
+        '</section>\n'
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operation = {
+        "op": "insert_after",
+        "path": "frontend/index.html",
+        "file_sha256": digest,
+        "after_line": 3,
+        "content": '    <section data-testid="history"></section>',
+    }
+
+    with pytest.raises(ValueError, match="unsafe HTML insertion boundary"):
+        _apply_sha_line_operations(
+            source,
+            [operation],
+            expected_path="frontend/index.html",
+            expected_sha256=digest,
+        )
+
+    operation["after_line"] = 4
+    updated, _ = _apply_sha_line_operations(
+        source,
+        [operation],
+        expected_path="frontend/index.html",
+        expected_sha256=digest,
+    )
+    assert updated.index('data-testid="history"') > updated.index("</div>")
+
+
+def test_atomic_executor_accepts_unindented_body_child():
+    source = '<html>\n<body>\n<footer>Existing footer</footer>\n</body>\n</html>\n'
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operation = {
+        "op": "insert_after", "path": "frontend/index.html",
+        "file_sha256": digest, "after_line": 3,
+        "content": '<section id="workspace">New workspace</section>',
+    }
+    updated, _ = _apply_sha_line_operations(
+        source, [operation], expected_path="frontend/index.html", expected_sha256=digest,
+    )
+    assert '<footer>Existing footer</footer>\n<section id="workspace">New workspace</section>\n</body>' in updated
+
+
+def test_atomic_executor_accepts_unindented_child_inside_unindented_main():
+    source = (
+        '<main data-testid="workspace">\n'
+        '<section data-testid="board"></section>\n'
+        '</main>\n'
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operation = {
+        "op": "insert_after", "path": "frontend/index.html",
+        "file_sha256": digest, "after_line": 2,
+        "content": '<section data-testid="intake"></section>',
+    }
+    updated, _ = _apply_sha_line_operations(
+        source, [operation], expected_path="frontend/index.html", expected_sha256=digest,
+    )
+    assert '<section data-testid="board"></section>\n<section data-testid="intake"></section>\n</main>' in updated
+
+
+def test_atomic_executor_rejects_replacement_that_unbalances_html():
+    source = (
+        '<section class="cta">\n'
+        '    <div class="links">\n'
+        '        <a href="#">Alternative</a>\n'
+        '    </div>\n'
+        '</section>\n'
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operation = {
+        "op": "replace_lines",
+        "path": "frontend/index.html",
+        "file_sha256": digest,
+        "start_line": 3,
+        "end_line": 3,
+        "replacement": (
+            '</section>\n'
+            '<section data-testid="history"></section>\n'
+            '</section>'
+        ),
+    }
+
+    with pytest.raises(ValueError, match="unbalanced HTML edit"):
+        _apply_sha_line_operations(
+            source,
+            [operation],
+            expected_path="frontend/index.html",
+            expected_sha256=digest,
+        )
+
+
+def test_atomic_executor_rebases_one_novel_html_subtree_without_replacing_context():
+    source = (
+        '<main>\n'
+        '    <section class="card">\n'
+        '        <div class="links">\n'
+        '            <a href="#">Alternative</a>\n'
+        '        </div>\n'
+        '    </section>\n'
+        '\n'
+        '    <aside class="sidebar">Keep</aside>\n'
+        '</main>\n'
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operation = {
+        "op": "replace_lines",
+        "path": "frontend/index.html",
+        "file_sha256": digest,
+        "start_line": 4,
+        "end_line": 4,
+        "replacement": (
+            '        </div>\n'
+            '    </section>\n\n'
+            '    <!-- HISTORY VIEW -->\n'
+            '    <section data-testid="history">\n'
+            '        <h2 data-testid="history-title">History</h2>\n'
+            '    </section>\n\n'
+            '    <aside class="sidebar">Keep</aside>'
+        ),
+    }
+
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        [operation],
+        expected_path="frontend/index.html",
+        expected_sha256=digest,
+    )
+
+    assert updated.count('data-testid="history"') == 1
+    assert updated.count('data-testid="history-title"') == 1
+    assert updated.count('<!-- HISTORY VIEW -->') == 1
+    assert updated.count('<a href="#">Alternative</a>') == 1
+    assert updated.count('<aside class="sidebar">Keep</aside>') == 1
+    assert updated.index('data-testid="history"') > updated.index('    </section>')
+    assert exact_inputs[0]["old_text"] in source
+
+
+def test_atomic_executor_rebases_section_replacement_to_comment_boundaries():
+    source = (
+        "(function () {\n"
+        "    // ---------- Download state machine ----------\n"
+        "    const button = true;\n"
+        "    if (button) {\n"
+        "        start();\n"
+        "    }\n"
+        "\n"
+        "    // ---------- Sidebar ----------\n"
+        "    keepSidebar();\n"
+        "})();\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    replacement = (
+        "    // ---------- Download state machine and history ----------\n"
+        "    const button = true;\n"
+        "    if (button) {\n"
+        "        start();\n"
+        "        saveHistory();\n"
+        "    }\n"
+        "\n"
+    )
+
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations(
+            {
+                "operations": [
+                    {
+                        "op": "replace_lines",
+                        "path": "main.js",
+                        "file_sha256": digest,
+                        "start_line": 3,
+                        "end_line": 5,
+                        "replacement": replacement,
+                    }
+                ]
+            }
+        ),
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert "saveHistory();" in updated
+    assert updated.count("// ---------- Sidebar ----------") == 1
+    assert exact_inputs[0]["old_text"].startswith(
+        "    // ---------- Download state machine ----------"
+    )
+
+
+def test_atomic_executor_rebases_replacement_to_same_named_function_boundary():
+    source = (
+        "if (ready) {\n"
+        "    function loadHistory() {\n"
+        "        oldRender();\n"
+        "    }\n"
+        "    keepGoing();\n"
+        "}\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations(
+            {
+                "operations": [
+                    {
+                        "op": "replace_lines",
+                        "path": "main.js",
+                        "file_sha256": digest,
+                        "start_line": 3,
+                        "end_line": 3,
+                        "replacement": (
+                            "    function loadHistory() {\n"
+                            "        newRender();\n"
+                            "    }\n"
+                        ),
+                    }
+                ]
+            }
+        ),
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert updated.count("function loadHistory()") == 1
+    assert "newRender();" in updated
+    assert "keepGoing();" in updated
+    assert exact_inputs[0]["old_text"].startswith("    function loadHistory()")
+
+
+def test_atomic_executor_preserves_explicit_range_for_multiple_functions():
+    source = (
+        "function loadState() {\n"
+        "  oldLoad();\n"
+        "}\n"
+        "function saveState() {\n"
+        "  oldSave();\n"
+        "}\n"
+        "keep();\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    replacement = (
+        "function loadState() { newLoad(); }\n"
+        "function saveState() { newSave(); }\n"
+        "function renderHistory() { render(); }\n"
+    )
+
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations({"operations": [{
+            "op": "replace_lines",
+            "path": "main.js",
+            "file_sha256": digest,
+            "start_line": 1,
+            "end_line": 6,
+            "replacement": replacement,
+        }]}),
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert updated.count("function saveState()") == 1
+    assert "function renderHistory()" in updated
+    assert "keep();" in updated
+    assert exact_inputs[0]["_harness_end_line"] == 6
+
+
+def test_atomic_executor_does_not_expand_incomplete_function_prefix():
+    source = (
+        "function renderGallery() {\n"
+        "  items.forEach(item => {\n"
+        "    render(item);\n"
+        "  });\n"
+        "}\n"
+        "keep();\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations(
+            {
+                "operations": [
+                    {
+                        "op": "replace_lines",
+                        "path": "main.js",
+                        "file_sha256": digest,
+                        "start_line": 1,
+                        "end_line": 2,
+                        "replacement": (
+                            "function renderGallery() {\n"
+                            "  filteredItems.forEach(item => {\n"
+                        ),
+                    }
+                ]
+            }
+        ),
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert "    render(item);" in updated
+    assert "keep();" in updated
+    assert exact_inputs[0]["old_text"] == (
+        "function renderGallery() {\n  items.forEach(item => {\n"
+    )
+
+
+def test_atomic_executor_stops_section_rebase_at_lower_indent_comment():
+    source = (
+        "  // Type Filter\n"
+        "  if (filter) {\n"
+        "    oldHandler();\n"
+        "  }\n"
+        "// Start App\n"
+        "document.addEventListener('DOMContentLoaded', init);\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, _exact_inputs = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations(
+            {
+                "operations": [
+                    {
+                        "op": "replace_lines",
+                        "path": "main.js",
+                        "file_sha256": digest,
+                        "start_line": 2,
+                        "end_line": 4,
+                        "replacement": (
+                            "  // Type Filter\n"
+                            "  if (filter) {\n"
+                            "    newHandler();\n"
+                            "  }"
+                        ),
+                    }
+                ]
+            }
+        ),
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert "newHandler();\n  }\n// Start App" in updated
+    assert "document.addEventListener('DOMContentLoaded', init);" in updated
+
+
+def test_atomic_executor_preserves_function_header_for_indented_body_slice():
+    source = (
+        "function setupEventListeners() {\n"
+        "  // Reset Button\n"
+        "  resetBtn.addEventListener('click', () => {\n"
+        "    oldReset();\n"
+        "  });\n"
+        "  keepOtherListener();\n"
+        "}\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations({
+            "operations": [{
+                "op": "replace_lines",
+                "path": "app.js",
+                "file_sha256": digest,
+                "start_line": 1,
+                "end_line": 5,
+                "replacement": (
+                    "  // Reset Button\n"
+                    "  resetBtn.addEventListener('click', () => {\n"
+                    "    newReset();\n"
+                    "  });\n"
+                ),
+            }],
+        }),
+        expected_path="frontend/app.js",
+        expected_sha256=digest,
+    )
+
+    assert updated.startswith("function setupEventListeners() {\n  // Reset Button")
+    assert "newReset();" in updated
+    assert "keepOtherListener();\n}" in updated
+    assert exact_inputs[0]["_harness_start_line"] == 2
+
+
+def test_atomic_executor_does_not_expand_past_included_next_section_header():
+    source = (
+        "// Event Listeners\n"
+        "function setup() {\n"
+        "  old();\n"
+        "}\n"
+        "\n"
+        "// Start App\n"
+        "document.addEventListener('DOMContentLoaded', init);\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, _ = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations({
+            "operations": [{
+                "op": "replace_lines",
+                "path": "app.js",
+                "file_sha256": digest,
+                "start_line": 2,
+                "end_line": 6,
+                "replacement": (
+                    "// Event Listeners\n"
+                    "function setup() {\n"
+                    "  updated();\n"
+                    "}\n"
+                ),
+            }],
+        }),
+        expected_path="frontend/app.js",
+        expected_sha256=digest,
+    )
+
+    assert "updated();" in updated
+    assert "document.addEventListener('DOMContentLoaded', init);" in updated
+
+
+def test_atomic_executor_uses_unique_suffix_for_blank_line_insertion():
+    source = "function one() {\n}\n\nfunction two() {\n}\n"
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, exact_inputs = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations(
+            {
+                "operations": [
+                    {
+                        "op": "insert_after",
+                        "path": "main.js",
+                        "file_sha256": digest,
+                        "after_line": 3,
+                        "content": "const inserted = true;\n",
+                    }
+                ]
+            }
+        ),
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert "\n\nconst inserted = true;\nfunction two" in updated
+    assert source.count(exact_inputs[0]["old_text"]) == 1
+
+
+def test_atomic_executor_rebases_named_function_after_adjacent_outer_brace():
+    source = (
+        "function renderGallery() {\n"
+        "  items.forEach(item => {\n"
+        "    render(item);\n"
+        "  });\n"
+        "}\n"
+        "start();\n"
+    )
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, _ = _apply_sha_line_operations(
+        source,
+        _normalize_atomic_operations({
+            "operations": [{
+                "op": "insert_after",
+                "path": "main.js",
+                "file_sha256": digest,
+                "after_line": 4,
+                "content": "function renderHistory() {\n  return true;\n}\n",
+            }],
+        }),
+        expected_path="frontend/main.js",
+        expected_sha256=digest,
+    )
+
+    assert "  });\n}\nfunction renderHistory()" in updated
+    assert updated.index("function renderHistory") < updated.index("start();")
+
+
+def test_atomic_executor_copy_from_normalizes_nested_line_edits():
+    payload = _normalize_atomic_operations({
+        "operations": [{
+            "op": "copy_from",
+            "source": "index.html",
+            "path": "settings.html",
+            "source_sha256": "abc",
+            "line_edits": [{
+                "op": "replace_lines", "start_line": 3, "end_line": 3,
+                "replacement": "<h1>Settings</h1>\n",
+            }],
+        }]
+    })
+
+    assert payload[0]["source"] == "frontend/index.html"
+    assert payload[0]["path"] == "frontend/settings.html"
+    assert payload[0]["line_edits"][0]["path"] == ""
+
+
 def test_atomic_executor_removes_whitespace_only_lines_from_replacement():
     patches = _normalize_atomic_patch_response(
         {
@@ -857,17 +1690,276 @@ def test_repair_packet_derives_selector_level_handler_instruction():
     assert "Do not only change #target's initial style" in directives
 
 
-def test_atomic_executor_requires_native_runtime_and_no_dependency_widening(
+def test_repair_packet_turns_browser_reference_error_into_scope_directive():
+    checks = [{
+        "id": "deep-link",
+        "actions": [{"action": "assert_visible", "selector": ".summary"}],
+    }]
+    packet = {"failed_checks": [{
+        "check_id": "deep-link",
+        "console_errors": [
+            "renderSummary is not defined",
+            "renderSummary is not defined",
+        ],
+        "steps": [{"action": "assert_visible", "ok": False}],
+    }]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert directives.count("renderSummary is not defined") == 1
+    assert "common enclosing lexical scope" in directives
+    assert "Do not hide the defect with `typeof`" in directives
+    assert "duplicate helper" in directives
+    assert "three-site bridge" in directives
+    assert "assign the existing `renderSummary` function reference" in directives
+    assert "use one `insert_after` operation" in directives
+    assert "do not repeat or replace any closing brace" in directives
+
+
+def test_repair_keeps_deduplicated_runtime_error_across_masking_rounds(
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "repair_packet_round_2.json").write_text(
+        json.dumps({"failed_checks": [{
+            "console_errors": [
+                "renderSummary is not defined",
+                "renderSummary is not defined",
+            ]
+        }]}),
+        encoding="utf-8",
+    )
+    (file_comm.dir / "repair_packet_round_3.json").write_text(
+        json.dumps({"failed_checks": [{"console_errors": []}]}),
+        encoding="utf-8",
+    )
+
+    errors = _recent_repair_runtime_errors(file_comm, before_round=3)
+
+    assert errors == [{
+        "source_round": 2,
+        "error": "renderSummary is not defined",
+    }]
+
+
+def test_repair_packet_derives_exact_scroll_restore_instruction():
+    checks = [{
+        "id": "restore",
+        "actions": [{"action": "assert_scroll", "y": 500}],
+    }]
+    packet = {"failed_checks": [{
+        "check_id": "restore",
+        "steps": [{
+            "action": "assert_scroll",
+            "ok": False,
+            "output": {"actual": 375, "expected": 500},
+        }],
+    }]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "window.scrollY was 375, expected 500" in directives
+    assert "after the prior filter/layout is visible and stable" in directives
+
+
+def test_repair_packet_derives_reload_safe_value_restore_instruction():
+    checks = [{
+        "id": "filter-context",
+        "actions": [
+            {"action": "reload"},
+            {"action": "assert_value", "selector": "#filter", "value": "Document"},
+        ],
+    }]
+    packet = {"failed_checks": [{
+        "check_id": "filter-context",
+        "steps": [
+            {"action": "reload", "ok": True},
+            {
+                "action": "assert_value", "ok": False,
+                "output": {"actual": "All", "expected": "Document"},
+            },
+        ],
+    }]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "#filter had value 'All', expected 'Document'" in directives
+    assert "addressable route" in directives
+
+
+def test_repair_packet_preserves_existing_target_that_disappears_after_reload():
+    selector = "[data-testid='reorder-history-item']"
+    checks = [{"id": "persistence", "actions": [
+        {"action": "click", "selector": "#reset"},
+        {"action": "assert_visible", "selector": selector},
+        {"action": "reload"},
+        {"action": "assert_visible", "selector": selector},
+    ]}]
+    packet = {"failed_checks": [{"check_id": "persistence", "steps": [
+        {"action": "click", "ok": True},
+        {"action": "assert_visible", "ok": True},
+        {"action": "reload", "ok": True},
+        {"action": "assert_visible", "ok": False},
+    ]}]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "was visible before reload and disappeared only after reload" in directives
+    assert "Preserve the existing target markup" in directives
+    assert "do not add a duplicate target or replace the router" in directives
+
+
+def test_repair_context_reports_exact_and_unwired_near_duplicate_functions():
+    context = {"source_windows": [{"content": """
+function handleRoute() { renderReorderHistory(); }
+function handleRouteChange() { renderGallery(); }
+function setupRouter() { window.addEventListener('hashchange', handleRouteChange); }
+function renderGallery() {}
+function renderReorderHistory() {}
+"""}]}
+
+    assert _declared_source_functions(context) == [
+        "handleRoute",
+        "handleRouteChange",
+        "renderGallery",
+        "renderReorderHistory",
+        "setupRouter",
+    ]
+    assert _unreferenced_near_duplicate_functions(context) == [
+        ("handleRoute", "handleRouteChange")
+    ]
+
+
+def test_repair_packet_derives_navigation_instruction_from_failed_wait():
+    checks = [{
+        "id": "gallery",
+        "actions": [
+            {"action": "click", "selector": "a[href='#gallery']"},
+            {"action": "wait_for", "selector": "#gallery-grid"},
+        ],
+    }]
+    packet = {"failed_checks": [{
+        "check_id": "gallery",
+        "steps": [
+            {"action": "click", "ok": True},
+            {"action": "wait_for", "ok": False},
+        ],
+    }]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "after clicking a[href='#gallery'], #gallery-grid never became visible" in directives
+    assert "navigation/state transition" in directives
+
+
+def test_repair_packet_derives_missing_stable_selector_instruction():
+    checks = [{
+        "id": "direct-link",
+        "actions": [{"action": "wait_for", "selector": "[data-testid='driver']"}],
+    }]
+    packet = {"failed_checks": [{
+        "check_id": "direct-link",
+        "steps": [{"action": "wait_for", "ok": False}],
+    }]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "required target [data-testid='driver'] never became visible" in directives
+    assert "do not create a duplicate UI surface" in directives
+
+
+def test_repair_packet_routes_missing_state_class_to_behavior_not_markup():
+    selector = 'a.sidebar-item[data-name="Audio Studio Driver"][class~="highlighted"]'
+    base = 'a.sidebar-item[data-name="Audio Studio Driver"]'
+    checks = [{"id": "deep-link", "actions": [
+        {"action": "set_hash", "value": "#audio-studio-driver"},
+        {"action": "assert_visible", "selector": selector},
+    ]}]
+    packet = {"failed_checks": [{"check_id": "deep-link", "steps": [
+        {"action": "set_hash", "ok": True},
+        {
+            "action": "assert_visible", "ok": False,
+            "visibility_diagnostic": {
+                "matched_count": 0,
+                "base_selector": base,
+                "base_matched_count": 1,
+            },
+        },
+    ]}]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "Repair the event/hash state transition in behavior code" in directives
+    assert "do not add or duplicate the existing DOM item" in directives
+    assert "after setting hash #audio-studio-driver" in directives
+    assert "Attribute selector values are case-sensitive" in directives
+
+
+def test_repair_packet_explains_hidden_ancestor_not_target_style():
+    checks = [{
+        "id": "detail",
+        "actions": [
+            {"action": "click", "selector": ".artifact-card"},
+            {"action": "assert_visible", "selector": "#detail"},
+        ],
+    }]
+    packet = {"failed_checks": [{
+        "check_id": "detail",
+        "steps": [
+            {"action": "click", "ok": True},
+            {
+                "action": "assert_visible",
+                "ok": False,
+                "visibility_diagnostic": {
+                    "matched_count": 1,
+                    "hidden_ancestors": [{
+                        "label": "#view-gallery",
+                        "hidden_reasons": ["display=none", "zero-geometry"],
+                    }],
+                },
+            },
+        ],
+    }]}
+
+    directives = _render_failed_action_directives(packet, checks)
+
+    assert "ancestor #view-gallery is hidden" in directives
+    assert "display=none" in directives
+    assert "changing only the target's own display" in directives
+
+
+def test_atomic_executor_supports_preloaded_multi_file_dependency_and_new_page(
     tmp_path: Path,
 ):
     harness = tmp_path / ".harness"
     harness.mkdir()
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "app.js").write_text("const app = true;", encoding="utf-8")
+    (frontend / "index.html").write_text("<main></main>", encoding="utf-8")
+    (frontend / "unseen.js").write_text("const unseen = true;", encoding="utf-8")
     (harness / "edit_context_round_1.json").write_text(
-        '{"schema_version":"edit-context-v1","source_windows":[]}',
+        json.dumps(
+            {
+                "schema_version": "edit-context-v1",
+                "source_windows": [
+                    {"path": "frontend/app.js", "content": "const app = true;"},
+                    {"path": "frontend/index.html", "content": "<main></main>"},
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     (harness / "minimal_path_plan_round_1.json").write_text(
-        '{"source_change_cone":{"dependency_paths":[],"planned_new_paths":[]}}',
+        json.dumps(
+            {
+                "source_change_cone": {
+                    "local_paths": ["frontend/app.js", "frontend/index.html"],
+                    "dependency_paths": ["frontend/styles.css"],
+                    "planned_new_paths": ["frontend/settings.html"],
+                }
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -876,8 +1968,23 @@ def test_atomic_executor_requires_native_runtime_and_no_dependency_widening(
         workdir=tmp_path,
         round_num=1,
     ) is True
+
+    # Every existing mutation candidate must already be visible in the bounded
+    # context. A planned new file needs no source window.
     (harness / "minimal_path_plan_round_1.json").write_text(
-        '{"source_change_cone":{"dependency_paths":["frontend/app.js"],"planned_new_paths":[]}}',
+        json.dumps(
+            {
+                "source_change_cone": {
+                    "local_paths": [
+                        "frontend/app.js",
+                        "frontend/index.html",
+                        "frontend/unseen.js",
+                    ],
+                    "dependency_paths": [],
+                    "planned_new_paths": ["frontend/settings.html"],
+                }
+            }
+        ),
         encoding="utf-8",
     )
     assert _atomic_executor_eligible(
@@ -1271,7 +2378,13 @@ def test_minimal_path_repair_uses_independent_preloaded_short_context(tmp_path: 
         encoding="utf-8",
     )
     (file_comm.dir / "repair_packet_round_1.json").write_text(
-        json.dumps({"status": "repairable", "failed_checks": ["UI-SAVE"]}),
+        json.dumps({
+            "status": "repairable",
+            "failed_checks": ["UI-SAVE"],
+            "regressions": [
+                "Edit guard failed: Alternative OS changed to Audio Studio Driver"
+            ],
+        }),
         encoding="utf-8",
     )
     (file_comm.dir / "edit_context_round_2.json").write_text(
@@ -1316,6 +2429,7 @@ def test_minimal_path_repair_uses_independent_preloaded_short_context(tmp_path: 
     assert "save.addEventListener" in prompt
     assert "0.7%" in prompt
     assert "Do not reread planning, grade, or shown code" in prompt
+    assert "Alternative OS changed to Audio Studio Driver" in prompt
     assert "### Failed criteria" not in prompt
     assert '"task":' not in prompt
     assert "Required minimal reads:" not in prompt
@@ -1750,3 +2864,49 @@ async def test_generator_includes_design_stage_reads_in_repair_mode(
     assert ".harness/design/layout_contract.json" in captured["prompt"]
     assert ".harness/design/asset_manifest.json" in captured["prompt"]
     assert "The design stage fell back to text-only" in captured["prompt"]
+
+
+def test_partial_source_uses_tool_enabled_generator(tmp_path):
+    harness=tmp_path/".harness"; harness.mkdir()
+    frontend=tmp_path/"frontend"; frontend.mkdir()
+    (frontend/"app.js").write_text("const first = 1;\nfunction render() {}\n")
+    context={"schema_version":"edit-context-v1","source_windows":[{"path":"frontend/app.js","start_line":1,"end_line":1,"content":"const first = 1;\n"}]}
+    (harness/"edit_context_round_1.json").write_text(json.dumps(context))
+    (harness/"minimal_path_plan_round_1.json").write_text(json.dumps({"source_change_cone":{"local_paths":["frontend/app.js"],"initial_paths":["frontend/app.js"]}}))
+    config=HarnessConfig(agent_runtime="openai")
+    assert not _atomic_executor_eligible(config=config,workdir=tmp_path,round_num=1)
+    context["source_windows"].append({"path":"frontend/app.js","start_line":2,"end_line":2,"content":"function render() {}\n"})
+    (harness/"edit_context_round_1.json").write_text(json.dumps(context))
+    assert _atomic_executor_eligible(config=config,workdir=tmp_path,round_num=1)
+
+
+def test_supplied_line_operations_reach_browser_without_html_heuristics():
+    source = '<main>\n<section>content</section>\n</main>\n'
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operation = {"op": "replace_lines", "path": "frontend/index.html",
+                 "file_sha256": digest, "start_line": 2, "end_line": 2,
+                 "replacement": '<section>new content'}
+    updated, _ = _apply_sha_line_operations(
+        source, [operation], expected_path="frontend/index.html",
+        expected_sha256=digest, preserve_operations=True,
+    )
+    assert updated == '<main>\n<section>new content\n</main>\n'
+    with pytest.raises(ValueError, match="SHA mismatch"):
+        _apply_sha_line_operations(source, [operation], expected_path="frontend/index.html",
+                                   expected_sha256="outdated", preserve_operations=True)
+
+
+def test_product_patch_hashes_are_bound_to_supplied_source_revision():
+    source = '<main>Before</main>\n'
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    operations = _normalize_atomic_operations({"operations":[{
+        "op":"replace_lines", "path":"index.html", "file_sha256":"model-typo",
+        "start_line":1, "end_line":1, "replacement":"<main>After</main>"}]},
+        {"frontend/index.html":digest})
+    assert operations[0]["file_sha256"] == digest
+    updated, _ = _apply_sha_line_operations(source, operations, expected_path="frontend/index.html",
+                                            expected_sha256=digest, preserve_operations=True)
+    assert 'After' in updated
+    with pytest.raises(ValueError, match="SHA mismatch"):
+        _apply_sha_line_operations(source + '<footer/>', operations, expected_path="frontend/index.html",
+                                  expected_sha256=digest, preserve_operations=True)

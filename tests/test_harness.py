@@ -62,6 +62,79 @@ def _failing_functionality_criteria() -> dict:
     }
 
 
+def _supplied_atomic_plan() -> dict:
+    return {
+        "schema_version": "atomic-edit-plan-v1",
+        "title": "Add archive",
+        "goal": "Add an archive view.",
+        "source_anchors": [],
+        "deliverables": ["An archive view."],
+        "exit_criteria": ["The archive is visible."],
+        "requirement_changes": [{
+            "requirement_id": "REQ-Q1",
+            "relation": "add",
+            "prior_requirement_ids": [],
+            "rationale": "Add an archive view.",
+        }],
+        "impact_tags": ["product-session-edit"],
+        "unresolved_conflicts": [],
+        "visual_evidence": "not_required",
+        "visual_evidence_reason": "The supplied functional check is sufficient.",
+        "checks": [{
+            "id": "archive-flow",
+            "task": "Open the archive.",
+            "expected_result": "The archive is visible.",
+            "critical": True,
+            "category": "functional",
+            "requirement_id": "REQ-Q1",
+            "impact_tags": ["product-session-edit"],
+            "route": "/",
+            "fixtures": [],
+            "actions": [{
+                "action": "assert_visible",
+                "selector": "[data-testid='archive']",
+            }],
+        }],
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("target_route", ["/", "/archive.html"])
+async def test_supplied_atomic_plan_skips_model_planner(monkeypatch, tmp_path: Path, target_route):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<main>Seed</main>", encoding="utf-8")
+
+    async def unexpected_planner(*args, **kwargs):
+        raise AssertionError("the Harness Planner must not run")
+
+    monkeypatch.setattr("src.orchestration.harness.run_planner_phase", unexpected_planner)
+    await run_harness(
+        "Add an archive view.",
+        tmp_path,
+        HarnessConfig(minimality_guard_enabled=False),
+        task_mode="edit",
+        target_routes=[target_route],
+        atomic_plan=_supplied_atomic_plan(),
+        plan_only=True,
+    )
+
+    file_comm = FileComm(tmp_path / ".harness")
+    assert file_comm.read_state()["last_completed_phase"] == "plan"
+    assert file_comm.read_state()["supplied_atomic_plan"] is True
+    assert file_comm.read_ui_verification_plan()["sprints"][0]["checks"][0]["id"] == "archive-flow"
+
+    await run_harness(
+        "Add an archive view.",
+        tmp_path,
+        HarnessConfig(minimality_guard_enabled=False),
+        task_mode="edit",
+        target_routes=[target_route],
+        resume=True,
+        plan_only=True,
+    )
+
+
 def test_next_round_cost_reserve_requires_both_observed_phases():
     assert _next_round_cost_reserve({"generator_r1": {"cost_usd": 1.2}}) == 0.0
     assert _next_round_cost_reserve({
@@ -185,7 +258,8 @@ async def test_resume_from_build_checkpoint_skips_planner_and_build(monkeypatch,
 
     async def fake_evaluator(*args, **kwargs):
         calls.append(("evaluator", kwargs["round_num"]))
-        return True, {}, 0.3
+        return True, {'round':kwargs['round_num'], 'criteria':_passing_criteria(),
+                      'overall_passed':True, 'mode_recommendation':'complete'}, 0.3
 
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         calls.append(("start_app_stack", round_num))
@@ -240,7 +314,8 @@ async def test_resume_from_evaluate_checkpoint_starts_next_build_round(monkeypat
 
     async def fake_evaluator(*args, **kwargs):
         calls.append(("evaluator", kwargs["round_num"]))
-        return True, {}, 0.3
+        return True, {'round':kwargs['round_num'], 'criteria':_passing_criteria(),
+                      'overall_passed':True, 'mode_recommendation':'complete'}, 0.3
 
     async def fake_start_app_stack(workdir, harness_dir, config, round_num):
         calls.append(("start_app_stack", round_num))
@@ -1856,3 +1931,61 @@ async def test_resume_from_design_checkpoint_skips_planner_and_design(monkeypatc
     )
 
     assert calls == []
+
+
+@pytest.mark.anyio
+async def test_resume_before_first_checkpoint_preserves_chain_and_prior_tapes(monkeypatch, tmp_path):
+    directory = tmp_path / ".harness"
+    directory.mkdir()
+    metadata = {"edit_id":"q2", "requires":[{"source":"q1", "state":"saved collection"}]}
+    contract = {"schema_version":"edit-task-contract-v1", "task_mode":"edit", "requested_target_routes":["/"], "chain_metadata":metadata}
+    (directory/"edit_task_contract.json").write_text(json.dumps(contract))
+    tapes = b'{"id":"prior-behavior"}\n'
+    (directory/"accepted_tapes.jsonl").write_bytes(tapes)
+    monkeypatch.setattr("src.orchestration.harness.recover_trace_proven_planner_checkpoint", lambda *a: None)
+    monkeypatch.setattr("src.orchestration.harness.resolve_task_mode", lambda *a: "edit")
+    def prepare(workdir, *, requested_target_routes, chain_metadata):
+        assert chain_metadata == metadata
+        assert requested_target_routes == ["/"]
+        (directory/"edit_task_contract.json").write_text(json.dumps(contract))
+        return contract
+    async def planner(ctx):
+        assert json.loads((directory/"edit_task_contract.json").read_text())["chain_metadata"] == metadata
+        assert (directory/"accepted_tapes.jsonl").read_bytes() == tapes
+    monkeypatch.setattr("src.orchestration.harness.prepare_edit_task_contract", prepare)
+    monkeypatch.setattr("src.orchestration.harness.run_planner_phase", planner)
+    await run_harness("new edit", tmp_path, HarnessConfig(), resume=True, task_mode="edit", plan_only=True, target_routes=["/"])
+
+
+@pytest.mark.anyio
+async def test_changed_browser_policy_rechecks_last_round_without_second_repair(monkeypatch, tmp_path):
+    from src.orchestration.phases import Verdict
+    frontend = tmp_path/'frontend'
+    frontend.mkdir()
+    (frontend/'index.html').write_text('<main>Seed</main>')
+    config = HarnessConfig(max_rounds=2, edit_max_rounds=2, minimality_guard_enabled=False)
+    await run_harness('Add archive', tmp_path, config, task_mode='edit',
+                      target_routes=['/'], atomic_plan=_supplied_atomic_plan(), plan_only=True)
+    comm = FileComm(tmp_path/'.harness')
+    state = comm.read_state()
+    state.update(last_completed_phase='evaluate_r2', round_num=2, last_verdict='failed_review',
+                 generator_mode='repair', accepted_sprints=[], current_sprint=1,
+                 accepted_sprints_payload={'accepted':[], 'current_target':1, 'last_evaluated_round':2})
+    comm.write_state(state)
+    grade = {'round':2, 'sprint':1, 'overall_passed':False, 'mode_recommendation':'repair',
+             'criteria':_failing_functionality_criteria()}
+    (comm.dir/'grade_round_2.json').write_text(json.dumps(grade))
+    (comm.dir/'browser_evidence_round_2.json').write_text(json.dumps({'checks':[], 'policy_version':'old'}))
+    calls=[]
+    async def unexpected_build(*args, **kwargs):
+        raise AssertionError('must not run another generation or Repair')
+    async def evaluate(_ctx, round_num):
+        calls.append(round_num)
+        return Verdict.completed
+    monkeypatch.setattr('src.orchestration.harness.run_build_phase', unexpected_build)
+    monkeypatch.setattr('src.orchestration.harness.run_evaluate_phase', evaluate)
+    await run_harness('ignored', tmp_path, config, task_mode='edit', target_routes=['/'], resume=True)
+    assert calls == [2]
+    history = list((comm.dir/'evidence_history').glob('*/grade_round_2.json'))
+    assert len(history) == 1
+    assert json.loads(history[0].read_text()) == grade

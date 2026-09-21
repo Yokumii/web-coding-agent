@@ -1,10 +1,10 @@
-"""Semantic regression guard for forward edit tasks.
+"""Semantic and computed-style regression guard for forward edit tasks.
 
 This deliberately compares browser semantics rather than screenshots.  A seed
 baseline is reduced to independently identifiable top-level surfaces and the
 meaningful DOM/ARIA tree inside each surface.  An edit may name a small set of
 surfaces it intends to change; every other baseline surface must survive
-unchanged.
+with its content, behavior-facing semantics, and stable visual style unchanged.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from playwright.async_api import async_playwright
 from src.config import HarnessConfig
 from src.orchestration.browser_evidence import _same_origin_route_url
 from src.orchestration.file_comm import FileComm
+from src.orchestration.minimal_path_guidance import expected_fragment_consumes_scope_slot
 from src.utils.playwright_browser import launch_chromium
 
 
@@ -40,6 +41,53 @@ def is_forward_edit(workdir: Path) -> bool:
 def _fingerprint(value: Any) -> str:
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _strip_visual_styles(value: Any) -> Any:
+    """Keep the semantic tree while excluding computed appearance values."""
+    if isinstance(value, list):
+        return [_strip_visual_styles(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _strip_visual_styles(item)
+            for key, item in value.items()
+            if key != "visual_style"
+        }
+    return value
+
+
+def _collect_visual_styles(value: Any) -> Any:
+    """Retain ordered element identity plus its bounded computed-style vector."""
+    if not isinstance(value, dict):
+        return []
+    return {
+        "tag": value.get("tag"),
+        "visual_style": value.get("visual_style") or {},
+        "children": [
+            _collect_visual_styles(item)
+            for item in value.get("children") or []
+            if isinstance(item, dict)
+        ],
+    }
+
+
+def _fragment_change_kind(
+    before: dict[str, Any], after: dict[str, Any]
+) -> str:
+    """Distinguish a style-only regression from content/behavior semantics."""
+    before_semantic = before.get("semantic_fingerprint")
+    after_semantic = after.get("semantic_fingerprint")
+    before_visual = before.get("visual_style_fingerprint")
+    after_visual = after.get("visual_style_fingerprint")
+    if (
+        before_semantic
+        and before_semantic == after_semantic
+        and before_visual
+        and after_visual
+        and before_visual != after_visual
+    ):
+        return "visual_style_changed"
+    return "semantic_changed"
 
 
 def _align_single_route_baseline(
@@ -207,13 +255,16 @@ def _compare_fragment_contract(
         or not isinstance(item.get("max_count"), int)
         or isinstance(item.get("max_count"), bool)
         or not 1 <= item.get("max_count") <= 50
+        or not isinstance(item.get("min_count", item.get("max_count")), int)
+        or isinstance(item.get("min_count", item.get("max_count")), bool)
+        or not 0 <= item.get("min_count", item.get("max_count")) <= item.get("max_count")
         for item in expected_new
     ):
         return {
             "passed": False,
             "reason": (
                 "invalid edit scope: expected_new_fragments must contain "
-                "route/selector and max_count in 1..50"
+                "route/selector, max_count in 1..50, and optional min_count in 0..max_count"
             ),
         }
 
@@ -276,11 +327,19 @@ def _compare_fragment_contract(
                 "reason": "invalid edit scope: expected fragment is outside target routes",
                 "selector": contract["selector"],
             }
-        route_counts[route] = route_counts.get(route, 0) + 1
-    if any(count > 4 for count in route_counts.values()):
+        if expected_fragment_consumes_scope_slot(contract):
+            route_counts[route] = route_counts.get(route, 0) + 1
+    limits = scope.get("max_fragments_per_route", {})
+    if not isinstance(limits, dict) or any(
+        not isinstance(route, str) or type(limit) is not int or limit < 0
+        or (target_routes and route not in target_routes)
+        for route, limit in limits.items()
+    ):
+        return {"passed": False, "reason": "invalid per-route fragment budget"}
+    if any(count > limits.get(route, 4) for route, count in route_counts.items()):
         return {
             "passed": False,
-            "reason": "invalid edit scope: at most four fragments per target route may be changed",
+            "reason": "invalid edit scope: declared fragments exceed the per-route budget",
         }
 
     def parent_chain(key: str, items: dict[str, dict[str, Any]]) -> list[str]:
@@ -300,19 +359,123 @@ def _compare_fragment_contract(
         normalized = selector.replace("='", '="').replace("']", '"]')
         return selector in anchors or normalized in anchors
 
+    def selector_family(selector: str) -> tuple[str, str] | None:
+        normalized = selector.replace("='", '="').replace("']", '"]')
+        if "[" not in normalized or "=" not in normalized:
+            return None
+        tag, remainder = normalized.split("[", 1)
+        attribute = remainder.split("=", 1)[0]
+        if not attribute:
+            return None
+        return tag.lower(), attribute.lower()
+
     # First identify roots of expected new semantic subtrees. Their descendant
     # fragments are represented by the matched root fingerprint, but unrelated
     # new siblings still need an independent contract.
     expected_hits = [0] * len(expected_new)
     expected_roots: set[str] = set()
     violations: list[dict[str, str]] = []
-    added_keys = sorted(
-        set(after_items) - set(before_items), key=lambda key: (depth(key), key)
-    )
-    for key in added_keys:
-        if any(parent in allowed for parent in parent_chain(key, after_items)):
+    # Anonymous fragment keys contain positional suffixes. Inserting one
+    # requested sibling can therefore shift unchanged later siblings from
+    # ``a:unnamed#7`` to ``a:unnamed#8``. Reconcile only unique, byte-identical
+    # semantic fingerprints on the same route; ambiguous duplicates remain
+    # fail-closed and content changes never qualify as relocation.
+    exact_keys = {
+        key
+        for key in set(before_items) & set(after_items)
+        if before_items[key].get("fingerprint")
+        == after_items[key].get("fingerprint")
+    }
+    before_by_identity: dict[tuple[str, str], list[str]] = {}
+    after_by_identity: dict[tuple[str, str], list[str]] = {}
+    for key, item in before_items.items():
+        if key in exact_keys:
             continue
-        if any(parent in expected_roots for parent in parent_chain(key, after_items)):
+        identity = (str(item.get("route", "/")), str(item.get("fingerprint") or ""))
+        if identity[1]:
+            before_by_identity.setdefault(identity, []).append(key)
+    for key, item in after_items.items():
+        if key in exact_keys:
+            continue
+        identity = (str(item.get("route", "/")), str(item.get("fingerprint") or ""))
+        if identity[1]:
+            after_by_identity.setdefault(identity, []).append(key)
+    relocated_pairs = [
+        {"before": before_by_identity[identity][0], "after": after_by_identity[identity][0]}
+        for identity in sorted(set(before_by_identity) & set(after_by_identity))
+        if len(before_by_identity[identity]) == 1
+        and len(after_by_identity[identity]) == 1
+        and before_by_identity[identity][0] != after_by_identity[identity][0]
+    ]
+    relocated_before = {item["before"] for item in relocated_pairs}
+    relocated_after = {item["after"] for item in relocated_pairs}
+    # A required selector can replace an existing selector on the same stable
+    # semantic node, for example a hash href becoming a physical href. Treat
+    # only the deepest node whose sole anchor addition is that exact selector
+    # as the changed subtree boundary. Ancestors are exempted below because
+    # their fingerprints necessarily include the changed leaf.
+    for key in sorted(
+        set(before_items) & set(after_items),
+        key=lambda item: (depth(item), item),
+        reverse=True,
+    ):
+        if before_items[key].get("fingerprint") == after_items[key].get("fingerprint"):
+            continue
+        route = str(after_items[key].get("route", "/"))
+        before_anchors = {
+            str(anchor) for anchor in before_items[key].get("anchors", [])
+        }
+        after_anchors = {
+            str(anchor) for anchor in after_items[key].get("anchors", [])
+        }
+        added_anchors = after_anchors - before_anchors
+        removed_anchors = before_anchors - after_anchors
+        if len(added_anchors) != 1:
+            continue
+        matched_index = next(
+            (
+                index
+                for index, contract in enumerate(expected_new)
+                if expected_hits[index] < int(contract["max_count"])
+                and contract["route"] == route
+                and selector_matches(
+                    str(contract["selector"]), added_anchors
+                )
+                and (
+                    not removed_anchors
+                    or (
+                        selector_family(str(contract["selector"])) is not None
+                        and all(
+                            selector_family(anchor)
+                            == selector_family(str(contract["selector"]))
+                            for anchor in removed_anchors
+                        )
+                    )
+                )
+            ),
+            None,
+        )
+        if matched_index is not None:
+            expected_hits[matched_index] += 1
+            expected_roots.add(key)
+    displaced_keys = {
+        key
+        for key in set(before_items) & set(after_items)
+        if key in relocated_before
+        and before_items[key].get("fingerprint")
+        != after_items[key].get("fingerprint")
+    }
+    added_keys = sorted(
+        ((set(after_items) - set(before_items)) | displaced_keys) - relocated_after,
+        key=lambda key: (depth(key), key),
+    )
+    # First claim the shallowest matching expected roots. A second pass can
+    # then admit both their descendants and any new structural wrappers above
+    # them without admitting unrelated siblings.
+    for key in added_keys:
+        if key in expected_roots:
+            continue
+        if any(parent in allowed for parent in parent_chain(key, after_items)):
             continue
         item = after_items[key]
         anchors = {str(anchor) for anchor in item.get("anchors", [])}
@@ -329,11 +492,21 @@ def _compare_fragment_contract(
             ),
             None,
         )
-        if matched_index is None:
-            violations.append({"fragment": key, "kind": "unexpected_added"})
-        else:
+        if matched_index is not None:
             expected_hits[matched_index] += 1
             expected_roots.add(key)
+    for key in added_keys:
+        if key in expected_roots:
+            continue
+        if any(parent in allowed for parent in parent_chain(key, after_items)):
+            continue
+        if any(parent in expected_roots for parent in parent_chain(key, after_items)):
+            continue
+        if any(key in parent_chain(root, after_items) for root in expected_roots):
+            continue
+        if str(after_items[key].get("route", "/")) in expected_new_route_set:
+            continue
+        violations.append({"fragment": key, "kind": "unexpected_added"})
     selector_counts = {
         (str(item.get("route")), str(item.get("selector"))): int(item.get("count"))
         for item in current.get("selector_counts", [])
@@ -350,7 +523,9 @@ def _compare_fragment_contract(
         for index, contract in enumerate(expected_new)
     ]
     for index, hits in enumerate(observed_counts):
-        if hits != int(expected_new[index]["max_count"]):
+        minimum = int(expected_new[index].get("min_count", expected_new[index]["max_count"]))
+        maximum = int(expected_new[index]["max_count"])
+        if hits < minimum or hits > maximum:
             contract = expected_new[index]
             violations.append(
                 {
@@ -374,6 +549,7 @@ def _compare_fragment_contract(
     }
     for key in allowed:
         exempt.update(parent_chain(key, before_items))
+    exempt.update(key for key in expected_roots if key in before_items)
     for key in expected_roots:
         exempt.update(
             parent for parent in parent_chain(key, after_items) if parent in before_items
@@ -381,10 +557,39 @@ def _compare_fragment_contract(
     for key, item in before_items.items():
         if key in exempt:
             continue
+        if key in relocated_before:
+            continue
         if key not in after_items:
-            violations.append({"fragment": key, "kind": "removed"})
+            violations.append(
+                {
+                    "fragment": key,
+                    "kind": "removed",
+                    **(
+                        {"before_summary": item["summary"]}
+                        if item.get("summary")
+                        else {}
+                    ),
+                }
+            )
         elif item.get("fingerprint") != after_items[key].get("fingerprint"):
-            violations.append({"fragment": key, "kind": "semantic_changed"})
+            change_kind = _fragment_change_kind(item, after_items[key])
+            violations.append(
+                {
+                    "fragment": key,
+                    "kind": change_kind,
+                    **(
+                        {"before_summary": item["summary"]}
+                        if change_kind == "semantic_changed" and item.get("summary")
+                        else {}
+                    ),
+                    **(
+                        {"after_summary": after_items[key]["summary"]}
+                        if change_kind == "semantic_changed"
+                        and after_items[key].get("summary")
+                        else {}
+                    ),
+                }
+            )
     return {
         "passed": not violations,
         "mode": "semantic_fragment_contract",
@@ -392,6 +597,7 @@ def _compare_fragment_contract(
         "expected_new_fragments": expected_new,
         "expected_new_routes": expected_new_routes,
         "expected_new_hits": observed_counts,
+        "relocated_fragment_pairs": relocated_pairs,
         "violations": violations,
         "baseline_fragment_count": len(before_items),
         "current_fragment_count": len(after_items),
@@ -537,12 +743,32 @@ async def snapshot_semantic_dom(
     """Capture a stable, route-aware semantic frame with nested fragments."""
     snapshot_script = """
     () => {
-      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const clean = value => String(value || '').replace(/\\s+/g, ' ').trim();
       const quoted = value => JSON.stringify(String(value || ''));
       const relevant = el => {
         const tag = el.tagName.toLowerCase();
         return /^(a|button|input|select|textarea|summary|dialog|main|nav|header|footer|aside|section|article|form|h1|h2|h3|h4|h5|h6)$/.test(tag)
           || el.hasAttribute('role') || [...el.attributes].some(a => a.name.startsWith('aria-'));
+      };
+      const visualStyle = el => {
+        const style = getComputedStyle(el);
+        return {
+          display: style.display, visibility: style.visibility, position: style.position,
+          color: style.color, backgroundColor: style.backgroundColor,
+          fontFamily: style.fontFamily, fontSize: style.fontSize, fontWeight: style.fontWeight,
+          lineHeight: style.lineHeight, textAlign: style.textAlign,
+          marginTop: style.marginTop, marginRight: style.marginRight,
+          marginBottom: style.marginBottom, marginLeft: style.marginLeft,
+          paddingTop: style.paddingTop, paddingRight: style.paddingRight,
+          paddingBottom: style.paddingBottom, paddingLeft: style.paddingLeft,
+          rowGap: style.rowGap, columnGap: style.columnGap,
+          borderTop: `${style.borderTopWidth} ${style.borderTopStyle} ${style.borderTopColor}`,
+          borderRight: `${style.borderRightWidth} ${style.borderRightStyle} ${style.borderRightColor}`,
+          borderBottom: `${style.borderBottomWidth} ${style.borderBottomStyle} ${style.borderBottomColor}`,
+          borderLeft: `${style.borderLeftWidth} ${style.borderLeftStyle} ${style.borderLeftColor}`,
+          borderRadius: style.borderRadius, boxShadow: style.boxShadow, opacity: style.opacity,
+          overflowX: style.overflowX, overflowY: style.overflowY,
+        };
       };
       const semanticChildren = el => [...el.children].flatMap(child =>
         relevant(child) ? [semanticNode(child)] : semanticChildren(child)
@@ -552,7 +778,11 @@ async def snapshot_semantic_dom(
         for (const name of ['role','aria-label','aria-labelledby','aria-describedby','aria-expanded','aria-selected','aria-checked','aria-current','aria-disabled','aria-hidden','aria-pressed','hidden','disabled','type','name','href','tabindex']) {
           if (el.hasAttribute(name)) attrs[name] = el.getAttribute(name) ?? '';
         }
-        return {tag: el.tagName.toLowerCase(), attrs, text: clean(el.textContent).slice(0, 300), children: semanticChildren(el)};
+        return {
+          tag: el.tagName.toLowerCase(), attrs,
+          text: clean(el.textContent).slice(0, 300),
+          visual_style: visualStyle(el), children: semanticChildren(el)
+        };
       };
       const anchors = el => {
         const anchorSet = new Set();
@@ -633,7 +863,15 @@ async def snapshot_semantic_dom(
             unstable_fragment_keys: list[str] = []
             for route in requested_routes:
                 route_url = _same_origin_route_url(app_url, route) if routes is not None else app_url
-                await page.goto(route_url, wait_until="networkidle", timeout=30_000)
+                # Background requests are unrelated to document readiness;
+                # compare two snapshots below to check DOM stability.
+                try:
+                    await page.goto(route_url, wait_until="load", timeout=30_000)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Browser navigation infrastructure failed: semantic baseline {route}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 first = await page.evaluate(snapshot_script)
                 await page.wait_for_timeout(150)
                 second = await page.evaluate(snapshot_script)
@@ -658,11 +896,24 @@ async def snapshot_semantic_dom(
 
                 def normalize(item: dict[str, Any]) -> dict[str, Any]:
                     local_key = str(item["key"])
+                    semantic_tree = (item.get("tree") or {}).get("semantic") or {}
+                    focusables = (item.get("tree") or {}).get("focusables") or []
+                    semantic_only = {
+                        "semantic": _strip_visual_styles(semantic_tree),
+                        "focusables": focusables,
+                    }
+                    visual_only = _collect_visual_styles(semantic_tree)
                     normalized: dict[str, Any] = {
                         "key": prefix + local_key,
                         "fingerprint": _fingerprint(item["tree"]),
+                        "semantic_fingerprint": _fingerprint(semantic_only),
+                        "visual_style_fingerprint": _fingerprint(visual_only),
                         "anchors": item.get("anchors", []),
                         "route": route,
+                        "summary": str(
+                            semantic_tree.get("text")
+                            or ""
+                        )[:160],
                     }
                     parent_key = item.get("parent_key")
                     if parent_key:
@@ -744,9 +995,12 @@ async def evaluate_guard(*, workdir: Path, file_comm: FileComm, config: HarnessC
         file_comm.dir / sprint_baseline_name(sprint_num)
         if sprint_num is not None else None
     )
+    # Edit repairs retain the accepted source as their preservation contract.
+    # The failed-candidate snapshot is only a fallback for a Generate repair
+    # that has no accepted sprint source.
     path = (
-        repair_path if repair_path.is_file()
-        else sprint_path if sprint_path is not None and sprint_path.is_file()
+        sprint_path if sprint_path is not None and sprint_path.is_file()
+        else repair_path if repair_path.is_file()
         else file_comm.dir / BASELINE_NAME
     )
     if not path.is_file():

@@ -298,10 +298,12 @@ class Grades(_Artifact):
     regressions_found: list[Any] = Field(default_factory=list)
     missing_features: list[Any] = Field(default_factory=list)
     repair_instructions: list[Any] = Field(default_factory=list)
+    repair_task_descriptions: list[Any] = Field(default_factory=list)
     evaluation_infrastructure_failure: dict[str, Any] | None = None
     edit_guard: dict[str, Any] | None = None
     edit_scope_audit: str | None = None
     minimality_certificate: dict[str, Any] | None = None
+    hidden_oracle: dict[str, Any] | None = None
     browser_action_contract_reconciliation: dict[str, Any] | None = None
     accepted_tape_replay: dict[str, Any] | None = None
     accepted_tape: dict[str, Any] | None = None
@@ -361,6 +363,8 @@ class HarnessState(_Artifact):
     design_status: str | None = None
     approved_concept_path: str | None = None
     background_ui_path: str | None = None
+    edit_freeze: dict[str, Any] | None = None
+    supplied_atomic_plan: bool | None = None
     timestamp: str | None = None
 
     @classmethod

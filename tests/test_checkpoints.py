@@ -86,6 +86,39 @@ def test_record_build_completed_captures_current_accepted_payload(tmp_path: Path
     assert state["last_verdict"] == "awaiting_review"
 
 
+def test_checkpoint_preserves_compact_edit_freeze_without_separate_artifact(
+    tmp_path: Path,
+):
+    file_comm = FileComm(tmp_path / ".harness")
+    file_comm.write_accepted_sprints(
+        {"accepted": [], "current_target": 1, "last_evaluated_round": 0}
+    )
+    transaction = CheckpointTransaction(
+        file_comm=file_comm,
+        prompt="edit notifications",
+        costs={},
+        phase_metrics={},
+    )
+    freeze = {
+        "schema_version": "edit-freeze-v1",
+        "instruction_sha256": "a",
+        "atomic_plan_sha256": "b",
+        "test_plan_sha256": "c",
+        "hidden_oracle_sha256": "d",
+        "edit_risk_tests_sha256": "e",
+    }
+
+    transaction.record_plan_completed(edit_freeze=freeze)
+    transaction.record_build_completed(
+        round_num=1,
+        current_sprint=1,
+        generator_mode="generate",
+    )
+
+    assert file_comm.read_state()["edit_freeze"] == freeze
+    assert not (file_comm.dir / "preimplementation_validation.json").exists()
+
+
 def test_record_evaluate_completed_writes_checkpoint_before_accepted_sprints(
     tmp_path: Path,
 ):

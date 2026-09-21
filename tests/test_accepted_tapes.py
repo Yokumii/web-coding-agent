@@ -6,6 +6,7 @@ import pytest
 
 from src.orchestration.accepted_tapes import (
     AcceptedTapeError,
+    accepted_obligation_summary,
     accepted_replay_checks,
     append_accepted_tape,
     recover_missing_accepted_tapes,
@@ -59,6 +60,30 @@ def test_accepted_tape_allows_related_multi_assertion_check(tmp_path):
     )
 
     assert accepted_replay_checks(tmp_path) == [check]
+
+
+def test_obligation_summary_exposes_only_bounded_user_actions(tmp_path):
+    check = {
+        **_check(),
+        "actions": [
+            {"action": "click", "selector": "#downloadBtn"},
+            {"action": "assert_visible", "selector": "#history"},
+        ],
+    }
+    append_accepted_tape(
+        harness_dir=tmp_path,
+        sprint_num=1,
+        round_num=1,
+        checks=[check],
+        evidence={"checks": [{"check_id": "UI-001", "status": "ok"}]},
+    )
+
+    summary = accepted_obligation_summary(tmp_path)
+
+    assert summary[0]["user_actions"] == [
+        {"action": "click", "selector": "#downloadBtn"}
+    ]
+    assert "#history" not in json.dumps(summary)
 
 
 def test_recover_missing_tape_uses_only_accepted_passing_browser_evidence(tmp_path):
@@ -226,3 +251,15 @@ def test_impact_selection_periodically_runs_full_replay(tmp_path):
 
     assert selection["mode"] == "periodic_full"
     assert [item["id"] for item in selection["checks"]] == ["UI-a", "UI-b"]
+
+
+def test_long_chain_keeps_full_history_but_replays_only_minimal_sample(tmp_path):
+    checks = [_check(f'UI-{i:03d}') for i in range(35)]
+    append_accepted_tape(harness_dir=tmp_path, sprint_num=1, round_num=1, checks=checks,
+                         evidence={'checks':[{'check_id':c['id'],'status':'ok'} for c in checks]})
+    assert accepted_replay_checks(tmp_path) == checks
+    selection = select_accepted_replay_checks(tmp_path, edit_card={}, accepted_edit_index=5,
+                                              full_replay_interval=5, before_round=2)
+    assert selection['checks'] == []
+    assert selection['skipped_reasons']['UI-000'] == 'minimal_replay_limit'
+    assert selection['skipped_reasons']['UI-002'] == 'minimal_replay_limit'

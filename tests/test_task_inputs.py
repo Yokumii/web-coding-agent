@@ -12,6 +12,7 @@ from src.orchestration.task_inputs import (
     load_task_input_manifest,
     openai_user_content,
     stage_task_inputs,
+    task_inputs_match,
     task_input_prompt_context,
 )
 
@@ -25,13 +26,24 @@ def test_stage_task_inputs_materializes_manifest_and_preserves_types(tmp_path: P
 
     manifest = stage_task_inputs(workdir, [image, notes])
 
-    assert manifest["schema_version"] == "harness-task-inputs-v1"
+    assert manifest["schema_version"] == "harness-task-inputs-v2"
     assert [item["kind"] for item in manifest["inputs"]] == ["image", "text"]
     assert all((workdir / item["staged_path"]).is_file() for item in manifest["inputs"])
     assert load_task_input_manifest(workdir) == manifest
+    assert all("sha256" not in item and "source_path" not in item for item in manifest["inputs"])
+    assert task_inputs_match(workdir, [image, notes]) is True
     context = task_input_prompt_context(workdir)
     assert "Keep the settings page unchanged." in context
     assert ".harness/inputs/" in context
+
+
+def test_empty_task_inputs_create_no_manifest(tmp_path: Path):
+    workdir = tmp_path / "run"
+
+    manifest = stage_task_inputs(workdir, [])
+
+    assert manifest["inputs"] == []
+    assert not (workdir / ".harness" / "task_inputs.json").exists()
 
 
 def test_stage_task_inputs_rejects_unsupported_binary(tmp_path: Path):
