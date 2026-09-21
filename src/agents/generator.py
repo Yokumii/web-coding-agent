@@ -1267,6 +1267,7 @@ async def _run_atomic_patch_executor(
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     supplied_plan = bool((file_comm.read_state() or {}).get("supplied_atomic_plan"))
     frozen_compound = config.edit_frozen_compound_mode
+    allow_semantic_correction = not frozen_compound
     system_prompt = (
         (REPAIR_SYSTEM_PROMPT if mode == "repair" else EDIT_SYSTEM_PROMPT)
         + "\nReturn JSON only. Prefer the compact protocol: "
@@ -1733,14 +1734,18 @@ async def _run_atomic_patch_executor(
                 ),
                 "fallback": (
                     "compact_semantic_correction"
-                    if semantic_attempt < _MAX_ATOMIC_SEMANTIC_ATTEMPTS
+                    if allow_semantic_correction
+                    and semantic_attempt < _MAX_ATOMIC_SEMANTIC_ATTEMPTS
                     else "stop_after_compact_correction"
                 ),
             }, ensure_ascii=False) + "\n")
             trace.flush()
             if candidate_override:
                 raise AtomicCandidateRejected(str(exc)) from exc
-            if semantic_attempt < _MAX_ATOMIC_SEMANTIC_ATTEMPTS:
+            if (
+                allow_semantic_correction
+                and semantic_attempt < _MAX_ATOMIC_SEMANTIC_ATTEMPTS
+            ):
                 logger.warning(
                     "[bold yellow]Atomic candidate rejected[/]; requesting a "
                     f"compact semantic correction: {exc}"
