@@ -135,6 +135,20 @@ def normalize_frozen_compound_plan(
                         ):
                             action["key"] = action.pop("value")
                         if (
+                            action.get("action") == "assert_url"
+                            and "#" in str(action.get("value") or "")
+                        ):
+                            parsed_url = urlsplit(str(action["value"]))
+                            action["value"] = parsed_url.path or str(check.get("route") or "/")
+                            actions.append(action)
+                            actions.append(
+                                {
+                                    "action": "assert_hash",
+                                    "value": f"#{parsed_url.fragment}",
+                                }
+                            )
+                            continue
+                        if (
                             action.get("action") == "assert_property"
                             and "property" in action
                             and "name" not in action

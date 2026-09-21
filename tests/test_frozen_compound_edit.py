@@ -186,6 +186,32 @@ def test_plan_normalizes_common_interaction_aliases():
     }
 
 
+def test_plan_splits_url_fragment_assertion_into_path_and_hash():
+    tasks = frozen_tasks()
+    payload = raw_plan(tasks)
+    payload["subtasks"][0]["target_routes"] = ["/about.html"]
+    check = payload["subtasks"][0]["atomic_plan"]["checks"][0]
+    check["route"] = "/about.html"
+    check["actions"] = [
+        {"action": "click", "selector": "a[href='#team']"},
+        {"action": "assert_url", "value": "/about.html#team"},
+    ]
+
+    normalized = normalize_frozen_compound_plan(
+        payload,
+        case_id="case-1",
+        source_code_sha256="abc",
+        planner_model="gpt-5.6-luna",
+        frozen_subtasks=tasks,
+    )
+
+    actions = normalized["subtasks"][0]["atomic_plan"]["checks"][0]["actions"]
+    assert actions[-2:] == [
+        {"action": "assert_url", "value": "/about.html"},
+        {"action": "assert_hash", "value": "#team"},
+    ]
+
+
 def test_frozen_plan_detects_post_plan_mutation(tmp_path):
     tasks = frozen_tasks()
     normalized = normalize_frozen_compound_plan(
