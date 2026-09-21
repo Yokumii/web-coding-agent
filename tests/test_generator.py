@@ -36,6 +36,7 @@ from src.agents.generator import (
     _trace_confirms_commit,
     _last_replayable_atomic_candidate,
     _unreferenced_near_duplicate_functions,
+    _uniquify_first_exact_patch,
     _trace_has_successful_validation,
     _trace_written_frontend_paths,
     run_generator,
@@ -54,6 +55,20 @@ def anyio_backend():
 
 def test_atomic_edit_generation_has_no_internal_candidate_retry():
     assert _MAX_ATOMIC_SEMANTIC_ATTEMPTS == 1
+
+
+def test_frozen_exact_patch_adds_context_around_repeated_search():
+    source = "<main><section></section><section></section></main>"
+
+    old_text, new_text = _uniquify_first_exact_patch(
+        source, "<section></section>", "<section><button>Open</button></section>"
+    )
+
+    assert source.count(old_text) == 1
+    updated = source.replace(old_text, new_text, 1)
+    assert updated == (
+        "<main><section><button>Open</button></section><section></section></main>"
+    )
 
 
 def test_unplanned_new_path_only_blocks_when_minimality_is_enabled():

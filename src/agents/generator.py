@@ -1189,6 +1189,33 @@ def _render_inspiration_code(harness_dir: Path) -> str:
             + json.dumps(references["snippets"], ensure_ascii=False))
 
 
+def _uniquify_first_exact_patch(
+    current: str, old_text: str, new_text: str
+) -> tuple[str, str]:
+    """Add unchanged context around the first match until its SEARCH is unique."""
+    if not old_text:
+        raise ValueError("atomic patch search text is empty")
+    count = current.count(old_text)
+    if count == 0:
+        raise ValueError("atomic patch search text is absent")
+    if count == 1:
+        return old_text, new_text
+    start = current.index(old_text)
+    left = start
+    right = start + len(old_text)
+    step = 32
+    while left > 0 or right < len(current):
+        left = max(0, left - step)
+        right = min(len(current), right + step)
+        unique_old = current[left:right]
+        if current.count(unique_old) == 1:
+            return (
+                unique_old,
+                current[left:start] + new_text + current[start + len(old_text):right],
+            )
+    raise ValueError("atomic patch search text cannot be made unique")
+
+
 def _atomic_executor_eligible(
     *, config: HarnessConfig, workdir: Path, round_num: int
 ) -> bool:
@@ -1541,7 +1568,11 @@ async def _run_atomic_patch_executor(
                     if not target.is_file():
                         raise ValueError(f"atomic patch targets missing source: {relative}")
                     current = target.read_text(encoding="utf-8")
-                    if not item["old_text"] or current.count(item["old_text"]) != 1:
+                    if frozen_compound:
+                        item["old_text"], item["new_text"] = _uniquify_first_exact_patch(
+                            current, item["old_text"], item["new_text"]
+                        )
+                    elif not item["old_text"] or current.count(item["old_text"]) != 1:
                         raise ValueError(f"atomic patch is not unique in {relative}")
                     updated = current.replace(item["old_text"], item["new_text"], 1)
                     policy_inputs = [("apply_patch", {
