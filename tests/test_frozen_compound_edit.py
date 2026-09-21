@@ -155,6 +155,37 @@ def test_plan_normalizes_unambiguous_action_field_aliases():
     assert actions[1]["storage"] == "session"
 
 
+def test_plan_normalizes_common_interaction_aliases():
+    tasks = frozen_tasks()
+    payload = raw_plan(tasks)
+    payload["subtasks"][0]["atomic_plan"]["checks"][0]["actions"] = [
+        {
+            "action": "drag_and_drop",
+            "source": "[data-testid='first-card']",
+            "destination": "[data-testid='second-card']",
+        },
+        {
+            "action": "assert_visible",
+            "selector": "[data-testid='second-card']",
+        },
+    ]
+
+    normalized = normalize_frozen_compound_plan(
+        payload,
+        case_id="case-1",
+        source_code_sha256="abc",
+        planner_model="gpt-5.6-luna",
+        frozen_subtasks=tasks,
+    )
+
+    drag = normalized["subtasks"][0]["atomic_plan"]["checks"][0]["actions"][0]
+    assert drag == {
+        "action": "drag_and_drop",
+        "source_selector": "[data-testid='first-card']",
+        "target_selector": "[data-testid='second-card']",
+    }
+
+
 def test_frozen_plan_detects_post_plan_mutation(tmp_path):
     tasks = frozen_tasks()
     normalized = normalize_frozen_compound_plan(

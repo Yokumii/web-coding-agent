@@ -62,7 +62,12 @@ changes.
 def _planner_prompt(
     *, frozen_subtasks: list[dict[str, str]], source_ui_contract: dict[str, Any]
 ) -> str:
+    required_ids = [str(item["id"]) for item in frozen_subtasks]
     return (
+        f"Return exactly {len(frozen_subtasks)} subtask plans. Required IDs in order: "
+        + json.dumps(required_ids, ensure_ascii=False)
+        + ". A syntactically valid response that omits any ID is invalid. Keep each continuous "
+        "check focused, but do not stop before every required ID is present.\n\n"
         "Frozen subtasks:\n"
         + json.dumps(frozen_subtasks, ensure_ascii=False, indent=2)
         + "\n\nAccepted source UI contract:\n"

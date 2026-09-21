@@ -114,6 +114,26 @@ def normalize_frozen_compound_plan(
             for action in check.get("actions") or []:
                 if not isinstance(action, dict) or action.get("action") != "navigate":
                     if isinstance(action, dict):
+                        if action.get("action") == "drag_and_drop":
+                            for alias, canonical in (
+                                ("source", "source_selector"),
+                                ("destination", "target_selector"),
+                                ("target", "target_selector"),
+                            ):
+                                if alias in action and canonical not in action:
+                                    action[canonical] = action.pop(alias)
+                        if (
+                            action.get("action") == "select_option"
+                            and "option" in action
+                            and "value" not in action
+                        ):
+                            action["value"] = action.pop("option")
+                        if (
+                            action.get("action") == "key_press"
+                            and "key" not in action
+                            and "value" in action
+                        ):
+                            action["key"] = action.pop("value")
                         if (
                             action.get("action") == "assert_property"
                             and "property" in action
