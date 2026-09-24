@@ -140,6 +140,12 @@ async def learn(packet_path, library, config, output):
             messages=[{'role':'system','content':'''Extract at most ONE genuinely useful, already exercised reusable pure JavaScript function
 from this accepted Edit. Prefer retaining the original function body. Remove business names, labels,
 field/DOM identifiers, storage keys and project-specific data assumptions; use arguments instead.
+Inspect individual new functions, not only the feature as a whole. A pure mapping/calculation used
+by a DOM component can be reusable even when the containing component is not. Such a helper does
+not duplicate the engine merely because that engine consumes its result.
+Standard UI modes and mathematical parameters are not business data. Compare actual existing code:
+sharing a broad feature category is NOT duplication. A small helper supporting additional generic
+options absent from the core is a valid extension; retain the engine and expose the helper separately.
 Do not extract a whole component, clone an existing core API, invent new capabilities, or retain dead code.
 Check existing helpers and core: merge the SAME capability under its existing name, never add an alias
 or duplicate. Existing calls must remain compatible. If already covered, too trivial, unsafe, or uncertain,
