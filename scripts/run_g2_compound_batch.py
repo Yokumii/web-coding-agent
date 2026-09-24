@@ -254,7 +254,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
             _save(args.output / "status.json", progress)
             print(json.dumps(progress, ensure_ascii=False), flush=True)
-    return json.loads((args.output / "status.json").read_text())
+    progress=json.loads((args.output / 'status.json').read_text())
+    # Learning is outside all Edit deadlines and cannot turn a completed batch into failure.
+    if args.fast_gt and args.provider_profile=='qwen' and args.rsi and not CANCELLED.is_set():
+        packets=sorted(args.output.glob('*/rsi_queue/*.json'))
+        learning=args.output/'rsi'
+        if packets and not (learning/'result.json').exists():
+            learning.mkdir(exist_ok=True)
+            command=[sys.executable,str(RUNNER.with_name('run_skill_rsi.py')),
+                '--packet',str(packets[0].resolve()),'--output',str(learning.resolve()),
+                '--library',str(RUNNER.parent.parent/'.agents/skills'),'--model',args.model]
+            from scripts.run_fast_edit_worker import stop
+            process=None
+            try:
+                with (learning/'worker.log').open('a') as log:
+                    process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+                deadline=time.monotonic()+28
+                while process.poll() is None and not CANCELLED.wait(.2):
+                    if time.monotonic()>=deadline:
+                        break
+            except Exception as exc:
+                _save(learning/'result.json',{'status':'skipped','reason':str(exc)})
+            finally:
+                stop(process)
+            if not (learning/'result.json').exists():
+                _save(learning/'result.json',{'status':'skipped','reason':'learner timeout or cancellation'})
+        if (learning/'result.json').exists():
+            progress['rsi']=json.loads((learning/'result.json').read_text())
+            metric=learning/'call_1.json'
+            if metric.exists():
+                progress['rsi_usage']=json.loads(metric.read_text())
+            _save(args.output/'status.json',progress)
+    return progress
 
 
 def parser() -> argparse.ArgumentParser:
@@ -267,6 +298,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model", default="gpt-5.6-luna")
     result.add_argument("--provider-profile", choices=["experimental-luna","qwen"])
     result.add_argument('--fast-gt',action='store_true')
+    result.add_argument('--no-rsi',dest='rsi',action='store_false',default=True,
+        help='Disable the single bounded post-batch Skill learning call')
     result.add_argument('--dependencies',type=Path)
     result.add_argument('--subtask-timeout',type=float,default=180)
     result.add_argument("--budget-usd", type=float, default=20.0)

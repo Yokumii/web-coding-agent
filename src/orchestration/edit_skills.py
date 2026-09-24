@@ -64,6 +64,20 @@ def acceptance_recipe(task_type: str) -> dict:
     return json.loads((SKILLS_ROOT / name / "references/acceptance.json").read_text())
 
 
+def _selected_skill_folder(workdir: Path, name: str) -> Path:
+    lock = _read_skill_manifest(workdir / '.harness' / 'skill_version_lock.json')
+    version = ((lock.get('skills') or {}).get(name) or {}).get('version')
+    if not version:
+        manifest = _read_skill_manifest(workdir / '.harness' / 'skill_versions.json')
+        version = ((manifest.get('skills') or {}).get(name) or {}).get('current')
+    if version:
+        folder = workdir / '.harness' / 'skill_versions' / name / version
+        if not folder.is_dir():
+            raise ValueError(f'missing Skill snapshot: {name}@{version}')
+        return folder
+    return SKILLS_ROOT / name
+
+
 def selected_reference_files(workdir: Path) -> list[Path]:
     contract = read_edit_task_contract(workdir) or {}
     metadata = contract.get("chain_metadata") or {}
@@ -73,7 +87,7 @@ def selected_reference_files(workdir: Path) -> list[Path]:
     stack = metadata.get("edit_skill_stack") or detect_edit_stack(workdir / "frontend")
     if stack not in {"vanilla", "react", "vue"}:
         raise ValueError(f"Unsupported edit Skill stack: {stack}")
-    folder = SKILLS_ROOT / name / "references"
+    folder = _selected_skill_folder(workdir, name) / "references"
     return sorted(file for file in folder.iterdir() if
         file.suffix == ".css" or
         (stack == "vanilla" and file.suffix == ".js") or
@@ -125,16 +139,7 @@ def render_edit_skill(workdir: Path) -> str:
     name = selected_edit_skill(metadata)
     if name is None:
         return ""
-    folder = SKILLS_ROOT / name
-    # A running task may pin a validated Skill snapshot.  Never switch its
-    # bytes when a newer version is enabled for later tasks.
-    lock = _read_skill_manifest(workdir / ".harness" / "skill_version_lock.json")
-    pinned = (lock.get("skills") or {}).get(name) or {}
-    version = pinned.get("version")
-    if version:
-        snapshot = workdir / ".harness" / "skill_versions" / name / version
-        if snapshot.is_dir():
-            folder = snapshot
+    folder = _selected_skill_folder(workdir, name)
     instruction = (folder / "SKILL.md").read_text(encoding="utf-8")
     staged = workdir / ".harness" / "edit_skill" / name / "references"
     staged.mkdir(parents=True, exist_ok=True)
