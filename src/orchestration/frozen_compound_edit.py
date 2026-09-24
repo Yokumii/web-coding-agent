@@ -96,6 +96,10 @@ def normalize_frozen_compound_plan(
         expected_id = str(expected["id"])
         expected_type = str(expected["task_type"])
         expected_instruction = str(expected["instruction"])
+        # The dataset owns these fields; the planner need not spend tokens
+        # reproducing long instructions. Explicit conflicting values still fail.
+        item.setdefault("task_type", expected_type)
+        item.setdefault("instruction", expected_instruction)
         for key, value in (
             ("id", expected_id),
             ("task_type", expected_type),

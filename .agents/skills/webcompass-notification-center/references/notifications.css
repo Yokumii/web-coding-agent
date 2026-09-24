@@ -1,0 +1,6 @@
+.wc-notifications { font:inherit; color:inherit; }
+.wc-notifications ul { list-style:none; padding:0; }
+.wc-notifications li { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; padding:.75rem 0; border-bottom:1px solid #aaa5; }
+.wc-notifications li span { flex:1 1 10rem; overflow-wrap:anywhere; }
+.wc-notifications [data-read=false] span { font-weight:bold; }
+.wc-notifications button { font:inherit; }

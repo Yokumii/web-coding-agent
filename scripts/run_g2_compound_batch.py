@@ -3,18 +3,32 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import time
+import threading
 from typing import Any
 
 
 RUNNER = Path(__file__).resolve().with_name("run_g2_compound_edit.py")
+CANCELLED = threading.Event()
+
+
+def _runtime_hash(root):
+    fingerprint=hashlib.sha256()
+    paths=sorted([*root.glob('src/**/*'),*root.glob('scripts/**/*'),*root.glob('.agents/skills/**/*')])
+    for path in paths:
+        if path.is_file() and '__pycache__' not in path.parts and path.suffix!='.pyc':
+            fingerprint.update(str(path.relative_to(root)).encode())
+            fingerprint.update(path.read_bytes())
+    return fingerprint.hexdigest()
 
 
 def _save(path: Path, payload: dict[str, Any]) -> None:
@@ -58,10 +72,16 @@ def _latest_result(output: Path) -> dict[str, Any] | None:
 def _run_one(args: argparse.Namespace, ordinal: int, job: dict[str, Any]) -> dict[str, Any]:
     case_id = str(job["instance_id"])
     case_path = Path(str(job["case"]))
+    if args.fast_gt:
+        case_path=args.case_paths[case_id]
     output = args.output / case_id
     existing = _latest_result(output)
-    if existing and existing.get("status") in {"ok", "incomplete"}:
+    if existing and (args.fast_gt or existing.get("status") in {"ok", "incomplete"}):
+        if any(s.get('failure_scope')=='system' for s in existing.get('steps',[])):
+            CANCELLED.set()
         return existing
+    if CANCELLED.is_set():
+        return {'instance_id':case_id,'status':'cancelled'}
     output.mkdir(parents=True, exist_ok=True)
     log_path = output / "worker.log"
     command = [
@@ -83,6 +103,14 @@ def _run_one(args: argparse.Namespace, ordinal: int, job: dict[str, Any]) -> dic
         "--case-timeout",
         str(args.case_timeout),
     ]
+    if args.provider_profile:
+        command.extend(["--provider-profile", args.provider_profile])
+    if args.fast_gt:
+        command=[sys.executable,'-u',str(args.runtime_root/'scripts/run_fast_edit_worker.py'),
+            '--case',str(case_path.resolve()),'--output',str(output.resolve()),
+            '--dependencies',str(args.dependencies.resolve()),'--port',str(args.base_port+ordinal),
+            '--model',args.model,'--provider-profile',args.provider_profile or 'qwen',
+            '--subtask-timeout',str(args.subtask_timeout)]
     with log_path.open("a", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -92,7 +120,17 @@ def _run_one(args: argparse.Namespace, ordinal: int, job: dict[str, Any]) -> dic
             env={**os.environ, "PYTHONPATH": str(RUNNER.parent.parent)},
         )
         try:
-            process.wait(timeout=args.case_timeout + 60)
+            if args.fast_gt:
+                while process.poll() is None:
+                    if CANCELLED.wait(.5):
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        break
+            else:
+                process.wait(timeout=args.case_timeout + 60)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
@@ -111,27 +149,75 @@ def _run_one(args: argparse.Namespace, ordinal: int, job: dict[str, Any]) -> dic
             "error": f"worker exited {process.returncode} without result",
         }
         _save(output / "result.json", result)
+    if args.fast_gt:
+        errors=' '.join(str(x.get('error','')) for x in [result,*result.get('steps',[])])
+        if any(s.get('failure_scope')=='system' for s in result.get('steps',[])) or any(
+                code in errors for code in ('insufficient_quota','invalid_api_key','401 from','403 from')):
+            CANCELLED.set()
     return result
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    CANCELLED.clear()
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *_: CANCELLED.set())
+        signal.signal(signal.SIGINT, lambda *_: CANCELLED.set())
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
     jobs = _select_jobs(plan, args.limit)
+    identifiers=[str(j['instance_id']) for j in jobs]
+    if len(set(identifiers))!=len(identifiers) or any(
+            not s or s in {'.','..'} or Path(s).name!=s or '/' in s or '\\' in s for s in identifiers):
+        raise ValueError('job identifiers must be unique safe directory names')
+    if not jobs or args.base_port<1024 or args.base_port+len(jobs)>65536:
+        raise ValueError('empty selection or invalid port range')
+    if args.fast_gt and (not args.dependencies or not 0<args.subtask_timeout<=180 or args.limit<=0):
+        raise ValueError('fast GT requires --dependencies and a subtask timeout <=180')
     args.output.mkdir(parents=True, exist_ok=True)
     selection = {
         "schema_version": "g2-compound-batch-v1",
         "source_plan": str(args.plan.resolve()),
         "model": args.model,
+        "provider_profile": args.provider_profile,
         "workers": args.workers,
         "case_timeout_seconds": args.case_timeout,
         "jobs": jobs,
     }
+    if args.fast_gt:
+        root=RUNNER.parent.parent
+        selection.update(fast_gt=True,subtask_timeout=args.subtask_timeout,
+            dependencies=str(args.dependencies.resolve()),code_skill_sha256=_runtime_hash(root),
+            input_hashes={str(j['case']):hashlib.sha256(Path(j['case']).read_bytes()).hexdigest() for j in jobs})
     selection_path = args.output / "selection.json"
     if selection_path.is_file() and json.loads(selection_path.read_text()) != selection:
         raise ValueError("batch selection/config changed; use a new output directory")
     _save(selection_path, selection)
+    if args.fast_gt:
+        args.runtime_root=args.output.resolve()/'runtime'
+        if not args.runtime_root.exists():
+            staging=args.output.resolve()/'runtime_staging'
+            if staging.exists():
+                raise ValueError('incomplete runtime snapshot; preserve output and choose a fresh batch directory')
+            for directory in ('src','scripts','.agents/skills'):
+                shutil.copytree(root/directory,staging/directory,
+                    ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+            staging.rename(args.runtime_root)
+        if _runtime_hash(args.runtime_root)!=selection['code_skill_sha256']:
+            raise ValueError('runtime snapshot changed; no jobs dispatched')
+        args.case_paths={}
+        inputs=args.output.resolve()/'inputs'
+        inputs.mkdir(exist_ok=True)
+        for job in jobs:
+            source=Path(job['case'])
+            target=inputs/(job['instance_id']+('.json.gz' if source.suffix=='.gz' else '.json'))
+            if not target.exists():
+                shutil.copyfile(source,target)
+            if hashlib.sha256(target.read_bytes()).hexdigest()!=selection['input_hashes'][str(job['case'])]:
+                raise ValueError('input snapshot changed; no jobs dispatched')
+            args.case_paths[job['instance_id']]=target
     counts: dict[str, int] = {}
     total_cost = 0.0
+    unknown_cost = 0
+    tokens = {'input_tokens':0,'output_tokens':0,'calls':0,'unknown_usage_calls':0}
     started = time.time()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
@@ -139,16 +225,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for ordinal, job in enumerate(jobs)
         }
         for completed, future in enumerate(as_completed(futures), 1):
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception as exc:
+                result={'status':'error','instance_id':futures[future]['instance_id'],
+                    'error':f'{type(exc).__name__}: {exc}'}
+                _save(args.output/result['instance_id']/'result.json',result)
             status = str(result.get("status") or "error")
             counts[status] = counts.get(status, 0) + 1
             total_cost += float(result.get("cost_usd") or 0.0)
+            unknown_cost += result.get('cost_usd') is None
+            usage=result.get('usage') or {}
+            if not usage:
+                for step in result.get('steps',[]):
+                    for key in tokens:
+                        usage[key]=usage.get(key,0)+(step.get('usage') or {}).get(key,0)
+            for key in tokens:
+                tokens[key]+=usage.get(key,0)
             progress = {
                 "status": "running" if completed < len(jobs) else "complete",
                 "selected": len(jobs),
                 "processed": completed,
                 "counts": counts,
-                "cost_usd": total_cost,
+                "cost_usd": None if unknown_cost else total_cost,
+                "known_cost_usd":total_cost,"unknown_cost_tasks":unknown_cost,"usage":tokens.copy(),
                 "elapsed_seconds": round(time.time() - started, 3),
                 "last_instance_id": result.get("instance_id"),
             }
@@ -165,6 +265,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--workers", type=int, default=4)
     result.add_argument("--base-port", type=int, default=19000)
     result.add_argument("--model", default="gpt-5.6-luna")
+    result.add_argument("--provider-profile", choices=["experimental-luna","qwen"])
+    result.add_argument('--fast-gt',action='store_true')
+    result.add_argument('--dependencies',type=Path)
+    result.add_argument('--subtask-timeout',type=float,default=180)
     result.add_argument("--budget-usd", type=float, default=20.0)
     result.add_argument("--request-timeout", type=int, default=300)
     result.add_argument("--case-timeout", type=float, default=14400)

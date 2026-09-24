@@ -12,6 +12,7 @@ from src.agents.generator import (
     _control_topology_invariants,
     _atomic_executor_eligible,
     _build_generator_prompt,
+    _compact_browser_error,
     _checkpoint_interrupted_model_work,
     _recover_deferred_model_patches,
     _describe_failures,
@@ -1613,6 +1614,18 @@ def test_atomic_executor_copy_from_normalizes_nested_line_edits():
     assert payload[0]["line_edits"][0]["path"] == ""
 
 
+def test_complete_inner_method_preserves_adjacent_outer_call_closer():
+    import hashlib
+    source = "const view = mount({\n  onUpdate(job){\n    render(job);\n  },\n});\nview.start();\n"
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    updated, patches = _apply_sha_line_operations(source, [{
+        "op": "replace_lines", "path": "frontend/app.js", "start_line": 2, "end_line": 5,
+        "replacement": "  onUpdate(job){\n    render(job.state);\n  },",
+    }], expected_path="frontend/app.js", expected_sha256=digest, preserve_operations=True)
+    assert updated == source.replace("render(job)", "render(job.state)")
+    assert patches[0]["_harness_end_line"] == 4
+
+
 def test_atomic_executor_removes_whitespace_only_lines_from_replacement():
     patches = _normalize_atomic_patch_response(
         {
@@ -1755,6 +1768,43 @@ def test_repair_keeps_deduplicated_runtime_error_across_masking_rounds(
         "source_round": 2,
         "error": "renderSummary is not defined",
     }]
+
+
+def test_browser_error_compaction_retains_actionability_cause():
+    error = "TimeoutError: drag_and_drop\n" + "waiting for target\n" * 180 + "fixed toolbar intercepts pointer events"
+    compact = _compact_browser_error(error)
+    assert compact.startswith("TimeoutError: drag_and_drop")
+    assert "fixed toolbar intercepts pointer events" in compact
+    assert len(compact) < 2100
+
+
+def test_frozen_repair_prompt_uses_only_latest_reproduced_runtime_error(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    _write_generator_context(file_comm)
+    file_comm.write_grades(2, {"round": 2, "sprint": 1, "criteria": {}, "overall_passed": False})
+    for number, message in [(1, "obsoleteHelper is not defined"), (2, "Current list root is null")]:
+        (file_comm.dir / f"repair_packet_round_{number}.json").write_text(json.dumps({
+            "failed_checks": [{"check_id": "flow", "console_errors": [message]}],
+        }))
+    (file_comm.dir / "minimal_path_plan_round_3.json").write_text(json.dumps({
+        "route_scope": {"target_routes": ["/"]},
+        "source_change_cone": {"initial_paths": ["frontend/app.js"]},
+        "budgets": {"max_patch_lines": 30, "max_touched_files": 1},
+    }))
+    (file_comm.dir / "edit_context_round_3.json").write_text(json.dumps({
+        "schema_version": "edit-context-v1", "round": 3,
+        "source_windows": [{"path": "frontend/app.js", "start_line": 1,
+                            "end_line": 1, "content": "const list = null;\n"}],
+        "exposure": {"full_source_chars": 19, "exposed_source_chars": 19},
+    }))
+    prompt = _build_generator_prompt(
+        mode="repair", file_comm=file_comm, round_num=3, sprint_num=1,
+        sprint_context={"goal": "Repair list", "feature_ids": []},
+        accepted_sprints={"accepted": []}, frozen_compound=True,
+    )
+    assert "Current list root is null" in prompt
+    assert "obsoleteHelper" not in prompt
+    assert "a later candidate may have masked" not in prompt
 
 
 def test_repair_packet_derives_exact_scroll_restore_instruction():
@@ -2925,3 +2975,67 @@ def test_product_patch_hashes_are_bound_to_supplied_source_revision():
     with pytest.raises(ValueError, match="SHA mismatch"):
         _apply_sha_line_operations(source + '<footer/>', operations, expected_path="frontend/index.html",
                                   expected_sha256=digest, preserve_operations=True)
+
+
+def test_atomic_executor_accepts_nested_exact_patches_and_rejects_conflicting_path():
+    payload = {'operations': [{'op': 'patches', 'path': 'game.js', 'patches': [
+        {'old_text': 'before', 'new_text': 'after'},
+        {'search': 'second', 'replace': 'third'},
+    ]}]}
+    assert _normalize_atomic_patch_response(payload) == [
+        {'path': 'frontend/game.js', 'old_text': 'before', 'new_text': 'after'},
+        {'path': 'frontend/game.js', 'old_text': 'second', 'new_text': 'third'},
+    ]
+    payload['operations'][0]['patches'][0]['path'] = 'other.js'
+    with pytest.raises(ValueError, match='conflicts'):
+        _normalize_atomic_patch_response(payload)
+
+
+def test_skill_exact_schema_uses_copy_and_search_replace_without_line_numbers():
+    from src.agents.generator import _atomic_exact_response_format
+    schema=_atomic_exact_response_format('generate')['json_schema']['schema']
+    fields=schema['properties']
+    assert fields['operations']['items']['properties']['op']['enum']==['copy_from']
+    assert set(fields['patches']['items']['required'])=={'path','old_text','new_text'}
+    assert fields['operations']['items']['properties']['line_edits']['maxItems']==0
+    assert schema['additionalProperties'] is False
+    assert 'repair_task_descriptions' in _atomic_exact_response_format('repair')['json_schema']['schema']['required']
+
+
+def test_exact_patch_recovers_only_unique_whole_line_indentation():
+    old,new=_uniquify_first_exact_patch('  activate();\n', '   activate();', '   openPanel();')
+    assert '  activate();\n'.replace(old,new)=='  openPanel();\n'
+    with pytest.raises(ValueError,match='absent'):
+        _uniquify_first_exact_patch('if (ready) activate();\n','   activate();','   openPanel();')
+    with pytest.raises(ValueError,match='absent'):
+        _uniquify_first_exact_patch('  activate();\n  activate();\n','   activate();','   openPanel();')
+
+
+def test_exact_patch_recovers_a_unique_section_comment_delimiter_only():
+    source='/* ===== SECTION ===== */\n.rule { color: red; }\n'
+    old,new=_uniquify_first_exact_patch(source,'/* ===== SECTION =====\n','.added { color: blue; }\n')
+    assert source.replace(old,new)=='.added { color: blue; }\n.rule { color: red; }\n'
+    with pytest.raises(ValueError,match='absent'):
+        _uniquify_first_exact_patch(source+source,'/* ===== SECTION =====\n','x')
+
+
+def test_exact_patch_recovers_unique_multiline_indentation_without_code_fuzzing():
+    source = '  <section>\n    <p>Original</p>\n  </section>\n'
+    old, new = _uniquify_first_exact_patch(source, '<section>\n  <p>Original</p>\n</section>', '<section>Updated</section>')
+    assert old == source.rstrip('\n')
+    assert new == '<section>Updated</section>'
+    with pytest.raises(ValueError, match='absent'):
+        _uniquify_first_exact_patch(source + source, '<section>\n<p>Original</p>\n</section>', 'x')
+    with pytest.raises(ValueError, match='absent'):
+        _uniquify_first_exact_patch(source, '<section>\n<p>Different</p>\n</section>', 'x')
+
+
+def test_html_nesting_diagnostic_ignores_void_self_closing_tags():
+    from src.agents.generator import _HTMLBalanceParser
+    parser = _HTMLBalanceParser()
+    parser.feed('<html><head><meta charset="utf-8"/><link href="x.css"/></head><body><section><input/><div>Text</div></section></body></html>')
+    assert parser.error_score == 0
+    assert parser.issues == []
+    broken = _HTMLBalanceParser()
+    broken.feed('<html><body><div>\n</section></div></body></html>')
+    assert broken.issues[0] == 'line 2: </section> while the open element is <div>'

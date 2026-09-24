@@ -226,6 +226,32 @@ def test_atomic_edit_prompt_excludes_heavy_planning_outputs():
     assert "multiple sprints" in prompt
 
 
+def test_count_value_alias_preserves_removal_postcondition():
+    normalized = normalize_atomic_edit_plan_payload({
+        "schema_version": "atomic-edit-plan-v1", "goal": "Remove an uploaded file.",
+        "source_anchors": ["#uploads"], "visual_evidence": "not_required",
+        "checks": [{"id": "remove", "route": "/", "actions": [
+            {"action": "click", "selector": "#remove"},
+            {"action": "assert_count", "selector": "#removed-file", "value": 0},
+        ]}],
+    })
+    assert normalized["checks"][0]["actions"][-1] == {
+        "action": "assert_count", "selector": "#removed-file", "count": 0,
+    }
+
+
+def test_uploaded_fixture_count_is_not_weakened_to_presence():
+    normalized = normalize_atomic_edit_plan_payload({
+        "schema_version": "atomic-edit-plan-v1", "goal": "Deduplicate uploaded files.",
+        "source_anchors": ["#uploads"], "visual_evidence": "not_required",
+        "checks": [{"id": "dedup", "route": "/", "actions": [
+            {"action": "set_input_files", "selector": "#files", "files": [{"name": "a.txt", "mime_type": "text/plain", "content": "a"}]},
+            {"action": "assert_count", "selector": ".file", "count": 1},
+        ]}],
+    })
+    assert normalized["checks"][0]["actions"][-1]["action"] == "assert_count"
+
+
 def test_minimal_authored_atomic_plan_gets_deterministic_compatibility_fields():
     normalized = normalize_atomic_edit_plan_payload(
         {

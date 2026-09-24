@@ -29,6 +29,7 @@ class _SourceUiHintParser(HTMLParser):
         self._anchor: dict[str, object] | None = None
         self._select: dict[str, object] | None = None
         self._option: dict[str, object] | None = None
+        self._button: dict[str, object] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {key: value or "" for key, value in attrs}
@@ -61,6 +62,17 @@ class _SourceUiHintParser(HTMLParser):
             })
         if tag == "a" and values.get("href") and len(self.navigation) < 24:
             self._anchor = {"href": values["href"][:160], "text": []}
+        if tag == "button" and len(self.controls) < 24:
+            selector = ""
+            if values.get("id") and re.fullmatch(r"[A-Za-z_][\w-]*", values["id"]):
+                selector = "#" + values["id"]
+            else:
+                for attribute in ("data-testid", "data-action", "data-cmd", "aria-label"):
+                    if values.get(attribute):
+                        selector = f"button[{attribute}={json.dumps(values[attribute])}]"
+                        break
+            if selector:
+                self._button = {"tag": "button", "selector": selector, "text": []}
         if tag == "select" and len(self.controls) < 24:
             selectors: list[str] = []
             if values.get("data-testid"):
@@ -77,7 +89,7 @@ class _SourceUiHintParser(HTMLParser):
         elif tag == "option" and self._select is not None:
             self._option = {"value": values.get("value", "")[:120], "text": []}
         if (
-            tag in {"main", "nav", "section", "form", "aside"}
+            tag in {"main", "nav", "section", "form", "aside", "dialog"}
             or (values.get("id") and tag in {"div", "ul", "ol"})
         ) and len(self.surfaces) < 24:
             identifier = values.get("id", "")[:100]
@@ -87,15 +99,23 @@ class _SourceUiHintParser(HTMLParser):
                     "tag": tag,
                     **({"id": identifier} if identifier else {}),
                     **({"class": classes} if classes else {}),
+                    **({"hidden": True} if "hidden" in values else {}),
+                    **({"open": "open" in values} if tag == "dialog" else {}),
                 })
 
     def handle_data(self, data: str) -> None:
+        if self._button is not None and str(data).strip():
+            self._button["text"].append(" ".join(str(data).split()))
         if self._anchor is not None and str(data).strip():
             self._anchor["text"].append(" ".join(str(data).split()))
         if self._option is not None and str(data).strip():
             self._option["text"].append(" ".join(str(data).split()))
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "button" and self._button is not None:
+            self._button["text"] = " ".join(self._button["text"])[:120]
+            self.controls.append(self._button)
+            self._button = None
         if tag == "a" and self._anchor is not None:
             label = " ".join(self._anchor["text"])[:120]
             self.navigation.append({
@@ -286,10 +306,12 @@ def prepare_seed(source_frontend: Path, target_workdir: Path, source_evaluation:
     external_urls = external_asset_urls(source_frontend)
 
     frontend = target_workdir / "frontend"
-    shutil.copytree(source_frontend, frontend, ignore=shutil.ignore_patterns(".git"))
+    shutil.copytree(source_frontend, frontend, symlinks=True, ignore=shutil.ignore_patterns(".git"))
     _git(frontend, "init", "-b", "main")
     _git(frontend, "config", "user.name", "WebCoding Harness")
     _git(frontend, "config", "user.email", "webcoding-harness@local.invalid")
+    with (frontend / ".git/info/exclude").open("a") as excludes:
+        excludes.write("\nnode_modules/\n")
     _git(frontend, "add", "--all")
     _git(frontend, "commit", "-m", "chore: accepted forward-edit baseline")
     baseline = _git(frontend, "rev-parse", "HEAD")

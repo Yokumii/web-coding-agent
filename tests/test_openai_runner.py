@@ -75,7 +75,8 @@ def test_browser_screenshot_schema_exposes_distinct_page_positions():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("complete", [True, False])
-async def test_tokenwave_stream_preserves_text_tools_usage_and_rejects_truncation(monkeypatch, complete):
+@pytest.mark.parametrize("qwen", [True, False])
+async def test_tokenwave_stream_preserves_text_tools_usage_and_rejects_truncation(monkeypatch, complete, qwen):
     import httpx
     original = httpx.AsyncClient
     requests = []
@@ -92,19 +93,24 @@ async def test_tokenwave_stream_preserves_text_tools_usage_and_rejects_truncatio
         return httpx.Response(200, text=body + ("data: [DONE]\n\n" if complete else ""),
                               headers={"content-type":"text/event-stream"})
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs))
-    client = OpenAIHTTPClient(HarnessConfig(openai_base_url="https://api.tokenwave.us/v1",
+    client = OpenAIHTTPClient(HarnessConfig(openai_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1" if qwen else "https://api.tokenwave.us/v1",
                                            openai_api_key="test-key"), 20)
+    options = {'model':'qwen3.7-max','_stream':True,'enable_thinking':False} if qwen else {'model':'gpt-5.5'}
     if not complete:
         with pytest.raises(RuntimeError, match="DONE marker"):
-            await client.complete(model="gpt-5.5", messages=[])
+            await client.complete(**options, messages=[])
     else:
-        result = await client.complete(model="gpt-5.5", messages=[])
+        result = await client.complete(**options, messages=[])
         message = result["choices"][0]["message"]
         assert message["content"] == "Ready now"
         assert message["tool_calls"][0]["function"] == {"name":"read_file", "arguments":'{"path":"app.js"}'}
         assert result["usage"] == {"prompt_tokens":7,"completion_tokens":3}
     assert len(requests) == 1
     assert requests[0]["stream"] is True
+    assert '_stream' not in requests[0]
+    if qwen:
+        assert requests[0]['enable_thinking'] is False
+        assert requests[0]['model'] == 'qwen3.7-max'
 
 
 @pytest.mark.anyio
@@ -743,3 +749,124 @@ async def test_tokenwave_responses_recovery_preserves_prompt_and_usage(monkeypat
         assert result["choices"][0]["message"]["content"] == "{}"
         assert result["usage"]["prompt_tokens"] == 19
         assert result["usage"]["completion_tokens"] == 7
+
+
+@pytest.mark.anyio
+async def test_responses_profile_preserves_exact_endpoint_model_and_headers(monkeypatch):
+    import httpx
+    original = httpx.AsyncClient
+    def respond(request):
+        assert str(request.url) == 'https://api.nju-link.com/responses'
+        assert request.headers['x-openai-actor-authorization'] == 'local-image-extension'
+        assert request.headers['authorization'] == 'Bearer test-only'
+        body=json.loads(request.content)
+        assert body['model']=='gpt-5.6-luna' and body['store'] is False
+        assert body['text']=={'format':{'type':'json_object'}}
+        assert body['reasoning'] == {'effort': 'low'}
+        event={'type':'response.completed','response':{'status':'completed','output':[
+            {'type':'message','content':[{'type':'output_text','text':'{"ok":true}'}]}],
+            'usage':{'input_tokens':9,'output_tokens':4}}}
+        return httpx.Response(200,text='data: '+json.dumps(event)+'\n\n')
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kwargs: original(transport=httpx.MockTransport(respond),**kwargs))
+    config=HarnessConfig(openai_base_url='https://api.nju-link.com',openai_api_key='test-only',
+        openai_wire_api='responses',openai_extra_headers={'x-openai-actor-authorization':'local-image-extension'})
+    result=await OpenAIHTTPClient(config,10).complete(model='gpt-5.6-luna',messages=[{'role':'user','content':'Test configuration'}],response_format={'type':'json_object'},reasoning_effort='low')
+    assert result['choices'][0]['message']['content']=='{"ok":true}'
+    assert result['usage']['prompt_tokens']==9
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('status',['completed','failed','incomplete'])
+async def test_responses_terminal_event_does_not_wait_for_connection_close(monkeypatch,tmp_path,status):
+    import httpx
+    original=httpx.AsyncClient
+    closed=[]
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield ('data: '+json.dumps({'type':'response.output_text.delta','delta':'secret generated text'})+'\n\n').encode()
+            yield ('data: '+json.dumps({'type':'response.'+status,'response':{'status':status,
+                'output':[{'content':[{'type':'output_text','text':'done'}]}],
+                'usage':{'input_tokens':3,'output_tokens':1}}})+'\n\n').encode()
+            raise AssertionError('Client read beyond the terminal event')
+        async def aclose(self):closed.append(True)
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kwargs:original(transport=httpx.MockTransport(lambda request:httpx.Response(200,stream=Stream())),**kwargs))
+    log=tmp_path/'stream.jsonl';monkeypatch.setenv('OPENAI_STREAM_LOG',str(log))
+    client=OpenAIHTTPClient(HarnessConfig(openai_base_url='https://example.test',openai_api_key='test-secret',openai_wire_api='responses'),1)
+    if status=='completed':
+        result=await client.complete(model='gpt-5.6-luna',messages=[{'role':'user','content':'secret prompt'}])
+        assert result['choices'][0]['message']['content']=='done'
+    else:
+        with pytest.raises(RuntimeError,match='without a completed response'):
+            await client.complete(model='gpt-5.6-luna',messages=[])
+    assert closed
+    records=[json.loads(line) for line in log.read_text().splitlines()]
+    terminal=next(r for r in records if r['event']=='terminal_event')
+    assert terminal['status']==status and terminal['output_chars']==21
+    assert terminal['usage']['input_tokens']==3
+    assert 'secret' not in log.read_text()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('partial_text', ['', 'partial model output'])
+async def test_responses_timeout_keeps_stream_progress(monkeypatch,tmp_path,partial_text):
+    import asyncio,httpx
+    original=httpx.AsyncClient
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b': keep-alive\n\ndata: {"type":"response.created"}\n\n'
+            if partial_text:
+                yield ('data: '+json.dumps({'type':'response.output_text.delta','delta':partial_text})+'\n\n').encode()
+            await asyncio.sleep(60)
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kwargs:original(transport=httpx.MockTransport(lambda request:httpx.Response(200,stream=Stream())),**kwargs))
+    log=tmp_path/'stream.jsonl';monkeypatch.setenv('OPENAI_STREAM_LOG',str(log))
+    client=OpenAIHTTPClient(HarnessConfig(openai_base_url='https://example.test',openai_api_key='test',openai_wire_api='responses'),.05)
+    with pytest.raises(TimeoutError):await client.complete(model='gpt-5.6-luna',messages=[])
+    records=[json.loads(line) for line in log.read_text().splitlines()]
+    assert records[-1]['event']=='request_interrupted'
+    assert records[-1]['event_count']==1+bool(partial_text) and records[-1]['output_chars']==len(partial_text)
+    if partial_text:
+        saved = next(item for item in records if item['event']=='partial_response_saved')
+        assert Path(saved['path']).read_text() == partial_text
+        assert saved['status']=='incomplete'
+    assert any(r['event']=='response_headers' and r['status']==200 for r in records)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('failures,expected_calls', [(1, 2), (3, 3)])
+async def test_responses_only_retries_diagnosed_stream_read_failures(monkeypatch, tmp_path, failures, expected_calls):
+    import httpx
+    from src.agents.openai_runner import ResponsesStreamReadError
+    original = httpx.AsyncClient
+    calls = []
+    sleeps = []
+    def respond(request):
+        calls.append(json.loads(request.content))
+        if len(calls) <= failures:
+            event = {'type':'error','error':{'code':'stream_read_error'}}
+        else:
+            event = {'type':'response.completed','response':{'status':'completed',
+                'output':[{'type':'message','content':[{'type':'output_text','text':'{}'}]}],
+                'usage':{'input_tokens':5,'output_tokens':2}}}
+        return httpx.Response(200,text='data: '+json.dumps(event)+'\n\n')
+    async def sleep(seconds):
+        sleeps.append(seconds)
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: original(transport=httpx.MockTransport(respond), **kw))
+    monkeypatch.setattr('src.agents.openai_runner.asyncio.sleep', sleep)
+    log = tmp_path/'stream.jsonl'
+    monkeypatch.setenv('OPENAI_STREAM_LOG',str(log))
+    config = HarnessConfig(openai_base_url='https://api.nju-link.com',openai_api_key='test',
+        openai_wire_api='responses',openai_stream_read_retries=2)
+    client = OpenAIHTTPClient(config, 10)
+    if failures == 3:
+        with pytest.raises(ResponsesStreamReadError):
+            await client.complete(model='gpt-5.6-luna',messages=[])
+    else:
+        result = await client.complete(model='gpt-5.6-luna',messages=[])
+        assert result['usage']['input_tokens'] == 5
+    assert len(calls) == expected_calls
+    assert all(call == calls[0] for call in calls)
+    assert sleeps == [5, 10][:expected_calls-1]
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    retries = [e for e in events if e['event']=='request_retry']
+    assert len(retries) == expected_calls-1
+    assert all(e['failed_request_usage']=='unavailable' for e in retries)

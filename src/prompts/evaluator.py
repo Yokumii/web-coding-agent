@@ -192,6 +192,24 @@ Apply these verdict rules:
    Occlusion, Crowding, Text Overlap, Alignment, Color Contrast, Overflow,
    Sizing Proportion, Loss of Interactivity, Semantic Error, Nesting Error, or
    Missing Attributes. If none fits exactly, leave the list empty.
+10. Treat behavior as the contract: derive a mapping from the current source to
+    the rendered controls and data. Equivalent markup (for example a strong
+    element wrapped in a paragraph) passes when content, formatting, state and
+    submission behavior are equivalent. Do not fail on business-field names,
+    DOM depth, or serialization differences alone.
+11. For each subtask use one shortest causal flow, with at most one recovery or
+    failure branch when the instruction requires it. Check preconditions first;
+    never ask an already-completed state to perform a disabled action.
+12. When a failure is observed, write the failed action, expected/actual result,
+    source location, and direct evidence of overlays, hidden ancestors, or runtime
+    errors. Mark root cause as confirmed only when evidence proves it; label other
+    causes as hypotheses. Remove stale, already-fixed findings.
+13. Add `skill_feedback` to the grade when an Edit task fails. Route project-only
+    defects to the project, reusable host wiring to the selected Skill, broken
+    component behavior to its reference implementation, and invalid actions or
+    assertions to the Harness. Skill feedback is a proposal only: it must be
+    validated on the triggering real sample plus affected regression behavior
+    before the current Skill version is replaced.
 
 ## Output Contract
 

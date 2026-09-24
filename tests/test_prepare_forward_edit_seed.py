@@ -71,6 +71,20 @@ def test_compact_source_ui_contract_keeps_navigation_without_source_code(tmp_pat
     assert "secret" not in json.dumps(contract)
 
 
+def test_compact_source_ui_contract_keeps_button_entry_and_closed_dialog(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "index.html").write_text(
+        '<button data-action="archives"><span>Open</span> Archives</button>'
+        '<dialog id="archive-modal"><button id="close">Close</button></dialog>'
+    )
+    evaluation = tmp_path / "evaluation.json"
+    evaluation.write_text("{}")
+    page = compact_source_ui_contract(source, evaluation)["pages"][0]
+    assert page["controls"][0] == {"tag": "button", "selector": 'button[data-action="archives"]', "text": "Open Archives"}
+    assert {"tag": "dialog", "id": "archive-modal", "open": False} in page["surfaces"]
+
+
 def test_compact_source_ui_contract_keeps_repeated_runtime_collection_selector(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()

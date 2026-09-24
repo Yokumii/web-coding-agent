@@ -18,6 +18,18 @@ def test_tab_focus_sequence_must_assert_the_destination():
         ])
 
 
+@pytest.mark.parametrize('bounds',[{'min':float('nan'),'max':1},{'min':2,'max':1},{'min':True,'max':1}])
+def test_numeric_assertion_rejects_invalid_bounds(bounds):
+    with pytest.raises(ActionContractError):
+        validate_ui_action({'action':'assert_number','selector':'progress','property':'value',**bounds})
+
+
+def test_file_fixture_cannot_expand_without_a_bound():
+    with pytest.raises(ActionContractError):
+        validate_ui_action({'action':'set_input_files','selector':'input','files':[
+            {'name':'huge.txt','mime_type':'text/plain','content':'x','size_bytes':33*1024*1024}]})
+
+
 def test_tab_requires_a_deterministic_starting_selector():
     with pytest.raises(ActionContractError, match="starting selector"):
         validate_ui_action_sequence([

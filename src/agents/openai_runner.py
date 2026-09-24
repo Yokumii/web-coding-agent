@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,10 @@ from src.config import HarnessConfig
 from src.prompts.final_chance import FINAL_CHANCE_TURNS, final_chance_prompt
 from src.orchestration.pricing import estimate_cost_usd
 from src.orchestration.task_inputs import openai_user_content
+
+
+class ResponsesStreamReadError(RuntimeError):
+    """Explicit upstream stream-read failure; output remains uncommitted."""
 
 
 @dataclass
@@ -215,7 +220,7 @@ class OpenAIHTTPClient:
         message = {"role": "assistant", "content": ""}
         calls, finish, done = {}, None, False
         async with client.stream("POST", base + "/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
+                headers={**self.config.openai_extra_headers, "Authorization": f"Bearer {key}"},
                 json={**payload, "stream": True, "stream_options": {"include_usage": True}}) as response:
             if response.is_error:
                 body = (await response.aread()).decode(errors="replace")[:2000]
@@ -281,23 +286,94 @@ class OpenAIHTTPClient:
         request = {"model": payload["model"], "instructions": "\n\n".join(instructions),
                    "input": inputs, "max_output_tokens": payload.get("max_tokens", 12000),
                    "stream": True, "store": False}
+        if payload.get("reasoning_effort"):
+            request["reasoning"] = {"effort": payload["reasoning_effort"]}
+        if payload.get("response_format", {}).get("type") == "json_object":
+            request["text"] = {"format": {"type": "json_object"}}
+        elif payload.get("response_format", {}).get("type") == "json_schema":
+            request["text"] = {"format": {"type": "json_schema", **payload["response_format"]["json_schema"]}}
         completed = None
-        async with client.stream("POST", base + "/responses",
-                headers={"Authorization": f"Bearer {key}"}, json=request) as response:
-            if response.is_error:
-                body = (await response.aread()).decode(errors="replace")[:2000]
-                raise httpx.HTTPStatusError(f"{response.status_code} from streamed responses: {body}",
-                                           request=response.request, response=response)
-            async for line in response.aiter_lines():
-                if not line.startswith("data:") or line[5:].strip() == "[DONE]":
-                    continue
-                event = json.loads(line[5:].strip())
-                if event.get("type") in {"response.completed", "response.failed", "response.incomplete"}:
-                    completed = event.get("response")
-                elif event.get("type") == "error":
-                    raise RuntimeError(f"streamed responses error: {event}")
-        if not completed or completed.get("status") != "completed":
-            raise RuntimeError(f"responses stream ended without a completed response: {completed}")
+        started = time.monotonic()
+        request_id = uuid.uuid4().hex
+        trace_path = os.getenv("OPENAI_STREAM_LOG")
+        event_count = output_chars = reasoning_chars = 0
+        output_deltas = []
+        first_line = True
+        last_progress = started
+
+        def record(kind, **details):
+            # Diagnostic metadata only: never log headers, credentials, prompts,
+            # generated text or reasoning content.
+            if trace_path:
+                path = Path(trace_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as trace:
+                    trace.write(json.dumps({
+                        "request_id": request_id, "event": kind,
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                        "event_count": event_count, "output_chars": output_chars,
+                        "reasoning_chars": reasoning_chars, **details,
+                    }, ensure_ascii=False) + "\n")
+
+        record("request_start", model=payload["model"], timeout_seconds=self.timeout)
+        try:
+            async with client.stream("POST", base + "/responses",
+                    headers={**self.config.openai_extra_headers, "Authorization": f"Bearer {key}"}, json=request) as response:
+                record("response_headers", status=response.status_code,
+                       content_type=response.headers.get("content-type", ""))
+                if response.is_error:
+                    body = (await response.aread()).decode(errors="replace")[:2000]
+                    raise httpx.HTTPStatusError(f"{response.status_code} from streamed responses: {body}",
+                                               request=response.request, response=response)
+                async for line in response.aiter_lines():
+                    if first_line:
+                        record("first_stream_line")
+                        first_line = False
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        record("done_marker")
+                        break
+                    event = json.loads(data)
+                    event_count += 1
+                    event_type = event.get("type", "")
+                    if event_type == "response.output_text.delta":
+                        output_chars += len(event.get("delta") or "")
+                        output_deltas.append(event.get("delta") or "")
+                    elif event_type in {"response.reasoning_text.delta", "response.reasoning_summary_text.delta"}:
+                        reasoning_chars += len(event.get("delta") or "")
+                    now = time.monotonic()
+                    if event_count == 1 or now - last_progress >= 2:
+                        record("stream_progress", event_type=event_type)
+                        last_progress = now
+                    if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                        completed = event.get("response")
+                        record("terminal_event", event_type=event_type,
+                               status=(completed or {}).get("status"),
+                               usage=(completed or {}).get("usage") or {})
+                        # The terminal event ends the response. Some gateways
+                        # keep the HTTP connection open indefinitely afterwards.
+                        break
+                    if event_type == "error":
+                        if (event.get("error") or {}).get("code") == "stream_read_error":
+                            raise ResponsesStreamReadError("upstream stream_read_error")
+                        raise RuntimeError(f"streamed responses error: {event}")
+            if not completed or completed.get("status") != "completed":
+                raise RuntimeError(
+                    "responses stream ended without a completed response: "
+                    f"status={(completed or {}).get('status')}, events={event_count}, "
+                    f"output_chars={output_chars}"
+                )
+        except BaseException as exc:
+            if trace_path and output_deltas:
+                partial = Path(trace_path).parent / "interrupted_responses" / f"{request_id}.txt"
+                partial.parent.mkdir(parents=True, exist_ok=True)
+                partial.write_text("".join(output_deltas), encoding="utf-8")
+                record("partial_response_saved", path=str(partial), status="incomplete")
+            record("request_interrupted", error_type=type(exc).__name__)
+            raise
+        record("request_completed", usage=completed.get("usage") or {})
         content = "".join(part.get("text", "") for item in completed.get("output", [])
                           for part in item.get("content", []) if part.get("type") == "output_text")
         if not content.strip():
@@ -310,7 +386,8 @@ class OpenAIHTTPClient:
 
     async def complete(self, **payload):
         import httpx
-        protocol = payload.pop("_protocol", "chat")
+        protocol = payload.pop("_protocol", self.config.openai_wire_api)
+        stream = payload.pop("_stream", False)
         base = (self.config.openai_base_url or self.config.base_url).rstrip("/")
         key = self.config.openai_api_key or self.config.api_key
         if not base or not key:
@@ -326,15 +403,32 @@ class OpenAIHTTPClient:
             trust_env=True,
             proxy=os.environ.get("TOKENWAVE_API_PROXY") if urlsplit(base).hostname == "api.tokenwave.us" else None,
         ) as client:
-            if urlsplit(base).hostname == "api.tokenwave.us":
-                if protocol == "responses":
-                    return await self._stream_responses(client, base, key, payload)
-                return await self._stream_complete(client, base, key, payload)
+            if protocol == "responses":
+                retries = min(2, max(0, self.config.openai_stream_read_retries))
+                for attempt in range(retries + 1):
+                    try:
+                        async with asyncio.timeout(self.timeout):
+                            return await self._stream_responses(client, base, key, payload)
+                    except ResponsesStreamReadError:
+                        if attempt == retries:
+                            raise
+                        delay = 5 * (attempt + 1)
+                        if trace_path := os.getenv("OPENAI_STREAM_LOG"):
+                            with Path(trace_path).open("a", encoding="utf-8") as trace:
+                                trace.write(json.dumps({"event": "request_retry", "model": payload["model"],
+                                    "reason": "stream_read_error", "attempt": attempt + 2,
+                                    "delay_seconds": delay, "failed_request_usage": "unavailable"}) + "\n")
+                        await asyncio.sleep(delay)
+            if protocol != "chat":
+                raise ValueError(f"Unsupported OpenAI wire API: {protocol}")
+            if stream or urlsplit(base).hostname == "api.tokenwave.us":
+                async with asyncio.timeout(self.timeout):
+                    return await self._stream_complete(client, base, key, payload)
             # Paid requests are single-attempt. Transport errors, throttling,
             # and provider failures must never cause an implicit duplicate call.
             response = await client.post(
                 base + "/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
+                headers={**self.config.openai_extra_headers, "Authorization": f"Bearer {key}"},
                 json=payload,
                 timeout=httpx.Timeout(self.timeout),
             )

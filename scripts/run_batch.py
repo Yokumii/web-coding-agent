@@ -405,8 +405,10 @@ async def run_batch(
         ):
             raise ValueError(f"{task.id}: completed chain metadata changed; use a new run ID")
     completed = {
-        task_id for task_id, record in latest_results.items()
-        if record.get("status") == "ok"
+        task.id for task in tasks
+        if (record := latest_results.get(task.id, {})).get("status") == "ok"
+        and (not task.edits or [step.get("edit_id") for step in record.get("steps", [])]
+             == [step.id for step in task.edits])
     }
     pending = [(index, task) for index, task in enumerate(tasks) if task.id not in completed]
     semaphore = asyncio.Semaphore(workers)

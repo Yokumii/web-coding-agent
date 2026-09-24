@@ -182,6 +182,7 @@ def ensure_edit_context(
     context_lines: int = 18,
     source_anchors: list[str] | None = None,
     include_dependency_paths: bool = False,
+    full_repair_context: bool = False,
 ) -> dict[str, Any]:
     """Select deterministic code windows; never ask an LLM to discover source scope."""
     path = harness_dir / edit_context_name(round_num)
@@ -207,7 +208,11 @@ def ensure_edit_context(
             + (dependency_paths if include_dependency_paths else [])
         )
     )
-    if "style" not in requested_roles and not include_dependency_paths:
+    # Repair needs enough current state to reconcile runtime evidence with the
+    # files actually on disk.  Expose the complete frontend source when it fits
+    # the generous repair budget; mutation scope remains enforced separately by
+    # the repair packet and atomic executor.
+    if "style" not in requested_roles and not include_dependency_paths and not full_repair_context:
         # Behavior-only edits need markup and script context, but loading every
         # connected stylesheet spends tokens and invites gratuitous visual churn.
         # A typed style failure can still unlock that dependency on a later round.
@@ -219,6 +224,8 @@ def ensure_edit_context(
         ]
     source_anchors = [str(item) for item in source_anchors or [] if str(item).strip()]
     all_files = _source_files(workdir)
+    if full_repair_context:
+        selected_paths = [str(path.relative_to(workdir)) for path in all_files]
     full_source_chars = sum(
         len(item.read_text(encoding="utf-8", errors="replace")) for item in all_files
     )

@@ -16,6 +16,7 @@ from typing import Any
 from src.agents.evaluator import (
     _determine_passed,
     build_deterministic_failure_grades,
+    build_lightweight_browser_grades,
     run_evaluator,
 )
 from src.agents.design_stage import run_design_stage
@@ -63,6 +64,7 @@ from src.orchestration.atomic_edit_plan import (
     read_atomic_edit_plan,
 )
 from src.orchestration.repair_packet import write_repair_packet
+from src.orchestration.skill_feedback import write_skill_feedback
 from src.orchestration.task_inputs import load_task_input_manifest
 from src.orchestration.preimplementation_validation import (
     freeze_preimplementation_validation,
@@ -582,8 +584,10 @@ async def run_build_phase(
             round_num=round_num,
             source_anchors=list(atomic_plan.get("source_anchors") or []),
             include_dependency_paths=ctx.config.edit_frozen_compound_mode,
+            full_repair_context=(mode == "repair"),
             **({"max_total_chars": 250000, "max_file_chars": 250000}
-               if (ctx.file_comm.read_state() or {}).get("supplied_atomic_plan") else {}),
+               if (mode == "repair") or (ctx.file_comm.read_state() or {}).get("supplied_atomic_plan")
+               else {}),
         )
     track_build = (
         (incremental_edit or mode == "repair")
@@ -1327,7 +1331,7 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                 # A continuous Edit uses its one planner-authored browser flow
                 # as the only acceptance check. The legacy DOM scope guard can
                 # mistake explicitly requested additions for collateral edits.
-                if frozen_validation is None:
+                if frozen_validation is None and not ctx.config.lightweight_edit_production:
                     guard_result = await evaluate_guard(
                         workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
                         app_url=app_stack.frontend_url, round_num=round_num,
@@ -1335,7 +1339,7 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                     )
                 edit_card = read_edit_card(ctx.file_comm.dir)
                 try:
-                    if edit_card is not None:
+                    if edit_card is not None and not ctx.config.lightweight_edit_production:
                         regression_selection = select_accepted_replay_checks(
                             ctx.file_comm.dir,
                             edit_card=edit_card,
@@ -1351,10 +1355,10 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                         )
                     else:
                         regression_selection = None
-                        replay_checks = accepted_replay_checks(ctx.file_comm.dir)
+                        replay_checks = []
                 except AcceptedTapeError as exc:
                     raise EvaluationInfrastructureError(str(exc)) from exc
-                if replay_checks:
+                if replay_checks and not ctx.config.lightweight_edit_production:
                     accepted_tape_evidence = await asyncio.wait_for(
                         collect_browser_evidence(
                             app_url=app_stack.frontend_url,
@@ -1419,11 +1423,11 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                         + ", ".join(invalid_contracts)
                         + "; refusing to fabricate a code repair from a broken test."
                     )
-                hidden_checks = (
+                hidden_checks = ([] if ctx.config.lightweight_edit_production else (
                     frozen_hidden_oracle_checks(frozen_validation)
                     if frozen_validation is not None
                     else read_hidden_oracle_checks(ctx.file_comm.dir)
-                )
+                ))
                 if hidden_checks:
                     source_risks = await asyncio.wait_for(collect_source_risk_baseline(
                         ctx.workdir, hidden_checks, headless=ctx.config.playwright_headless), timeout=75)
@@ -1469,6 +1473,12 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                         sprint_context=sprint_ctx,
                         ui_checks=visible_checks,
                         edit_guard=guard_result,
+                    )
+                elif ctx.config.lightweight_edit_production:
+                    passed, grades, ev_stats = build_lightweight_browser_grades(
+                        file_comm=ctx.file_comm, round_num=round_num,
+                        sprint_num=sprint_num, sprint_context=sprint_ctx,
+                        ui_checks=visible_checks, evidence=browser_evidence,
                     )
                 else:
                     try:
@@ -1643,7 +1653,8 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
         "originality_required": not is_edit_task or ctx.config.edit_originality_required,
         "reason": "Product Session novelty belongs to the product direction, not each atomic Edit.",
     }
-    if ctx.config.evaluator_mode == "full" and startup_error is None and visual_ready and needs_visual:
+    if (not ctx.config.lightweight_edit_production and
+            ctx.config.evaluator_mode == "full" and startup_error is None and visual_ready and needs_visual):
         async with _agent_phase_session(ctx, phase_name=f"visual review round {round_num}"):
             try:
                 grades, vs_stats = await asyncio.wait_for(
@@ -1789,6 +1800,13 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                 str(item.get("check_id", "unknown")) for item in packet.get("failed_checks") or []
             ],
         }
+    # Keep Skill learning separate from the repair itself.  The packet is the
+    # current code handoff; this artifact is a proposed reusable change that
+    # remains disabled until the same sample and regression flow pass.
+    if read_edit_task_contract(ctx.workdir) is not None:
+        # Keep feedback as its own artifact.  ``Grades`` is a strict persisted
+        # schema and must not be extended with the routing payload.
+        write_skill_feedback(workdir=ctx.workdir, round_num=round_num, grades=grades)
     if isinstance(grades.get("criteria"), dict) and "round" in grades:
         current_checks = ctx.sprint_state.ui_checks_for_sprint(sprint_num)
         if (

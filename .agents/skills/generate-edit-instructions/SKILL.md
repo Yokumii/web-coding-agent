@@ -68,3 +68,14 @@ Image Generate仅输入目标图和页面/状态说明；Image Edit仅增加sour
 出口是dataset/six_tasks/dataset_index.json；仅消费该索引指向的六类不可变JSONL分片，不glob目录中的历史分片。每行含messages、images/input_images、response及隐藏metadata，Edit/Repair答案为官方XML search_replace，Generate答案为完整项目Markdown。图片/资源按内容版本缓存，恢复校验哈希后复用，最后原子更新索引。
 
 按官方600条Edit/Repair的实际4–12项频数保存sampling索引；单页/多页各占官方任务的50%。保留全量样本，并为数量对齐部分计算权重；批入口汇总所有Session后重新计算全局权重和缺档。数量对齐与16/11类标签对齐分别标记，扩展Edit类别保持原标签。原子补充池与对齐部分的训练混合比例由消费侧配置，当前不丢数据、不强制抽样。由同一原始源码派生的样本共用lineage_group，训练/验证按组划分。官方频数和源文件SHA在Harness的src/orchestration/webcompass_subtask_distribution.json。
+
+## 宿主接入与持续改进
+
+先从现有源码定位真实入口、数据源、目标 DOM 容器和事件；保留宿主容器结构与已有状态，不以字段名、DOM 层级或 HTML 序列化字符串做硬编码验收。挂载时传入现有 refs/state 与回调，隐藏状态沿用宿主的可见性/路由机制；组件销毁时调用 `destroy()` 并移除监听，避免全局快捷键冲突、重复挂载和 stale 状态。示例：
+
+```javascript
+const instance = mount({ container: existingRegion, initialValue: existingState.value, onChange: value => updateExistingState(value) });
+view.addEventListener('beforeunload', () => instance.destroy(), { once: true });
+```
+
+验收采用一条最短因果路径，先建立前置状态，再执行核心操作并断言内容、状态和提交结果；必要时只补一个失败/恢复分支。失败反馈必须包含失败动作、预期/实际、源码位置和直接浏览器证据，并区分已确认根因与推测。Harness 会把可复用的宿主接入或参考实现问题写成待验证 Skill 改进；只有同一真实样本和受影响回归行为均通过后才启用新版本，运行中的任务继续使用原版本。不得写入样本专属答案或删除有效检查。

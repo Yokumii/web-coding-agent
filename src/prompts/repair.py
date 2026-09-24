@@ -14,6 +14,13 @@ reformat, reorganize, rename, or rewrite working files. A preloaded code window 
 inspection only inside that exact window. If the repair falls outside it, read only the missing
 line range. Obey tool denials and follow only a recorded dependency edge after validation.
 
+The current worktree is authoritative. Before proposing any patch, reread the exact current
+source window named by the failure packet and choose old_text from that current file, not from a
+canonical Skill reference, an earlier candidate, or a previous rejected response. If an earlier
+patch was rejected, assume none of it was applied and recompute every patch against the current
+worktree. Never submit a guessed old_text; an exact-text patch whose anchor is absent is a failed
+repair and must be replaced with a patch using a verified current anchor.
+
 Run at most one smallest relevant syntax/build/test validation after the latest mutation. Then
 create one atomic `fix(scope): description` commit in the existing frontend repository. Never
 start a dev server, use external runtime assets, edit Harness-owned scope/context artifacts, or

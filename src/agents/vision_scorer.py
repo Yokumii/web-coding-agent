@@ -251,7 +251,9 @@ def _perform_visual_review_request(
         )
 
     started = time.perf_counter()
-    if urlsplit(config.evaluator_vision_base_url or "").hostname == "api.tokenwave.us":
+    if (urlsplit(config.evaluator_vision_base_url or "").hostname == "api.tokenwave.us"
+        or (config.openai_wire_api == "responses"
+            and config.evaluator_vision_base_url == config.openai_base_url)):
         # Reuse the native streaming transport and its explicit TokenWave proxy.
         # Reasoning models must not receive the legacy temperature=0 default.
         from src.agents.openai_runner import OpenAIHTTPClient

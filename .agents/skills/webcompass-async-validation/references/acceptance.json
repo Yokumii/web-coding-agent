@@ -1,0 +1,12 @@
+{
+  "schema_version": "edit-skill-acceptance-v1",
+  "task_type": "Async Form Validation",
+  "flow": "Fill an invalid value, assert invalid feedback and blocked submission; fill a valid value, wait for validation and assert enabled submission. Rapidly replace the value and verify stale response cannot win.",
+  "grounding": [
+    "Use actual source data and stable current anchors; new selectors only for required new UI.",
+    "Before implementation freeze one continuous browser_check covering the core causal behavior and one important edge; aim for at most 24 actions. Implementation must still satisfy the full instruction.",
+    "Use only Harness typed actions, exact expected values derived from source or test input, and end with assert_no_console_errors.",
+    "A fixture may arrange preconditions, never write the result being tested. Preserve unrelated routes and interactions."
+  ],
+  "visual_policy": "Prefer deterministic DOM/state/style/geometry evidence; keep a targeted visual check only for explicit requirements those checks cannot establish."
+}

@@ -1,0 +1,4 @@
+.wc-tree ul { list-style:none; padding-inline-start:1.25rem; }
+.wc-tree li>div { display:flex; align-items:center; gap:.5rem; padding:.25rem; }
+.wc-tree [role=treeitem]:focus { outline:2px solid currentColor; outline-offset:2px; }
+.wc-tree input,.wc-tree button { font:inherit; }

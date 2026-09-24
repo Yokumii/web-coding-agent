@@ -1,0 +1,12 @@
+.wc-cart__root { color: inherit; font: inherit; margin-block: 1rem; }
+.wc-cart__heading { font-size: 1.25em; margin-block: 0 .75rem; }
+.wc-cart__lines { list-style: none; margin: 0; padding: 0; }
+.wc-cart__line {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: .75rem; padding-block: .5rem;
+}
+.wc-cart__item { flex: 1 1 12rem; overflow-wrap: anywhere; }
+.wc-cart__quantity-label { display: inline-flex; align-items: center; gap: .5rem; margin: 0; }
+.wc-cart__quantity { box-sizing: border-box; width: 5rem; max-width: 100%; font: inherit; }
+.wc-cart__subtotal, .wc-cart__total { display: inline; color: inherit; font: inherit; }
+.wc-cart__summary { font-weight: bold; margin-block: .75rem 0; }

@@ -1,0 +1,41 @@
+.wc-upload {
+  font: inherit;
+  color: inherit;
+}
+.wc-upload__drop {
+  padding: 1rem;
+  border: 2px dashed currentColor;
+}
+.wc-upload__active {
+  outline: 3px solid currentColor;
+}
+.wc-upload ul {
+  list-style: none;
+  padding: 0;
+}
+.wc-upload li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+}
+.wc-upload li > span:first-child {
+  flex: 1 1 10rem;
+  overflow-wrap: anywhere;
+}
+.wc-upload button,
+.wc-upload input {
+  font: inherit;
+}
+.wc-upload__preview {
+  width: 2.5rem;
+  height: 2.5rem;
+  object-fit: contain;
+}
+.wc-upload [hidden] {
+  display: none !important;
+}
+.wc-upload input {
+  max-width: 100%;
+}

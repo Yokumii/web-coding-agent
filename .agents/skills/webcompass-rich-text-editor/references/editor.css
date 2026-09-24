@@ -1,0 +1,7 @@
+.wc-editor { font:inherit; color:inherit; }
+.wc-editor__toolbar { display:flex; flex-wrap:wrap; gap:.25rem; position:sticky; top:0; background:Canvas; color:CanvasText; z-index:1; padding:.5rem; }
+.wc-editor button,.wc-editor input { font:inherit; }
+.wc-editor__content { min-height:10rem; padding:1rem; border:1px solid currentColor; overflow-wrap:anywhere; white-space:pre-wrap; }
+.wc-editor__content img { max-width:100%; height:auto; }
+.wc-editor [hidden], .wc-editor[hidden] { display:none !important; }
+.wc-editor__image-error { min-width:8rem; min-height:2rem; border:1px dashed currentColor; }

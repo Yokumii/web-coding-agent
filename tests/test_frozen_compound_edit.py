@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import asyncio
+import json
 
 import pytest
 
@@ -84,6 +86,20 @@ def test_plan_rejects_rewritten_frozen_instruction():
             planner_model="gpt-5.6-luna",
             frozen_subtasks=tasks,
         )
+
+
+def test_compact_planner_output_binds_immutable_dataset_fields():
+    tasks = frozen_tasks()
+    payload = raw_plan(tasks)
+    for item in payload["subtasks"]:
+        item.pop("task_type")
+        item.pop("instruction")
+        item["atomic_plan"].pop("goal", None)
+    result = normalize_frozen_compound_plan(payload, case_id="case", source_code_sha256="abc",
+                                           planner_model="gpt-5.6-luna", frozen_subtasks=tasks)
+    for task, item in zip(tasks, result["subtasks"]):
+        assert item["instruction"] == item["atomic_plan"]["goal"] == task["instruction"]
+        assert item["task_type"] == task["task_type"]
 
 
 def test_plan_rejects_check_outside_write_routes():
@@ -265,3 +281,64 @@ def test_frozen_plan_detects_post_plan_mutation(tmp_path):
 
     with pytest.raises(ValueError, match="goal must equal|hash mismatch"):
         read_frozen_compound_plan(path)
+
+
+@pytest.mark.parametrize('mode',['required','conditional','not_required'])
+def test_visual_evidence_inline_reason_preserves_mode_and_explanation(mode):
+    tasks=frozen_tasks();payload=raw_plan(tasks)
+    payload['subtasks'][0]['atomic_plan']['visual_evidence']=mode+': inspect only the target panel'
+    result=normalize_frozen_compound_plan(payload,case_id='case',source_code_sha256='abc',planner_model='gpt-5.6-luna',frozen_subtasks=tasks)
+    actual=result['subtasks'][0]['atomic_plan']
+    assert actual['visual_evidence']==mode
+    assert actual['visual_evidence_reason']=='inspect only the target panel'
+
+
+def test_visual_evidence_unknown_mode_is_not_guessed():
+    tasks=frozen_tasks();payload=raw_plan(tasks)
+    payload['subtasks'][0]['atomic_plan']['visual_evidence']='skip: inspect only the target panel'
+    with pytest.raises(ValueError):normalize_frozen_compound_plan(payload,case_id='case',source_code_sha256='abc',planner_model='gpt-5.6-luna',frozen_subtasks=tasks)
+
+
+def test_planner_corrects_hidden_entry_once_and_reuses_saved_responses(tmp_path, monkeypatch):
+    from src.agents.compound_edit_planner import plan_frozen_compound_edit
+    from src.agents.openai_runner import OpenAIHTTPClient
+    from src.config import HarnessConfig
+    tasks=frozen_tasks(); bad=raw_plan(tasks); good=raw_plan(tasks); calls=[]
+    bad['subtasks'][0]['atomic_plan']['checks'][0]['actions'].insert(0,{'action':'click','selector':'#hidden'})
+    good['subtasks'][0]['atomic_plan']['checks'][0]['actions'].insert(0,{'action':'click','selector':'#open'})
+    async def complete(self, **kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        return {'choices':[{'message':{'content':json.dumps(bad if len(calls)==1 else good)}}],
+                'usage':{'input_tokens':10,'output_tokens':20}}
+    monkeypatch.setattr(OpenAIHTTPClient,'complete',complete)
+    kwargs=dict(config=HarnessConfig(edit_skills_enabled=True,planner_model='gpt-5.5'),case_id='case',
+        source_code_sha256='abc',frozen_subtasks=tasks,source_ui_contract={'pages':[{'route':'/',
+        'controls':[{'selector':'#hidden','initially_visible':False},{'selector':'#open','initially_visible':True}]}]},output_path=tmp_path/'plan.json')
+    result=asyncio.run(plan_frozen_compound_edit(**kwargs))
+    assert len(calls)==2 and 'initially hidden' in calls[1]['messages'][-1]['content']
+    assert result['usage']['input_tokens']==20
+    replay=asyncio.run(plan_frozen_compound_edit(**kwargs))
+    assert len(calls)==2 and replay['frozen_plan_sha256']==result['frozen_plan_sha256']
+
+
+def test_planner_rejects_menu_control_hidden_by_an_earlier_entry(tmp_path, monkeypatch):
+    from src.agents.compound_edit_planner import plan_frozen_compound_edit
+    from src.agents.openai_runner import OpenAIHTTPClient
+    from src.config import HarnessConfig
+    tasks=frozen_tasks(); bad=raw_plan(tasks); good=raw_plan(tasks); calls=[]
+    bad['subtasks'][0]['atomic_plan']['checks'][0]['actions'][:0]=[
+        {'action':'click','selector':'#start'}, {'action':'click','selector':'#menu-feature'}]
+    good['subtasks'][0]['atomic_plan']['checks'][0]['actions'][:0]=[
+        {'action':'click','selector':'#menu-feature'}, {'action':'click','selector':'#start'}]
+    async def complete(self, **kwargs):
+        calls.append(kwargs)
+        return {'choices':[{'message':{'content':json.dumps(bad if len(calls)==1 else good)}}]}
+    monkeypatch.setattr(OpenAIHTTPClient,'complete',complete)
+    kwargs=dict(config=HarnessConfig(edit_skills_enabled=True,planner_model='gpt-5.6-luna'),
+        case_id='case',source_code_sha256='abc',frozen_subtasks=tasks,
+        source_ui_contract={'pages':[{'route':'/','controls':[],
+            'entry_transitions':[{'click':'#start','hides':['#menu-feature']}]}]},
+        output_path=tmp_path/'plan.json')
+    asyncio.run(plan_frozen_compound_edit(**kwargs))
+    assert len(calls)==2
+    assert 'source entry navigation hides #menu-feature' in calls[1]['messages'][-1]['content']

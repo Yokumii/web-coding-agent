@@ -1,0 +1,4 @@
+.wc-skeleton { pointer-events:none; }
+.wc-skeleton [data-skeleton-block] { background:#8884; border-radius:.25rem; animation:wc-skeleton-pulse 1.2s ease-in-out infinite alternate; }
+@keyframes wc-skeleton-pulse { to { opacity:.4; } }
+@media(prefers-reduced-motion:reduce) { .wc-skeleton [data-skeleton-block] { animation:none; } }

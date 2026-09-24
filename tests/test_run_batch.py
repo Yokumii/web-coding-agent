@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+from dataclasses import replace
 
 import pytest
 
@@ -341,8 +342,9 @@ async def test_batch_does_not_label_unfinished_harness_as_ok(monkeypatch, tmp_pa
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("resume_prefix", [False, True])
 async def test_edit_chain_uses_each_accepted_target_as_next_source_and_exports_diff(
-    monkeypatch, tmp_path: Path,
+    monkeypatch, tmp_path: Path, resume_prefix,
 ):
     seed = tmp_path / "seed"
     seed.mkdir()
@@ -404,6 +406,15 @@ async def test_edit_chain_uses_each_accepted_target_as_next_source_and_exports_d
         seed_frontend=seed, seed_evaluation=evaluation,
         edits=(EditStep(id="q1", prompt="first"), EditStep(id="q2", prompt="second")),
     )
+
+    if resume_prefix:
+        prefix = await run_batch(
+            [replace(task, edits=task.edits[:1])], output_dir=tmp_path / "runs",
+            results_path=tmp_path / "results.jsonl", workers=1, base_port=6500,
+            timeout_seconds=10,
+        )
+        assert prefix[0]["status"] == "ok"
+        assert prior_counts == [0]
 
     result = await run_batch(
         [task], output_dir=tmp_path / "runs", results_path=tmp_path / "results.jsonl",

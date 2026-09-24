@@ -1,0 +1,31 @@
+{
+  "schema_version": "edit-skill-acceptance-v1",
+  "task_type": "File Upload with Progress",
+  "flow": "Choose a small allowed file, assert filename and non-final progress before completion; assert completion. Exercise cancellation/retry/remove/dedup/type or size rejection when requested.",
+  "grounding": [
+    "Use actual source data and stable current anchors; new selectors only for required new UI.",
+    "Before implementation freeze one continuous browser_check covering the core causal behavior and one important edge; aim for at most 24 actions. Implementation must still satisfy the full instruction.",
+    "Use only Harness typed actions, exact expected values derived from source or test input, and end with assert_no_console_errors.",
+    "A fixture may arrange preconditions, never write the result being tested. Preserve unrelated routes and interactions."
+  ],
+  "visual_policy": "Prefer deterministic DOM/state/style/geometry evidence; keep a targeted visual check only for explicit requirements those checks cannot establish.",
+  "reference_contract": {
+    "entry": "mountFileUpload",
+    "options": "deduplicate/removable/preview enable requested extras; onCreate/onUpdate adapt DOM only",
+    "selectors": {
+      "input": ".wc-upload input[type=file]",
+      "items": ".wc-upload li",
+      "progress": ".wc-upload progress",
+      "error": ".wc-upload [role=alert]",
+      "file_row": ".wc-upload li[data-file-name=\"the exact full fixture filename including extension\"]",
+      "retry": "[data-action=retry] inside that file row",
+      "remove": "[data-action=remove] inside that file row"
+    },
+    "state_attribute": "li[data-state=queued|uploading|complete|cancelled|failed]",
+    "progress": "DOM progress.value/max = 0..1/1. Use assert_number value min=0.001 max=0.999, then wait_for li[data-state=complete]. Never require a precise non-final value or a Start button.",
+    "entry_rule": "Click the grounded existing host control before testing the panel.",
+    "size_rule": "Use size_bytes to make a genuinely oversized file; assert size and unsupported type separately.",
+    "simulation_rule": "When mock uploads are requested, a documented JSON content option simulateFailure:true may fail the first attempt only; retry succeeds. Never special-case filenames.",
+    "selector_rule": "Use these existing reference selectors directly. Do not invent basename-derived data-testid mappings for file rows or buttons."
+  }
+}

@@ -275,6 +275,30 @@ def build_deterministic_failure_grades(
     return _determine_passed(grades), grades, stats
 
 
+def build_lightweight_browser_grades(
+    *, file_comm: FileComm, round_num: int, sprint_num: int,
+    sprint_context: dict[str, Any], ui_checks: list[dict[str, Any]],
+    evidence: dict[str, Any],
+) -> tuple[bool, dict[str, Any], AgentRunStats]:
+    """Accept only the current typed browser flow in lightweight production mode."""
+    grades = _normalize_contract_grades(
+        {}, round_num=round_num, sprint_num=sprint_num,
+        sprint_context=sprint_context, ui_checks=ui_checks,
+        evidence=evidence, edit_guard=None,
+    )
+    grades["evidence_route"] = {
+        "decision": "lightweight_typed_browser_acceptance",
+        "llm_evaluator_called": False,
+        "browser_evidence_ref": f".harness/browser_evidence_round_{round_num}.json",
+    }
+    stats = AgentRunStats(
+        cost_usd=0.0, duration_ms=0, duration_api_ms=0,
+        token_usage={}, usage={"recovery": "lightweight_typed_browser_acceptance"},
+        model_usage={},
+    )
+    return _determine_passed(grades), grades, stats
+
+
 def _typed_pass_route_eligible(
     *,
     config: HarnessConfig,

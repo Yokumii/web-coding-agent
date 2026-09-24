@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import PurePath
 from typing import Any
 
@@ -11,6 +12,7 @@ TYPED_ASSERTION_ACTIONS = frozenset(
         "assert_aria",
         "assert_attribute",
         "assert_count",
+        "assert_number",
         "assert_computed_style",
         "assert_focus",
         "assert_hash",
@@ -69,8 +71,9 @@ SUPPORTED_UI_ACTIONS = frozenset(
 
 _ACTION_FIELDS = {
     "assert_aria": {"selector", "attribute", "value"},
-    "assert_attribute": {"selector", "name", "value", "match", "snapshot"},
+    "assert_attribute": {"selector", "name", "value", "match", "snapshot", "not"},
     "assert_count": {"selector", "count"},
+    "assert_number": {"selector", "property", "min", "max", "timeout_ms"},
     "assert_computed_style": {"selector", "property", "value", "match"},
     "assert_focus": {"selector"},
     "assert_hash": {"value", "match"},
@@ -163,6 +166,7 @@ def validate_ui_action(step: dict[str, Any]) -> None:
         "assert_aria",
         "assert_attribute",
         "assert_count",
+        "assert_number",
         "assert_computed_style",
         "assert_focus",
         "assert_form_valid",
@@ -210,6 +214,8 @@ def validate_ui_action(step: dict[str, Any]) -> None:
                 "assert_webcompass_risk defect_type must use the official WebCompass taxonomy"
             )
     elif action == "assert_attribute":
+        if "not" in step and not isinstance(step["not"], bool):
+            raise ActionContractError("assert_attribute not must be boolean")
         _non_empty_string(step, "name", action)
         has_value = "value" in step
         has_snapshot = "snapshot" in step
@@ -227,6 +233,17 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             )
     elif action == "assert_count":
         _bounded_int(step, "count", action, minimum=0, maximum=10_000)
+    elif action == "assert_number":
+        if step.get("property") not in {"value", "textContent"}:
+            raise ActionContractError("assert_number property must be value or textContent")
+        for bound in ("min", "max"):
+            value = step.get(bound)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ActionContractError("assert_number requires finite min and max")
+        if step["min"] > step["max"]:
+            raise ActionContractError("assert_number min must not exceed max")
+        if "timeout_ms" in step:
+            _bounded_int(step, "timeout_ms", action, minimum=1, maximum=10_000)
     elif action == "assert_computed_style":
         property_name = _non_empty_string(step, "property", action).lower()
         if property_name not in _COMPUTED_STYLE_PROPERTIES:
@@ -432,12 +449,9 @@ def validate_ui_action(step: dict[str, Any]) -> None:
         if not isinstance(files, list) or not 1 <= len(files) <= 3:
             raise ActionContractError("set_input_files files must contain 1 to 3 fixtures")
         total_bytes = 0
+        expanded_bytes = 0
         for fixture in files:
-            if not isinstance(fixture, dict) or set(fixture) != {
-                "name",
-                "mime_type",
-                "content",
-            }:
+            if not isinstance(fixture, dict) or not {"name", "mime_type", "content"} <= set(fixture) or set(fixture) - {"name", "mime_type", "content", "size_bytes"}:
                 raise ActionContractError(
                     "set_input_files fixtures require name, mime_type, and content only"
                 )
@@ -451,6 +465,11 @@ def validate_ui_action(step: dict[str, Any]) -> None:
             if not isinstance(content, str):
                 raise ActionContractError("set_input_files fixture content must be text")
             total_bytes += len(content.encode("utf-8"))
+            if "size_bytes" in fixture:
+                _bounded_int(fixture, "size_bytes", "file fixture", minimum=len(content.encode("utf-8")), maximum=32 * 1024 * 1024)
+            expanded_bytes += fixture.get("size_bytes", len(content.encode("utf-8")))
+        if expanded_bytes > 32 * 1024 * 1024:
+            raise ActionContractError("set_input_files expanded fixtures exceed 32 MiB")
         if total_bytes > 32_768:
             raise ActionContractError(
                 "set_input_files fixture content exceeds the 32768-byte budget"

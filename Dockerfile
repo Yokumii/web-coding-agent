@@ -33,6 +33,7 @@ RUN uv sync --frozen
 
 COPY --chown=pwuser:pwuser src/ ./src/
 COPY --chown=pwuser:pwuser tests/ ./tests/
+COPY --chown=pwuser:pwuser scripts/ ./scripts/
 
 # Chromium's setuid sandbox can't run as a non-root user in an
 # unprivileged container, and the MCP CLI doesn't always forward

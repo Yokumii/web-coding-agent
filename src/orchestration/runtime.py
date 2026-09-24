@@ -59,6 +59,16 @@ def build_frontend_command(frontend_dir: Path, port: int) -> list[str]:
     package_json = frontend_dir / "package.json"
     if (frontend_dir / "index.html").is_file() and _is_static_html_project(package_json):
         return ["python3", "-m", "http.server", str(port), "--bind", HOST]
+    # Some benchmark projects expose Vite as `start` rather than `dev`.
+    # Prefer the declared script instead of manufacturing a failing command.
+    if package_json.is_file():
+        try:
+            scripts = json.loads(package_json.read_text()).get("scripts") or {}
+        except (OSError, json.JSONDecodeError):
+            scripts = {}
+        script = "dev" if scripts.get("dev") else "start" if scripts.get("start") else None
+        if script:
+            return ["npm", "run", script, "--", "--host", HOST, "--port", str(port), "--strictPort"]
     return ["npm", "run", "dev", "--", "--host", HOST, "--port", str(port), "--strictPort"]
 
 

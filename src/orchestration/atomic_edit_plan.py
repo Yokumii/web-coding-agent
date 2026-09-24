@@ -120,6 +120,12 @@ def normalize_atomic_edit_plan_payload(
     output.setdefault("impact_tags", ["atomic-edit"])
     output.setdefault("unresolved_conflicts", [])
     visual_evidence = output.get("visual_evidence")
+    if isinstance(visual_evidence, str) and ":" in visual_evidence:
+        mode, reason = (part.strip() for part in visual_evidence.split(":", 1))
+        if mode in {"required", "conditional", "not_required"} and reason:
+            output["visual_evidence"] = mode
+            prior = output.get("visual_evidence_reason")
+            output["visual_evidence_reason"] = f"{prior}; {reason}" if prior else reason
     if isinstance(visual_evidence, dict):
         output["visual_evidence"] = str(
             visual_evidence.get("type")
@@ -287,6 +293,8 @@ def normalize_atomic_edit_plan_payload(
                 action["name"] = action.pop("attribute")
             if kind == "assert_text" and "text" in action and "value" not in action:
                 action["value"] = action.pop("text")
+            if kind == "assert_count" and "value" in action and "count" not in action:
+                action["count"] = action.pop("value")
             if kind == "assert_text":
                 action.setdefault("match", "contains")
                 if action.get("match") == "nonempty" and "value" not in action:
@@ -369,6 +377,7 @@ def normalize_atomic_edit_plan_payload(
             if (
                 kind == "assert_count"
                 and not check.get("fixtures")
+                and not any(prior.get("action") == "set_input_files" for prior in normalized_actions[:action_index])
                 and not count_is_instruction_grounded(action.get("count"))
             ):
                 # An exact source count without fixtures is usually guessed

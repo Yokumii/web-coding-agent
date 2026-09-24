@@ -29,6 +29,15 @@ def test_build_frontend_command_defaults_to_npm(tmp_path: Path):
     assert command[-3:] == ["--port", "5173", "--strictPort"]
 
 
+def test_build_frontend_command_uses_declared_start_script(tmp_path: Path):
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"start":"vite"},"dependencies":{"vite":"*"}}'
+    )
+    command = build_frontend_command(tmp_path, 5173)
+    assert command[:3] == ["npm", "run", "start"]
+    assert command[-3:] == ["--port", "5173", "--strictPort"]
+
+
 def test_build_frontend_command_uses_python_static_server_without_package_json(tmp_path: Path):
     (tmp_path / "index.html").write_text("<main>static</main>")
 

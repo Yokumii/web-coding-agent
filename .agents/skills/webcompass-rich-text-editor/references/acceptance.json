@@ -1,0 +1,18 @@
+{
+  "schema_version": "edit-skill-acceptance-v1",
+  "task_type": "Rich Text Editor",
+  "flow": "Enter actual text, select it with keyboard and apply formatting; assert formatted editor content and serialized output. Exercise requested link/list/save operations; a toolbar alone is insufficient.",
+  "grounding": [
+    "Use actual source data and stable current anchors; new selectors only for required new UI.",
+    "Before implementation freeze one continuous browser_check covering the core causal behavior and one important edge; aim for at most 24 actions. Implementation must still satisfy the full instruction.",
+    "Use only Harness typed actions, exact expected values derived from source or test input, and end with assert_no_console_errors.",
+    "A fixture may arrange preconditions, never write the result being tested. Preserve unrelated routes and interactions."
+  ],
+  "visual_policy": "Prefer deterministic DOM/state/style/geometry evidence; keep a targeted visual check only for explicit requirements those checks cannot establish.",
+  "reference_contract": [
+    "Reference DOM: .wc-editor__toolbar, .wc-editor__content[contenteditable], strong/em/u/s, h1/h2/h3, ul/ol li, blockquote, a[href], img[src].",
+    "Use key_press on the editing surface with ControlOrMeta+a. Assert each requested format immediately after applying it. Subsequent block formatting may replace an earlier block type.",
+    "Check output contains semantic markup and entered text; do not impose a complete invented nested HTML string. Link assertions use the real sanitized href, not an invented data-testid on the anchor.",
+    "Use a same-origin unavailable image URL for an error fixture so browser validation is deterministic and does not depend on external network access."
+  ]
+}

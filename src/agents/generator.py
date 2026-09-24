@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from html.parser import HTMLParser
 from pathlib import Path
 import json
@@ -23,6 +24,7 @@ from src.orchestration.design_contract import DesignContractContext
 from src.orchestration.edit_dom_guard import repair_baseline_name
 from src.orchestration.edit_context import read_edit_context, render_edit_context
 from src.orchestration.edit_task_contract import chain_obligations, read_edit_task_contract
+from src.orchestration.edit_skills import render_edit_skill, staged_reference_revisions, reference_destinations, selected_reference_files, vanilla_reference_wiring
 from src.orchestration.file_comm import FileComm
 from src.orchestration.git_journal import ensure_repo
 from src.orchestration.minimal_path_guidance import (
@@ -103,6 +105,7 @@ class _HTMLBalanceParser(HTMLParser):
         super().__init__(convert_charrefs=False)
         self.stack: list[str] = []
         self.mismatches = 0
+        self.issues: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         del attrs
@@ -112,10 +115,14 @@ class _HTMLBalanceParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         target = tag.lower()
+        if target in _HTML_VOID_TAGS:
+            return
         if self.stack and self.stack[-1] == target:
             self.stack.pop()
             return
         self.mismatches += 1
+        self.issues.append(f"line {self.getpos()[0]}: </{target}> while the open element is "
+                           + (f"<{self.stack[-1]}>" if self.stack else "none"))
         if target in self.stack:
             index = len(self.stack) - 1 - self.stack[::-1].index(target)
             del self.stack[index:]
@@ -394,6 +401,19 @@ def _normalize_atomic_patch_response(payload: dict[str, Any]) -> list[dict[str, 
     for item in items:
         if not isinstance(item, dict):
             continue
+        if "patches" in item:
+            nested = item["patches"]
+            if not isinstance(nested, list) or not nested:
+                raise ValueError("atomic nested patches must be a nonempty list")
+            for patch in nested:
+                if not isinstance(patch, dict):
+                    raise ValueError("atomic nested patch must be an object")
+                if patch.get("path") and patch["path"] != item.get("path"):
+                    raise ValueError("atomic nested patch path conflicts with its parent")
+                patches.extend(_normalize_atomic_patch_response({
+                    "patches": [{**patch, "path": item.get("path", "")}]
+                }))
+            continue
         path = str(item.get("path") or "").strip().replace("\\", "/")
         if path and not path.startswith("frontend/"):
             path = f"frontend/{path}"
@@ -492,7 +512,8 @@ def _normalize_atomic_operations(
             line_edits = _normalize_atomic_operations(
                 {"operations": item.get("line_edits") or []}
             )
-            source_path = _atomic_frontend_path(item.get("source"))
+            raw_source = str(item.get("source") or "")
+            source_path = raw_source if raw_source.startswith(".harness/edit_skill/") else _atomic_frontend_path(raw_source)
             source_hash = str(item.get("source_sha256") or "").strip()
             if source_revisions is not None:
                 if source_path not in source_revisions:
@@ -677,6 +698,18 @@ def _apply_sha_line_operations(
                 start, end = structural_section_range(
                     start, end, str(item.get("replacement") or "")
                 )
+            replacement_lines = str(item.get("replacement") or "").splitlines()
+            if (Path(expected_path).suffix in {".js", ".mjs", ".ts", ".jsx", ".tsx"}
+                and end > start and replacement_lines
+                and lines[start - 1].strip() == replacement_lines[0].strip()
+                and lines[end - 2].strip() == replacement_lines[-1].strip()
+                and re.fullmatch(r"\s*[})\]]+[;,]?\s*", lines[end - 1])
+                and len(lines[end - 1]) - len(lines[end - 1].lstrip())
+                    < len(lines[start - 1]) - len(lines[start - 1].lstrip())):
+                # A complete same-header inner block ends at its original
+                # closer. Keep the immediately following outer closer when
+                # the model's inclusive end coordinate ran one line too far.
+                end -= 1
             span = set(range(start, end + 1))
             if occupied & span:
                 raise ValueError(f"overlapping atomic line edits for {expected_path}")
@@ -1026,6 +1059,13 @@ def _render_failed_action_directives(
     return "\n".join(dict.fromkeys(directives)) or "(no additional derived directive)"
 
 
+def _compact_browser_error(message: str) -> str:
+    """Retain the cause at the end of Playwright actionability call logs."""
+    if len(message) <= 2000:
+        return message
+    return message[:700] + "\n... repeated call log omitted ...\n" + message[-1300:]
+
+
 def _recent_repair_runtime_errors(
     file_comm: FileComm,
     *,
@@ -1196,6 +1236,36 @@ def _uniquify_first_exact_patch(
     if not old_text:
         raise ValueError("atomic patch search text is empty")
     count = current.count(old_text)
+    if count == 0 and old_text.strip().startswith("/*") and "*/" not in old_text:
+        # A section-comment anchor may omit its closing delimiter. Recover
+        # only a unique complete comment line, never fuzzy executable code.
+        anchor = old_text.strip()
+        matches = list(re.finditer(r"(?m)^[ \t]*" + re.escape(anchor) + r"[ \t]*\*/[ \t]*(?:\r?\n|$)", current))
+        if len(matches) == 1:
+            return matches[0].group(), new_text
+    if count == 0 and "\n" not in old_text and "\n" not in new_text:
+        # Recover only a complete, unique line whose leading indentation was
+        # transcribed incorrectly. Keep the host's actual indentation.
+        content = old_text.lstrip(" \t")
+        if content and current.count(content) == 1:
+            start = current.index(content)
+            prefix = current[current.rfind("\n", 0, start) + 1:start]
+            suffix = current[start + len(content):].split("\n", 1)[0]
+            if not prefix.strip(" \t") and not suffix.strip(" \t\r"):
+                return content, new_text.lstrip(" \t")
+    if count == 0 and "\n" in old_text:
+        # Exact whole lines, allowing only leading spaces/tabs to differ. This
+        # repairs transcription indentation without guessing different code,
+        # deleting lines, or selecting among ambiguous matching regions.
+        pattern = "(?m)^" + "".join(
+            r"[ \t]*" + re.escape(line.lstrip(" \t"))
+            for line in old_text.splitlines(keepends=True)
+        )
+        if not old_text.endswith("\n"):
+            pattern += r"(?=\r?$)"
+        matches = list(re.finditer(pattern, current))
+        if len(matches) == 1:
+            return matches[0].group(), new_text
     if count == 0:
         raise ValueError("atomic patch search text is absent")
     if count == 1:
@@ -1274,6 +1344,31 @@ def _atomic_executor_eligible(
     return True
 
 
+def _atomic_exact_response_format(mode: str, references: dict | None = None) -> dict:
+    def obj(properties):
+        return {"type": "object", "properties": properties,
+                "required": list(properties), "additionalProperties": False}
+    string = {"type": "string"}
+    fields = {
+        "operations": {"type": "array", "items": obj({
+            "op": {"type": "string", "enum": ["copy_from"]}, "source": string, "path": string,
+            "line_edits": {"type": "array", "items": string, "maxItems": 0}})},
+        "patches": {"type": "array", "items": obj({"path": string, "old_text": string, "new_text": string})},
+        "new_files": {"type": "array", "items": obj({"path": string, "content": string})},
+    }
+    if mode == "repair":
+        fields["repair_task_descriptions"] = {"type": "array", "items": obj({
+            "task_type": string, "description": string,
+            "evidence_ids": {"type": "array", "items": string},
+            "issue_locations": {"type": "array", "items": obj({"element_path": string, "kind": string})}})}
+    if references:
+        copy_fields = fields["operations"]["items"]["properties"]
+        copy_fields["source"] = {"type": "string", "enum": list(references)}
+        copy_fields["path"] = {"type": "string", "enum": list(references.values())}
+    return {"type": "json_schema", "json_schema": {
+        "name": "skill_exact_patch", "strict": True, "schema": obj(fields)}}
+
+
 async def _run_atomic_patch_executor(
     *,
     config: HarnessConfig,
@@ -1294,7 +1389,8 @@ async def _run_atomic_patch_executor(
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     supplied_plan = bool((file_comm.read_state() or {}).get("supplied_atomic_plan"))
     frozen_compound = config.edit_frozen_compound_mode
-    allow_semantic_correction = not frozen_compound
+    max_semantic_attempts = 2 if frozen_compound and config.edit_skills_enabled else _MAX_ATOMIC_SEMANTIC_ATTEMPTS
+    allow_semantic_correction = max_semantic_attempts > 1
     system_prompt = (
         (REPAIR_SYSTEM_PROMPT if mode == "repair" else EDIT_SYSTEM_PROMPT)
         + "\nReturn JSON only. Prefer the compact protocol: "
@@ -1313,6 +1409,22 @@ async def _run_atomic_patch_executor(
         "cannot express the change. Do not describe commands."
     )
     if supplied_plan and frozen_compound:
+        system_prompt = (
+            (REPAIR_SYSTEM_PROMPT if mode == "repair" else EDIT_SYSTEM_PROMPT)
+            + '\nReturn one complete JSON candidate: {"operations":[{"op":"copy_from",'
+            '"source":"selected reference path","path":"permitted component path","line_edits":[]}],'
+            '"patches":[{"path":"frontend/file","old_text":"unique original source snippet",'
+            '"new_text":"replacement source snippet"}]}. '
+            "Use copy_from only for reference files. Existing files must use exact-text patches, "
+            "not line-number operations. Each old_text is literal source, without the displayed "
+            "line-number prefix, and occurs exactly once in that file. Insertions replace a short "
+            "unique anchor with the anchor plus new code. Return the entire corrected candidate "
+            "after a rejection, because all its previous edits were rolled back. "
+            "For a NEW copied reference, patch its destination using the reference's original "
+            "snippet. If the destination ALREADY EXISTS, copy_from preserves it unchanged: "
+            "use the CURRENT destination source shown in the source context for old_text, "
+            "never the canonical reference snippet. Keep copy_from.line_edits empty. "
+        )
         system_prompt += (
             " Frozen compound Edit policy: implement the complete requested behavior in the "
             "existing project with the smallest coherent exact patch. Browser checks are "
@@ -1324,6 +1436,21 @@ async def _run_atomic_patch_executor(
             "long/minified line, use {\"patches\":[{\"path\":...,\"old_text\":...,"
             "\"new_text\":...}]}; each old_text must occur exactly once. Do not mix patches "
             "and line operations for the same file."
+            " For existing-file edits prefer the exact-text patches protocol with a short "
+            "unique old_text and its replacement. This overrides the compact/no-search-text "
+            "preference above; use copy_from for new reference files. Load classic Skill "
+            "scripts before any script that calls their entry points; preserve the host's "
+            "defer/module ordering."
+            " Preserve existing IDs and DOM nodes referenced by host handlers. When enriching "
+            "a list, move/enrich its existing items instead of replacing them with fabricated "
+            "copies. Keep real metadata and numerical progress in the shared host state; "
+            "never use strings such as 'preserved' as a substitute for data. Count item "
+            "nodes, not both list containers and items sharing an attribute. New keyboard "
+            "handlers must not trigger the game's global shortcuts from forms or dialogs."
+            " Never special-case fixture filenames, input strings or expected test outcomes. "
+            "For explicitly simulated uploads use the reference createSimulatedUpload; its "
+            "documented JSON simulateFailure field controls a general fail-once policy. "
+            "Place each exact patch in the file that actually contains its old_text."
         )
     elif supplied_plan:
         system_prompt += (
@@ -1356,6 +1483,16 @@ async def _run_atomic_patch_executor(
             "Return [] if none fits; never invent a category. This is repair metadata, not an "
             "additional evaluation or a request to run more checks. "
             + json.dumps(REPAIR_TYPE_DEFINITIONS, ensure_ascii=False)
+        )
+    if config.edit_skills_enabled and selected_reference_files(workdir):
+        system_prompt += (
+            " The current subtask Skill is mandatory implementation input. Reuse its "
+            "JavaScript core through copy_from and call its public entry point from the "
+            "existing page. Adapt only the required integration and missing features. "
+            "Do not write a parallel implementation. If the selected core is already "
+            "present, edit/reuse that file instead of copying again. A response that "
+            "omits the selected core is rejected. Only replace_lines, insert_after and "
+            "copy_from are valid line operations; insert_before is not supported."
         )
     system_prompt += (
         " Serialize code strings exactly once as JSON: after JSON decoding, content must be "
@@ -1404,6 +1541,10 @@ async def _run_atomic_patch_executor(
         context = read_edit_context(file_comm.dir, round_num) or {}
         source_revisions = {str(item["path"]): str(item["file_sha256"])
                             for item in context.get("source_windows", [])}
+    skill_revisions = staged_reference_revisions(workdir) if config.edit_skills_enabled else {}
+    skill_destinations = reference_destinations(workdir) if skill_revisions else {}
+    if skill_revisions:
+        source_revisions = {**(source_revisions or {}), **skill_revisions}
     if candidate_override:
         raw = candidate_override
         usage: dict[str, Any] = {}
@@ -1413,6 +1554,7 @@ async def _run_atomic_patch_executor(
             messages=messages,
             temperature=0,
             max_tokens=12000 if (file_comm.read_state() or {}).get("supplied_atomic_plan") else 4096,
+            response_format=_atomic_exact_response_format(mode, skill_destinations) if frozen_compound else {"type": "json_object"},
             **({"_protocol": "responses"} if supplied_plan and
                int(os.environ.get("PRODUCT_SESSION_RECOVERY_ATTEMPT", "1")) >= 3 else {}),
         )
@@ -1426,6 +1568,7 @@ async def _run_atomic_patch_executor(
     created_paths: set[Path] = set()
     changed_paths: list[str] = []
     policy_snapshot = {
+        "initial_paths": set(mutation_policy.initial_paths),
         "observed_paths": set(mutation_policy.observed_paths),
         "tool_observed_paths": set(mutation_policy.tool_observed_paths),
         "touched_paths": set(mutation_policy.touched_paths),
@@ -1462,6 +1605,22 @@ async def _run_atomic_patch_executor(
         }, ensure_ascii=False) + "\n")
         trace.flush()
         payload = extract_json_object(raw)
+        for operation in payload.get("operations") or []:
+            source = str(operation.get("source") or "") if isinstance(operation, dict) else ""
+            if source.startswith("frontend/.harness/edit_skill/") and source[9:] in skill_revisions:
+                operation["source"] = source[9:]
+        core_sources = {source for source in skill_destinations if Path(source).suffix in {".js", ".mjs"}}
+        copied_sources = {item.get("source") for item in payload.get("operations", [])
+                          if isinstance(item, dict) and item.get("op") == "copy_from"}
+        if core_sources and not any(
+            source in copied_sources or (workdir / skill_destinations[source]).is_file()
+            for source in core_sources
+        ):
+            reason = "Selected Edit Skill core must be reused via copy_from; independent reimplementation is not allowed"
+            trace.write(json.dumps({"event": "run_error", "error": reason,
+                                    "attempt_usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}, ensure_ascii=False) + "\n")
+            trace.flush()
+            raise AtomicCandidateRejected(reason)
         compact_operations = _normalize_atomic_operations(payload, source_revisions)
         patches = _normalize_atomic_patch_response(payload) if payload.get("patches") or any(
             isinstance(item, dict) and (item.get("op") or item.get("operation")) == "patches"
@@ -1482,6 +1641,7 @@ async def _run_atomic_patch_executor(
             for item in context.get("source_windows") or []
             if isinstance(item, dict) and item.get("path")
         }
+        visible_source_paths.update(skill_revisions)
         try:
             patch_line_count = 0
             for item in compact_operations:
@@ -1569,9 +1729,12 @@ async def _run_atomic_patch_executor(
                         raise ValueError(f"atomic patch targets missing source: {relative}")
                     current = target.read_text(encoding="utf-8")
                     if frozen_compound:
-                        item["old_text"], item["new_text"] = _uniquify_first_exact_patch(
-                            current, item["old_text"], item["new_text"]
-                        )
+                        try:
+                            item["old_text"], item["new_text"] = _uniquify_first_exact_patch(
+                                current, item["old_text"], item["new_text"]
+                            )
+                        except ValueError as exc:
+                            raise ValueError(f"{exc} in {relative}: old_text={item['old_text'][:300]!r}") from exc
                     elif not item["old_text"] or current.count(item["old_text"]) != 1:
                         raise ValueError(f"atomic patch is not unique in {relative}")
                     updated = current.replace(item["old_text"], item["new_text"], 1)
@@ -1589,9 +1752,17 @@ async def _run_atomic_patch_executor(
                         raise ValueError(f"atomic copy source escapes workdir: {source_relative}") from exc
                     if source_relative not in visible_source_paths or not source.is_file():
                         raise ValueError(f"atomic copy source was not preloaded: {source_relative}")
-                    if not _atomic_new_path_allowed(config, relative, planned_new_paths):
+                    trusted_skill_copy = source_relative in skill_revisions
+                    if trusted_skill_copy and skill_destinations.get(source_relative) != relative:
+                        raise ValueError(f"Skill reference destination is outside its component directory: {relative}")
+                    if not trusted_skill_copy and not _atomic_new_path_allowed(config, relative, planned_new_paths):
                         raise ValueError(f"atomic new file was not planned: {relative}")
                     if target.exists():
+                        if trusted_skill_copy and not item.get("line_edits"):
+                            trace.write(json.dumps({"event": "tool", "name": "reuse_reference",
+                                "ok": True, "path": relative, "source": source_relative,
+                                "preserved_local_adaptation": target.read_bytes() != source.read_bytes()}) + "\n")
+                            continue
                         raise ValueError(f"atomic new file already exists: {relative}")
                     source_content = source.read_text(encoding="utf-8")
                     nested = list(item.get("line_edits") or [])
@@ -1626,13 +1797,23 @@ async def _run_atomic_patch_executor(
                         raise ValueError(f"atomic new file is empty: {relative}")
                     policy_inputs = [("write_file", {"path": relative, "content": updated})]
                 if target.exists() and updated == current:
-                    raise ValueError(
-                        f"atomic patch produces no source change in {relative}; patch the "
-                        "still-failing behavior shown in the repair evidence"
+                    trace.write(json.dumps({"event": "tool", "name": "skip_noop_patch",
+                                            "ok": True, "path": relative}) + "\n")
+                    continue
+                is_skill_copy = operation == "copy_from" and item.get("source") in skill_revisions
+                if is_skill_copy:
+                    # Reviewed library bytes are reuse, not generated edits. Only
+                    # local adaptations consume the patch budget; file limits remain.
+                    effective_patch_lines += effective_patch_line_count(source_content, updated)
+                    mutation_policy.initial_paths.add(relative)
+                    # The prompt exposed the SHA-verified reference in full.
+                    # Its freshly copied destination is therefore inspected,
+                    # allowing same-transaction local adaptation of those bytes.
+                    mutation_policy.observed_paths.add(relative)
+                else:
+                    effective_patch_lines += max(
+                        1, effective_patch_line_count(current if target.exists() else "", updated)
                     )
-                effective_patch_lines += max(
-                    1, effective_patch_line_count(current if target.exists() else "", updated)
-                )
                 if (not supplied_plan or frozen_compound) and effective_patch_lines > max_patch_lines:
                     raise ValueError(
                         f"Atomic candidate changes {effective_patch_lines} effective patch lines, "
@@ -1671,7 +1852,10 @@ async def _run_atomic_patch_executor(
                 if supplied_plan and not frozen_compound:
                     continue  # The supplied browser check owns functional acceptance.
                 diff_check = subprocess.run(
-                    ["git", "diff", "--check"],
+                    # A harmless final blank line is not a code defect and
+                    # must not consume a paid repair of an otherwise valid edit.
+                    ["git", "-c", "core.whitespace=-blank-at-eof", "diff", "--check"]
+                    if frozen_compound else ["git", "diff", "--check"],
                     cwd=frontend,
                     text=True,
                     capture_output=True,
@@ -1690,6 +1874,27 @@ async def _run_atomic_patch_executor(
                 )
                 if not validation_ok:
                     raise RuntimeError(validation_output)
+            if config.edit_skills_enabled and frozen_compound:
+                for wiring in vanilla_reference_wiring(workdir, mutation_policy.local_paths):
+                    target = workdir / wiring["path"]
+                    current = target.read_text(encoding="utf-8")
+                    wiring["old_text"], wiring["new_text"] = _uniquify_first_exact_patch(
+                        current, wiring["old_text"], wiring["new_text"])
+                    updated = current.replace(wiring["old_text"], wiring["new_text"], 1)
+                    effective_patch_lines += max(1, effective_patch_line_count(current, updated))
+                    if effective_patch_lines > max_patch_lines:
+                        raise ValueError("Reference wiring exceeds the current patch budget")
+                    denial = mutation_policy.check("apply_patch", wiring)
+                    if denial:
+                        raise ValueError(denial)
+                    originals.setdefault(target, current)
+                    target.write_text(updated, encoding="utf-8")
+                    mutation_policy.observe_result("apply_patch", wiring, ok=True, output="wired reference")
+                    changed_paths.append(wiring["path"].removeprefix("frontend/"))
+                    trace.write(json.dumps({"event": "tool", "name": "wire_reference", "ok": True,
+                                            **wiring}, ensure_ascii=False) + "\n")
+            if not changed_paths:
+                raise ValueError("Atomic candidate produces no source changes")
             subprocess.run(
                 ["git", "add", "--", *sorted(set(changed_paths))],
                 cwd=frontend,
@@ -1729,6 +1934,7 @@ async def _run_atomic_patch_executor(
             # The filesystem edit is transactional, so its policy evidence must
             # be transactional too.  Otherwise a rejected partial candidate can
             # unlock dependency files that were never actually changed.
+            mutation_policy.initial_paths = set(policy_snapshot["initial_paths"])
             mutation_policy.observed_paths = set(policy_snapshot["observed_paths"])
             mutation_policy.tool_observed_paths = set(
                 policy_snapshot["tool_observed_paths"]
@@ -1766,7 +1972,7 @@ async def _run_atomic_patch_executor(
                 "fallback": (
                     "compact_semantic_correction"
                     if allow_semantic_correction
-                    and semantic_attempt < _MAX_ATOMIC_SEMANTIC_ATTEMPTS
+                    and semantic_attempt < max_semantic_attempts
                     else "stop_after_compact_correction"
                 ),
             }, ensure_ascii=False) + "\n")
@@ -1775,7 +1981,7 @@ async def _run_atomic_patch_executor(
                 raise AtomicCandidateRejected(str(exc)) from exc
             if (
                 allow_semantic_correction
-                and semantic_attempt < _MAX_ATOMIC_SEMANTIC_ATTEMPTS
+                and semantic_attempt < max_semantic_attempts
             ):
                 logger.warning(
                     "[bold yellow]Atomic candidate rejected[/]; requesting a "
@@ -1836,6 +2042,14 @@ async def _run_atomic_patch_executor(
         f"## Round {round_num}\n\nApplied {len(compact_operations)} compact operations, "
         f"{len(patches)} exact patches, and {len(new_files)} planned new files in one bounded request."
     )
+    if candidate_override:
+        historical = _trace_usage_totals(trace_path)
+        return AgentRunStats(
+            cost_usd=float(historical["estimated_cost_usd"]),
+            duration_ms=int((time.monotonic() - started) * 1000), duration_api_ms=0,
+            token_usage={key: int(historical[key]) for key in ("input_tokens", "output_tokens")},
+            usage={"recovery": "trace_replay", "new_api_calls": 0, **historical}, model_usage={},
+        )
     return AgentRunStats(
         cost_usd=estimate_cost_usd(config.generator_model, usage),
         duration_ms=int((time.monotonic() - started) * 1000),
@@ -3024,6 +3238,7 @@ def _build_generator_prompt(
     accepted_sprints: dict,
     resume_uncommitted_work: bool = False,
     recovered_commit: str | None = None,
+    frozen_compound: bool = False,
 ) -> str:
     """构造 generator 单轮提示词，按 generate/repair 两种模式切换细节。"""
     round_artifacts = RoundArtifacts(file_comm, round_num)
@@ -3110,6 +3325,7 @@ def _build_generator_prompt(
         recent_runtime_errors = _recent_repair_runtime_errors(
             file_comm,
             before_round=round_num - 1,
+            lookback_rounds=1 if frozen_compound else 8,
         )
         compact_packet = {
             "failed_checks": [
@@ -3124,7 +3340,7 @@ def _build_generator_prompt(
                     "steps": [
                         {
                             key: (
-                                str(step.get(key) or "")[:400]
+                                _compact_browser_error(str(step.get(key) or ""))
                                 if key == "error"
                                 else step.get(key)
                             )
@@ -3173,10 +3389,25 @@ def _build_generator_prompt(
         failure_directives = _render_failed_action_directives(
             repair_packet, compact_checks
         )
+        if frozen_compound:
+            for window in edit_context.get("source_windows") or []:
+                content = str(window.get("content") or "")
+                if (str(window.get("path", "")).endswith((".html", ".htm"))
+                    and window.get("start_line") == 1 and "</html>" in content.lower()):
+                    parser = _HTMLBalanceParser()
+                    parser.feed(content)
+                    if parser.issues:
+                        failure_directives += (
+                            "\nHTML nesting diagnostic for " + window["path"] + ": "
+                            + "; ".join(parser.issues[:8])
+                            + ". Inspect missing/replaced host wrappers before changing z-index; "
+                            "broken nesting can move sibling content outside its modal. "
+                            "Preserve all existing sections and close new subtrees correctly."
+                        )
         recent_error_directives = _render_recent_runtime_error_directives(
             recent_runtime_errors
         )
-        if recent_error_directives != "(no additional derived directive)":
+        if not frozen_compound and recent_error_directives != "(no additional derived directive)":
             failure_directives += (
                 "\n- HARD: a later candidate may have masked, but did not repair, the "
                 "following earlier real-browser runtime failure. Preserve this causal "
@@ -3234,9 +3465,12 @@ def _build_generator_prompt(
             + json.dumps(compact_scope, ensure_ascii=False, separators=(",", ":"))
             + "\n\n"
             + render_edit_context(edit_context)
-            + "\n\nThe code above is already inspected for exact patches inside the shown windows. "
-            "Do not reread planning, grade, or shown code. "
-            "If a required patch is outside a shown window, read only that focused missing range. "
+            + "\n\nThe source blocks above are the current on-disk snapshot for this Repair round. "
+            "Use the runtime error location to connect evidence to the exact source. "
+            "The Harness exposes the complete frontend source when it fits the Repair context budget; "
+            "if a file is still truncated, read the missing range before patching. "
+            "Never reuse an old_text anchor from an earlier Repair round or from the reference Skill: "
+            "derive every patch from the current file contents. "
             "Fix ALL reproduced defects in this packet together in this single Repair response, "
             "including multiple issues of the same type. Preserve unrelated behavior. "
             "Run the smallest validation and create one atomic fix commit. "
@@ -3542,7 +3776,7 @@ def _build_generator_prompt(
         "The native OpenAI runner has no `.claude/skills/` directory. Do not attempt to read that path.\n"
         "Use paths relative to the workdir when calling tools; do not use absolute paths.\n"
         "For Bash, command chains and pipelines are allowed when each segment stays inside the workdir.\n"
-        "For every planner-authored UI action, implement the exact stable selector specified in `.harness/ui_verification_plan.json`; these selectors are part of the acceptance contract, not optional test metadata.\n"
+        "For every planner-authored UI action, implement the requested behavior and preserve the existing host entry/control selectors. A plan selector is a behavioral anchor, not an HTML serialization contract: equivalent stable value, trend, status, or semantic descendants are valid when they prove the same state. Do not add empty selector-only shells; the browser flow must observe real content and state transitions.\n"
         "For every check with a non-empty `fixtures` list, materialize those exact literals in the owning route's initial content before implementing the action flow; fixtures are executable data dependencies, not suggestions.\n"
         "Keep the frontend portable and offline: do not load remote fonts, scripts, stylesheets, media, iframes, or API/WebSocket/EventSource URLs. Ordinary external anchor links are allowed; runtime dependencies must be local.\n"
         "Do not use background execution, redirection, or command substitution such as `&`, `>`, `<`, `$(`, or backticks.\n"
@@ -3710,7 +3944,10 @@ async def run_generator(
         accepted_sprints=sprint_run_context.accepted_sprints,
         resume_uncommitted_work=resume_uncommitted_work,
         recovered_commit=recovered_commit,
+        frozen_compound=config.edit_frozen_compound_mode,
     )
+    if config.edit_skills_enabled:
+        user_msg += render_edit_skill(workdir)
     obligations = chain_obligations(read_edit_task_contract(workdir) or {})
     if obligations:
         user_msg += "\nChain host-state obligations:\n" + json.dumps(obligations, ensure_ascii=False)
@@ -3755,7 +3992,12 @@ async def run_generator(
                     candidate_override=replay_candidate,
                 )
             except AtomicCandidateRejected as exc:
-                if (file_comm.read_state() or {}).get("supplied_atomic_plan"):
+                trace_path = RoundArtifacts(file_comm, round_num).trace_path("generator")
+                prior_events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+                if any(event.get("event") == "run_start"
+                       and event.get("candidate_source") == "model"
+                       and event.get("phase") == "atomic_edit_executor_attempt_2"
+                       for event in prior_events):
                     raise
                 logger.info(
                     "Trace-backed candidate still fails current guards; requesting one "
@@ -3771,11 +4013,16 @@ async def run_generator(
                     prompt=user_msg,
                     baseline_commit=baseline_commit,
                     mutation_policy=mutation_policy,
+                    semantic_attempt=2,
+                    previous_candidate=replay_candidate,
                     correction_feedback=(
                         "Exact local rejection from the replayed, fully rolled-back candidate:\n"
                         + _atomic_rejection_feedback(exc)
                     ),
                 )
+                historical = _trace_usage_totals(trace_path)
+                stats = replace(stats, cost_usd=float(historical["estimated_cost_usd"]),
+                    token_usage={key: int(historical[key]) for key in ("input_tokens", "output_tokens")})
         else:
             stats = await _run_atomic_patch_executor(
                 config=config,

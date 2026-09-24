@@ -1,0 +1,17 @@
+{
+  "schema_version": "edit-skill-acceptance-v1",
+  "task_type": "Drag & Drop Interface",
+  "flow": "Drag one existing item to another position/list; assert new DOM order and destination, then exercise keyboard alternative. Reload and assert order only when persistence is required.",
+  "grounding": [
+    "Use actual source data and stable current anchors; new selectors only for required new UI.",
+    "Before implementation freeze one continuous browser_check covering the core causal behavior and one important edge; aim for at most 24 actions. Implementation must still satisfy the full instruction.",
+    "Use only Harness typed actions, exact expected values derived from source or test input, and end with assert_no_console_errors.",
+    "A fixture may arrange preconditions, never write the result being tested. Preserve unrelated routes and interactions."
+  ],
+  "visual_policy": "Prefer deterministic DOM/state/style/geometry evidence; keep a targeted visual check only for explicit requirements those checks cannot establish.",
+  "reference_contract": [
+    "Reference binds direct children of list elements. Its built-in keyboard reorder is Alt+ArrowUp/ArrowDown; cross-list keyboard controls are adapter work only when requested.",
+    "Assert individual DOM item positions with stable selectors or nth-child. Preserve real quest titles, descriptions and numerical progress; never require the literal string preserved as progress.",
+    "Reload persistence concerns item arrangement. Reopen the existing host view and board before checking restored items."
+  ]
+}

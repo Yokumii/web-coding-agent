@@ -293,6 +293,40 @@ def test_behavior_only_edit_context_skips_connected_stylesheet(tmp_path: Path):
     ]
 
 
+def test_repair_context_exposes_all_current_frontend_sources(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "entry.tsx").write_text(
+        "import './styles.css';\n" + "\n".join(f"const line{n} = {n};" for n in range(300)),
+        encoding="utf-8",
+    )
+    (frontend / "styles.css").write_text("main { color: black; }\n", encoding="utf-8")
+    plan = _plan()
+    plan["source_change_cone"].update(
+        {"initial_paths": ["frontend/entry.tsx"], "local_paths": ["frontend/entry.tsx"]}
+    )
+
+    payload = ensure_edit_context(
+        workdir=tmp_path,
+        harness_dir=tmp_path / ".harness",
+        plan=plan,
+        round_num=2,
+        max_total_chars=20_000,
+        max_file_chars=20_000,
+        full_repair_context=True,
+    )
+
+    assert payload["exposure"]["selected_paths"] == [
+        "frontend/entry.tsx",
+        "frontend/styles.css",
+    ]
+    assert all(item["start_line"] == 1 for item in payload["source_windows"])
+    assert all(
+        item["end_line"] == len((tmp_path / item["path"]).read_text(encoding="utf-8").splitlines())
+        for item in payload["source_windows"]
+    )
+
+
 def test_frozen_compound_context_includes_direct_markup_and_style_dependencies(
     tmp_path: Path,
 ):

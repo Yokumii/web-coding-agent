@@ -34,7 +34,7 @@ _ASSERTION_TEXT_READER = """element => {
   }
   return element.textContent;
 }"""
-BROWSER_EVIDENCE_POLICY_VERSION = "live_values_risk_state_reuse_v3"
+BROWSER_EVIDENCE_POLICY_VERSION = "live_values_keyboard_chords_v4"
 _ASSERTION_TEXT_VALUES = "(nodes, mode) => { const readText = " + _ASSERTION_TEXT_READER + ";" + """
   // A container already includes its descendant text. Independent matching
   // regions still each need to satisfy the assertion.
@@ -47,9 +47,21 @@ _ASSERTION_TEXT_VALUES = "(nodes, mode) => { const readText = " + _ASSERTION_TEX
 
 def _is_invalid_test_contract_error(action: str, exc: Exception) -> bool:
     message = f"{type(exc).__name__}: {exc}"
-    return isinstance(exc, ActionContractError) or (
+    return isinstance(exc, ActionContractError) or 'strict mode violation' in message or (
         action == "evaluate" and "SyntaxError" in message
     )
+
+
+def _is_nonblocking_react_warning(message: str) -> bool:
+    # React development diagnostics use console.error even for DOM prop warnings.
+    # Never apply this classification to pageerror exceptions or HTTP failures.
+    return message.startswith((
+        'Warning: Received ', 'Warning: Invalid DOM property ',
+        'Warning: React does not recognize the ',
+        'Warning: Unknown event handler property ',
+        'Warning: Each child in a list should have a unique "key" prop',
+        'Warning: validateDOMNesting(',
+    ))
 
 
 def _action_settle_ms(step: dict[str, Any], action: str) -> int:
@@ -259,7 +271,8 @@ async def _execute_typed_assertion(
     """Execute one bounded assertion without running planner-authored JavaScript."""
     action = str(step["action"])
     selector = str(step.get("selector", ""))
-    locator = page.locator(selector) if selector else None
+    resolved_selector = await _resolve_behavioral_selector(page, selector, action)
+    locator = page.locator(resolved_selector) if resolved_selector else None
     expected = step.get("value")
     actual: Any
     aria_snapshot: str | None = None
@@ -383,6 +396,19 @@ async def _execute_typed_assertion(
         actual = await locator.count()
         expected = int(step["count"])
         ok = actual == expected
+    elif action == "assert_number":
+        handle = await page.wait_for_function("""spec => {
+            const nodes = document.querySelectorAll(spec.selector);
+            if (nodes.length !== 1) return false;
+            const raw = nodes[0][spec.property];
+            if (raw == null || String(raw).trim() === '') return false;
+            const value = Number(raw);
+            return Number.isFinite(value) && value >= spec.min && value <= spec.max ? {value} : false;
+        }""", arg=step, timeout=step.get("timeout_ms", 5000))
+        actual = (await handle.json_value())["value"]
+        await handle.dispose()
+        expected = {"min": step["min"], "max": step["max"]}
+        ok = True
     elif action == "assert_computed_style":
         property_name = str(step["property"])
         actual = await locator.evaluate(
@@ -426,7 +452,23 @@ async def _execute_typed_assertion(
                 )
             expected = attribute_snapshots[snapshot_name]
         mode = str(step.get("match") or ("nonempty" if expected == "" else "exact"))
-        ok = _matches(actual, expected, mode)
+        if step.get("not", False) and "snapshot" in step:
+            name = str(step["name"])
+            snapshot_value = expected
+            await page.wait_for_function(
+                """({selector, name, snapshot}) => {
+                  const node = document.querySelector(selector);
+                  return node && node.getAttribute(name) !== snapshot;
+                }""",
+                arg={"selector": resolved_selector, "name": name, "snapshot": snapshot_value},
+                timeout=int(step.get("timeout_ms", 5000)),
+            )
+            actual = await locator.get_attribute(name)
+            ok = actual != snapshot_value
+        else:
+            ok = _matches(actual, expected, mode)
+        if step.get("not", False):
+            ok = ok if "snapshot" in step else not ok
     elif action == "assert_aria":
         attribute = str(step["attribute"])
         if attribute in {"accessible_name", "role"}:
@@ -454,9 +496,43 @@ async def _execute_typed_assertion(
         raise ActionContractError(f"unsupported typed assertion {action!r}")
 
     output = {"actual": actual, "expected": expected}
+    if resolved_selector != selector:
+        output["resolved_selector"] = resolved_selector
     if aria_snapshot is not None:
         output["aria_snapshot"] = aria_snapshot
     return ok, output
+
+
+async def _resolve_behavioral_selector(page: Any, selector: str, action: str) -> str:
+    """Accept stable equivalent selectors produced by an existing component.
+
+    Planner selectors describe the behavior being checked, while a host
+    component may expose the value, trend, or status node as the stable DOM
+    address.  Only visibility/wait assertions use these bounded aliases; user
+    interactions still require the exact control selector.
+    """
+    if not selector or action not in {"assert_visible", "wait_for"}:
+        return selector
+    match = re.fullmatch(r'\[data-testid="([^"]+)"\]', selector)
+    if not match:
+        return selector
+    test_id = match.group(1)
+    aliases: list[str] = []
+    if test_id.startswith("summary-") and not test_id.endswith("-value"):
+        aliases.append(f"{test_id}-value")
+    for suffix in ("-trend", "-status"):
+        if test_id.startswith("metric-") and test_id.endswith(suffix):
+            metric = test_id[len("metric-") : -len(suffix)]
+            aliases.extend((f"metric-{metric}{suffix}", f"metric-{metric}-reports{suffix}"))
+    # Permit a host component to add a stable semantic suffix/prefix while
+    # retaining the planner's metric role (value, trend, or status).
+    if not aliases:
+        aliases = [test_id + suffix for suffix in ("-value", "-trend", "-status")]
+    for alias in aliases:
+        candidate = f'[data-testid="{alias}"]'
+        if await page.locator(candidate).count():
+            return candidate
+    return selector
 
 
 async def _execute_webcompass_risk_assertion(
@@ -824,6 +900,8 @@ async def collect_browser_evidence(
     capture_screenshots: bool = False,
     screenshot_timeout_ms: int = 15_000,
     screenshot_full_page: bool = False,
+    baseline_console_errors: list[str] | None = None,
+    lenient_console: bool = False,
 ) -> dict[str, Any]:
     from playwright.async_api import async_playwright
     from src.utils.playwright_browser import launch_chromium
@@ -844,7 +922,12 @@ async def collect_browser_evidence(
         page = None
         try:
             console_errors: list[str] = []
+            console_warnings: list[str] = []
             def record_console_error(message: Any) -> None:
+                if message.type == 'warning' or (lenient_console and message.type == 'error'
+                        and _is_nonblocking_react_warning(message.text)):
+                    console_warnings.append(message.text)
+                    return
                 if message.type != "error":
                     return
                 # Chromium emits a generic duplicate for failed subresources.
@@ -866,7 +949,7 @@ async def collect_browser_evidence(
                 created = await browser.new_page(viewport={"width": 1280, "height": 812})
                 created.on("console", record_console_error)
                 created.on("response", record_failed_response)
-                created.on("pageerror", lambda error: console_errors.append(str(error)))
+                created.on("pageerror", lambda error: console_errors.append(str(getattr(error, "stack", None) or error)))
                 # A contract miss is evidence about this one UI check, not a
                 # reason to burn the whole evaluation budget on 30s defaults.
                 created.set_default_timeout(action_timeout_ms)
@@ -893,6 +976,7 @@ async def collect_browser_evidence(
                     if page is not None:
                         await page.close()
                     console_errors.clear()
+                    console_warnings.clear()
                     page = await fresh_page()
                     active_route = None
                     attribute_snapshots: dict[str, Any] = {}
@@ -914,6 +998,7 @@ async def collect_browser_evidence(
                 if risk_continuation:
                     steps = [step for step in steps if step.get("action") == "assert_webcompass_risk"]
                 console_error_start = len(console_errors)
+                console_warning_start = len(console_warnings)
                 item: dict[str, Any] = {
                     "check_id": check.get("id"),
                     "route": route,
@@ -1034,8 +1119,13 @@ async def collect_browser_evidence(
                                 if selector:
                                     await page.focus(str(selector))
                                 key = str(step["key"])
-                                known_keys = {"Tab", "Enter", "Escape", "Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Backspace"}
-                                if key not in known_keys:
+                                known_keys = {"Tab", "Enter", "Escape", "Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Backspace", "Delete", "Home", "End", "PageUp", "PageDown"}
+                                parts = key.split("+")
+                                is_chord = len(parts) > 1 and all(
+                                    part in {"Alt", "Control", "ControlOrMeta", "Meta", "Shift"}
+                                    for part in parts[:-1]
+                                ) and bool(parts[-1])
+                                if key not in known_keys and len(key) != 1 and not is_chord and not re.fullmatch(r"F(?:[1-9]|1[0-2])", key):
                                     await page.keyboard.insert_text(key)
                                     result["output"] = f"typed {key}"
                                 else:
@@ -1093,7 +1183,8 @@ async def collect_browser_evidence(
                                     {
                                         "name": str(fixture["name"]),
                                         "mimeType": str(fixture["mime_type"]),
-                                        "buffer": str(fixture["content"]).encode("utf-8"),
+                                        "buffer": str(fixture["content"]).encode("utf-8").ljust(
+                                            fixture.get("size_bytes", 0), b"\0"),
                                     }
                                     for fixture in step["files"]
                                 ]
@@ -1127,7 +1218,8 @@ async def collect_browser_evidence(
                                 assertion_ok, assertion_output = await _execute_typed_assertion(
                                     page=page,
                                     step=step,
-                                    console_errors=console_errors[console_error_start:],
+                                    console_errors=[error for error in console_errors[console_error_start:]
+                                                    if error not in (baseline_console_errors or [])],
                                     attribute_snapshots=attribute_snapshots,
                                 )
                                 result["output"] = assertion_output
@@ -1202,9 +1294,19 @@ async def collect_browser_evidence(
                     step.get("test_precondition") and not step.get("ok")
                     for step in item["steps"]
                 )
-                check_console_errors = console_errors[console_error_start:]
+                if any(not step.get('ok') for step in item['steps']):
+                    item['failure_dom'] = (await page.locator('body').inner_html())[:12000]
+                check_console_errors = [error for error in console_errors[console_error_start:]
+                                        if error not in (baseline_console_errors or [])]
+                if console_warnings[console_warning_start:]:
+                    item['console_warnings'] = console_warnings[console_warning_start:]
+                if baseline_console_errors:
+                    item['baseline_console_errors'] = baseline_console_errors
                 if check_console_errors:
                     item["console_errors"] = check_console_errors
+                    overlay = page.locator('vite-error-overlay')
+                    if await overlay.count():
+                        item['build_error'] = (await overlay.inner_text())[:8000]
                 contrast_issues = await _severe_contrast_issues(
                     page, visual_sanity_selectors or [], route
                 )

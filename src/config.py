@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -72,6 +73,10 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass
 class HarnessConfig:
+    lightweight_edit_production: bool = field(
+        default_factory=lambda: _env_bool("LIGHTWEIGHT_EDIT_PRODUCTION", False)
+    )
+    edit_skills_enabled: bool = field(default_factory=lambda: _env_bool("EDIT_SKILLS_ENABLED", False))
     edit_originality_required: bool = True
     edit_collect_visual_failures_before_repair: bool = False
     edit_webcompass_defect_checks: bool = False
@@ -83,6 +88,9 @@ class HarnessConfig:
     base_url: str = field(default_factory=lambda: _env_str("ANTHROPIC_BASE_URL"))
     agent_runtime: str = field(default_factory=lambda: _env_str("AGENT_RUNTIME", "auto"))
     openai_api_key: str = field(default_factory=lambda: _env_str("OPENAI_AGENT_API_KEY"))
+    openai_wire_api: str = field(default_factory=lambda: _env_str("OPENAI_AGENT_WIRE_API", "chat"))
+    openai_stream_read_retries: int = 0
+    openai_extra_headers: dict[str, str] = field(default_factory=lambda: json.loads(_env_str("OPENAI_AGENT_EXTRA_HEADERS", "{}")))
     openai_base_url: str = field(default_factory=lambda: _env_str("OPENAI_AGENT_BASE_URL"))
     agent_phase_timeout_seconds: int = field(default_factory=lambda: _env_int("AGENT_PHASE_TIMEOUT_SECONDS", 600))
     agent_request_timeout_seconds: int = field(default_factory=lambda: _env_int("AGENT_REQUEST_TIMEOUT_SECONDS", 120))

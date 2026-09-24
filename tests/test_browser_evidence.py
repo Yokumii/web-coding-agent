@@ -9,6 +9,7 @@ from src.orchestration.browser_evidence import (
     _action_settle_ms,
     _is_invalid_test_contract_error,
     _matches,
+    _resolve_behavioral_selector,
     _same_origin_route_url,
     collect_browser_evidence,
 )
@@ -40,6 +41,55 @@ def test_nonempty_match_rejects_missing_and_blank_runtime_values():
     assert _matches("  ", "", "nonempty") is False
 
 
+@pytest.mark.anyio
+async def test_lenient_react_warning_is_recorded_but_runtime_error_still_blocks(tmp_path):
+    warning = 'Warning: Received `%s` for a non-boolean attribute `%s`.'
+    async def page(request):
+        extra = '<script>throw new Error("runtime broke")</script>' if request.path=='/broken' else ''
+        return web.Response(text=f'<button onclick="this.textContent=\'done\'">run</button>'
+            f'<script>console.error({warning!r})</script>'+extra,content_type='text/html')
+    app=web.Application(); app.router.add_get('/',page); app.router.add_get('/broken',page)
+    runner=web.AppRunner(app); await runner.setup()
+    site=web.TCPSite(runner,'127.0.0.1',0); await site.start()
+    url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+    try:
+        for strict,route,expected in [(False,'/','ok'),(False,'/broken','action_failed'),(True,'/','action_failed')]:
+            result=await collect_browser_evidence(app_url=url,headless=True,lenient_console=not strict,
+                output_path=tmp_path/f'{strict}_{expected}.json', checks=[{'id':'flow','route':route,'actions':[
+                    {'action':'click','selector':'button'},
+                    {'action':'assert_text','selector':'button','value':'done','match':'exact'},
+                    {'action':'assert_no_console_errors'}]}])
+            check=result['checks'][0]
+            assert check['status']==expected
+            if not strict:
+                assert check['console_warnings']==[warning]
+            if route=='/broken':
+                assert any('runtime broke' in e for e in check['console_errors'])
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.anyio
+async def test_baseline_console_exemption_keeps_new_runtime_errors(tmp_path):
+    async def page(request):
+        extra = '<script>console.error("new runtime failure")</script>' if request.path == '/changed' else ''
+        return web.Response(text='<main>ready</main><script>console.error("existing source error")</script>'+extra,
+                            content_type='text/html')
+    app = web.Application(); app.router.add_get('/', page); app.router.add_get('/changed', page)
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0); await site.start()
+    url = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
+    try:
+        for suffix, expected in [('', 'ok'), ('/changed', 'action_failed')]:
+            evidence = await collect_browser_evidence(app_url=url+suffix,
+                checks=[{'id':'flow','route':suffix or '/', 'actions':[{'action':'assert_no_console_errors'}]}],
+                output_path=tmp_path/f'{expected}.json', headless=True,
+                baseline_console_errors=['existing source error'])
+            assert evidence['checks'][0]['status'] == expected
+    finally:
+        await runner.cleanup()
+
+
 def test_evaluate_syntax_error_is_invalid_test_contract():
     error = RuntimeError("Page.evaluate: SyntaxError: Illegal return statement")
 
@@ -51,6 +101,31 @@ def test_action_settle_ms_is_explicit_and_bounded():
     assert _action_settle_ms({"action": "fill", "settle_ms": 200}, "fill") == 200
     assert _action_settle_ms({"action": "fill"}, "fill") == 0
     assert _action_settle_ms({"action": "evaluate", "settle_ms": 250}, "evaluate") == 0
+
+
+@pytest.mark.anyio
+async def test_numeric_progress_and_sized_file_fixture_use_real_browser(tmp_path):
+    async def page(_request):
+        return web.Response(text='''<input type="file" id="file"><progress id="p" max="1" value="0"></progress><output id="size"></output><output id="blank"></output>
+          <script>document.querySelector('#file').onchange=e=>{
+            document.querySelector('#size').textContent=e.target.files[0].size;
+            setTimeout(()=>document.querySelector('#p').value=.35,150);
+          };</script>''', content_type='text/html')
+    app=web.Application();app.router.add_get('/',page)
+    runner=web.AppRunner(app);await runner.setup();site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+    try:
+        result=await collect_browser_evidence(app_url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+            checks=[{'id':'numeric','route':'/','actions':[
+                {'action':'set_input_files','selector':'#file','files':[{'name':'sized.txt','mime_type':'text/plain','content':'x','size_bytes':2048}]},
+                {'action':'assert_number','selector':'#p','property':'value','min':.01,'max':.99,'timeout_ms':2000},
+                {'action':'assert_text','selector':'#size','value':'2048','match':'exact'}]},
+                {'id':'blank','route':'/','actions':[{'action':'assert_number','selector':'#blank','property':'textContent','min':0,'max':0,'timeout_ms':50}]}],
+            output_path=tmp_path/'numeric.json',headless=True)
+    finally:
+        await runner.cleanup()
+    assert result['checks'][0]['status']=='ok'
+    assert result['checks'][0]['steps'][1]['output']['actual']==.35
+    assert result['checks'][1]['status']!='ok'
 
 
 def test_same_origin_route_url_accepts_only_bounded_hash_router_paths():
@@ -252,6 +327,61 @@ async def test_browser_evidence_compares_attribute_snapshot_after_reload(tmp_pat
         "actual": "artifact-1",
         "expected": "artifact-1",
     }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change, expected_status", [(True, "ok"), (False, "action_failed")])
+async def test_attribute_negation_requires_real_change(tmp_path, change, expected_status):
+    async def root(_request):
+        handler = "this.dataset.state='after'" if change else "void 0"
+        return web.Response(text=f"<button id='state' data-state='before' onclick=\"{handler}\">Update</button>", content_type="text/html")
+    app = web.Application(); app.router.add_get("/", root)
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0); await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        result = await collect_browser_evidence(app_url=f"http://127.0.0.1:{port}", checks=[{
+            "id": "change", "route": "/", "actions": [
+                {"action": "capture_attribute", "selector": "#state", "name": "data-state", "snapshot": "before"},
+                {"action": "click", "selector": "#state"},
+                {"action": "assert_attribute", "selector": "#state", "name": "data-state", "snapshot": "before", "not": True}
+            ]}], output_path=tmp_path / "evidence.json", headless=True)
+        assert result["checks"][0]["status"] == expected_status
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.anyio
+async def test_behavioral_selector_aliases_only_apply_to_assertions(tmp_path):
+    async def root(_request):
+        return web.Response(
+            text='<output data-testid="summary-total-reports-value">3</output>'
+            '<svg data-testid="metric-total-reports-trend"></svg>',
+            content_type="text/html",
+        )
+
+    app = web.Application(); app.router.add_get("/", root)
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0); await site.start()
+    try:
+        from playwright.async_api import async_playwright
+        from src.utils.playwright_browser import launch_chromium
+        async with async_playwright() as playwright:
+            browser = await launch_chromium(playwright, headless=True)
+            page = await browser.new_page()
+            await page.goto(f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/")
+            assert await _resolve_behavioral_selector(
+                page, '[data-testid="summary-total-reports"]', "assert_visible"
+            ) == '[data-testid="summary-total-reports-value"]'
+            assert await _resolve_behavioral_selector(
+                page, '[data-testid="metric-total-trend"]', "assert_visible"
+            ) == '[data-testid="metric-total-reports-trend"]'
+            assert await _resolve_behavioral_selector(
+                page, '[data-testid="metric-total-trend"]', "click"
+            ) == '[data-testid="metric-total-trend"]'
+            await browser.close()
+    finally:
+        await runner.cleanup()
 
 
 @pytest.mark.anyio
@@ -1599,3 +1729,44 @@ async def test_failed_risk_setup_blocks_siblings_without_inventing_defects(tmp_p
     assert [c['status'] for c in result['checks']] == ['action_failed','blocked_by_setup','ok']
     assert result['checks'][2]['steps'][0]['output']['actual']['applicable'] is False
     assert result['checks'][1]['steps'] == []
+
+
+@pytest.mark.anyio
+async def test_key_press_dispatches_modifier_chords_and_character_shortcuts(tmp_path):
+    async def page(_request):
+        return web.Response(text='''<div id="card" tabindex="0">Card</div><output id="moves">0</output><input id="draft" value="old draft"><output id="shortcut"></output>
+          <script>card.onkeydown=e=>{if(e.altKey&&e.key==='ArrowDown'){e.preventDefault();moves.textContent=Number(moves.textContent)+1;}if(e.key==='q')shortcut.textContent='opened';};</script>''', content_type='text/html')
+    app=web.Application();app.router.add_get('/',page)
+    runner=web.AppRunner(app);await runner.setup();site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+    try:
+        result=await collect_browser_evidence(app_url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+            checks=[{'id':'keys','route':'/','actions':[
+                {'action':'key_press','selector':'#card','key':'Alt+ArrowDown','count':2},
+                {'action':'assert_text','selector':'#moves','value':'2','match':'exact'},
+                {'action':'key_press','selector':'#card','key':'q'},
+                {'action':'assert_text','selector':'#shortcut','value':'opened','match':'exact'},
+                {'action':'key_press','selector':'#draft','key':'ControlOrMeta+A'},
+                {'action':'key_press','selector':'#draft','key':'Replacement text'},
+                {'action':'assert_value','selector':'#draft','value':'Replacement text'},
+            ]}],output_path=tmp_path/'keys.json',headless=True)
+    finally:await runner.cleanup()
+    assert result['checks'][0]['status']=='ok',result
+
+
+@pytest.mark.anyio
+async def test_ambiguous_wait_is_contract_error_not_broken_product(tmp_path):
+    async def page(_request):
+        return web.Response(text='<article>Alex</article><article>Alex</article>', content_type='text/html')
+    app = web.Application(); app.router.add_get('/', page)
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0); await site.start()
+    try:
+        result = await collect_browser_evidence(
+            app_url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+            checks=[{'id':'ambiguous','route':'/','actions':[
+                {'action':'wait_for','selector':'article','state':'attached'}]}],
+            output_path=tmp_path/'ambiguous.json', headless=True)
+    finally:
+        await runner.cleanup()
+    assert result['checks'][0]['status'] == 'invalid_test_contract'
+    assert '<article>Alex</article>' in result['checks'][0]['failure_dom']

@@ -20,7 +20,7 @@
 
 ## 验收与导出
 
-- 每个 Edit 只有一个连续 `browser_check`；真实操作证明状态变化，检查失败后最多一次基于证据的 Repair，再复测同一流程。
+- 每个 Edit 只有一个连续 `browser_check`；真实操作证明主要功能可用。快速 GT 在同一 180 秒预算内最多三轮局部 Repair，回归旧功能不锁死数量、文案或暂态布局。
 - 记录源码哈希、精确 patch、页面清单、图片角色/状态映射、浏览器证据和 lineage；不要以截图或单测代替真实验收。
 - 六类导出通过 `scripts/export_trajectory_dataset.py` / `scripts/export_session_six_tasks.py`，消费 `dataset_index.json` 指向的不可变分片，不 glob 历史文件。
 - Edit/Repair 窗口按 4–12 项保存；Repair 问题按独立问题计数；Image Repair 图片顺序为 current 后 target。

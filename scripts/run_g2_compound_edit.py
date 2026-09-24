@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one frozen 0905 compound Edit through the lightweight Harness path."""
+"""Run one 0921 record (or prepared case) through sequential Skill-assisted Edit."""
 from __future__ import annotations
 
 import argparse
@@ -25,12 +25,77 @@ from src.config import HarnessConfig
 from src.orchestration.frozen_compound_edit import read_frozen_compound_plan
 
 
+async def _source_ui_contract(source: Path, evaluation: Path, config: HarnessConfig) -> dict:
+    """Ground initial control visibility in the running source, not HTML guesses."""
+    from playwright.async_api import async_playwright
+    from src.utils.playwright_browser import launch_chromium
+    from src.orchestration.runtime import build_frontend_command, start_process, stop_process, wait_for_http
+    contract = compact_source_ui_contract(source, evaluation)
+    server = start_process(name="source-observation", command=build_frontend_command(source, config.frontend_port),
+                           cwd=source, log_path=evaluation.parent / "source_observation.log")
+    url = f"http://127.0.0.1:{config.frontend_port}"
+    try:
+        await wait_for_http(name="source-observation", url=url, managed=server)
+        async with async_playwright() as playwright:
+            browser = await launch_chromium(playwright, headless=True)
+            try:
+                page = await browser.new_page()
+                for surface in contract.get("pages", []):
+                    await page.goto(url + surface["route"], wait_until="domcontentloaded")
+                    for control in surface.get("controls", []):
+                        locator = page.locator(control["selector"])
+                        control["initially_visible"] = await locator.count() > 0 and await locator.first.is_visible()
+                    surface["entry_transitions"] = []
+                    entries = [c for c in surface.get("controls", [])
+                               if c.get("initially_visible") and c.get("tag") == "button"][:8]
+                    for entry in entries:
+                        probe = await browser.new_page()
+                        try:
+                            await probe.goto(url + surface["route"], wait_until="domcontentloaded")
+                            await probe.locator(entry["selector"]).first.click(timeout=3000)
+                            await probe.wait_for_timeout(1000)
+                            hidden = []
+                            for control in entries:
+                                target = probe.locator(control["selector"])
+                                if not await target.count() or not await target.first.is_visible():
+                                    hidden.append(control["selector"])
+                            if hidden:
+                                surface["entry_transitions"].append({"click": entry["selector"], "hides": hidden})
+                        finally:
+                            await probe.close()
+            finally:
+                await browser.close()
+    finally:
+        await stop_process(server)
+    (evaluation.parent / "source_ui_contract.json").write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n")
+    return contract
+
+
 def _read_case(path: Path) -> dict[str, Any]:
     if path.suffix == ".gz":
         with gzip.open(path, "rt", encoding="utf-8") as stream:
             return json.load(stream)
     return json.loads(path.read_text(encoding="utf-8"))
 
+
+
+def normalize_input_case(row: dict[str, Any]) -> dict[str, Any]:
+    """Accept the official 0921 row without rewriting its code or instructions."""
+    if "source_code" in row:
+        return row
+    instruction = row.get("instruction")
+    if not isinstance(instruction, dict):
+        raise ValueError("Expected 0921 instruction.src_code and instruction.description")
+    status = (row.get("metadata") or {}).get("instruction_status")
+    if status not in (None, "query_ready"):
+        raise ValueError(f"0921 input is not query_ready: {status}")
+    descriptions = instruction.get("description")
+    if not isinstance(descriptions, list):
+        raise ValueError("0921 description must be a list")
+    declared = row.get("task_type")
+    if declared is not None and declared != [item.get("task_type") for item in descriptions]:
+        raise ValueError("0921 task types disagree with descriptions")
+    return {**row, "source_code": instruction.get("src_code"), "descriptions": descriptions}
 
 def _code_sha256(code: list[dict[str, str]]) -> str:
     payload = json.dumps(code, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -82,10 +147,34 @@ def _materialize_source(
     return project_root, prefix
 
 
+def _prepare_source_dependencies(source: Path, evaluation: Path) -> None:
+    """Prepare an isolated source once before browser observation."""
+    package = source / "package.json"
+    if not package.is_file() or (source / "node_modules").is_dir():
+        return
+    log = evaluation.parent / "dependency_install.log"
+    env = {**os.environ, "npm_config_cache": "/tmp/webcoding_npm_cache"}
+    with log.open("w", encoding="utf-8") as stream:
+        import subprocess
+        subprocess.run(
+            ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund"],
+            cwd=source, env=env, stdout=stream, stderr=subprocess.STDOUT,
+            timeout=120, check=True,
+        )
+
+
 def _provider_config(args: argparse.Namespace) -> HarnessConfig:
-    key = os.environ.get("NJULINK_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    base = os.environ.get("OPENAI_BASE_URL", "https://api.nju-link.com").rstrip("/")
-    if not urlsplit(base).path.strip("/"):
+    profile = {}
+    if getattr(args, "provider_profile", None):
+        profile_path = Path.home() / ".config/webcoding" / f"{args.provider_profile}.json"
+        if args.provider_profile != "experimental-luna":
+            raise ValueError("Unknown provider profile")
+        profile = json.loads(profile_path.read_text())
+    key = profile.get("bearer_token") or os.environ.get("NJULINK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    base = (profile.get("base_url") or os.environ.get("OPENAI_BASE_URL", "https://api.nju-link.com")).rstrip("/")
+    model = args.model or profile.get("model") or "gpt-5.6-luna"
+    wire_api = profile.get("wire_api") or os.environ.get("OPENAI_WIRE_API", "chat")
+    if not urlsplit(base).path.strip("/") and wire_api != "responses":
         base += "/v1"
     if not key:
         raise ValueError("NJULINK_API_KEY is required")
@@ -94,30 +183,38 @@ def _provider_config(args: argparse.Namespace) -> HarnessConfig:
         agent_runtime="openai",
         openai_api_key=key,
         openai_base_url=base,
-        planner_model=args.model,
-        generator_model=args.model,
-        evaluator_model=args.model,
-        evaluator_vision_model=args.model,
+        openai_wire_api=wire_api,
+        openai_stream_read_retries=2 if args.provider_profile == "experimental-luna" else 0,
+        openai_extra_headers=profile.get("http_headers", {}),
+        planner_model=model,
+        generator_model=model,
+        evaluator_model=model,
+        evaluator_vision_model=model,
         evaluator_vision_api_key=key,
         evaluator_vision_base_url=base,
         evaluator_vision_endpoint_type="openai",
         evaluator_vision_max_retries=0,
+        evaluator_vision_timeout_seconds=args.request_timeout,
         evaluator_evidence_route="typed",
-        evaluator_mode="full",
+        evaluator_mode="typed",
         playwright_headless=True,
         frontend_port=args.port,
         max_budget_usd=budget,
         planner_budget_usd=budget,
         generator_budget_usd=budget,
         evaluator_budget_usd=budget,
-        edit_max_rounds=2,
+        # Lightweight production permits one additional evidence-driven Repair:
+        # implementation + at most two repairs, still bounded per case.
+        edit_max_rounds=max(3, getattr(args, "debug_max_rounds", 3)),
         edit_full_replay_interval=1,
-        edit_replay_all_accepted_checks=True,
+        edit_replay_all_accepted_checks=False,
         edit_originality_required=False,
         edit_collect_visual_failures_before_repair=False,
         edit_webcompass_defect_checks=False,
+        lightweight_edit_production=True,
         edit_ignore_unstable_source_fragments=True,
         edit_frozen_compound_mode=True,
+        edit_skills_enabled=True,
         # Reverse-built 0905 seeds commonly depend on remote fonts/assets. A
         # counterfactual source rerender can therefore drift even when source
         # bytes are unchanged. Keep the mutation-path guard (including its
@@ -169,7 +266,7 @@ def _load_step_patches(
 
 
 async def execute(args: argparse.Namespace) -> dict[str, Any]:
-    case = _read_case(args.case.resolve())
+    case = normalize_input_case(_read_case(args.case.resolve()))
     case_id = str(case.get("instance_id") or args.case.stem)
     code = case.get("source_code")
     if not isinstance(code, list) or not code:
@@ -196,6 +293,7 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
     evaluation = output / "source_evaluation.json"
     if not evaluation.exists():
         evaluation.write_text("{}\n", encoding="utf-8")
+    _prepare_source_dependencies(source, evaluation)
     config = _provider_config(args)
     frozen_path = output / "frozen_compound_edit_plan.json"
     if frozen_path.is_file():
@@ -214,10 +312,12 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
             case_id=case_id,
             source_code_sha256=source_hash,
             frozen_subtasks=subtasks,
-            source_ui_contract=compact_source_ui_contract(source, evaluation),
+            source_ui_contract=await _source_ui_contract(source, evaluation, config),
             output_path=frozen_path,
         )
-    planned = planning["plan"]["subtasks"]
+    all_planned = planning["plan"]["subtasks"]
+    limit = getattr(args, "max_steps", None)
+    planned = all_planned[:limit] if limit else all_planned
     steps = tuple(
         EditStep(
             id=item["id"],
@@ -293,6 +393,9 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
         "cost_usd": record.get("cost_usd", 0),
         "steps": record.get("steps") or [],
     }
+    if record.get("status") == "ok" and len(planned) < len(subtasks):
+        result["status"] = "partial"
+        result["completed_prefix"] = len(planned)
     if record.get("status") == "ok":
         patches, final, step_summaries = _load_step_patches(
             record, subtasks=subtasks, prefix=prefix
@@ -305,6 +408,7 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
         ]:
             raise ValueError("full ordered compound patch replay failed")
         result.update(
+            patch_scope="full" if result["status"] == "ok" else "accepted_prefix",
             response=patches,
             patch_count=len(patches),
             patch_count_by_task={
@@ -316,6 +420,11 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
             ),
             step_summaries=step_summaries,
         )
+        (output / "patches.json").write_text(
+            json.dumps({"scope": result["patch_scope"], "completed_steps": len(step_summaries),
+                        "total_steps": len(subtasks), "patches": patches}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     (output / "result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -325,19 +434,41 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--case", type=Path, required=True)
+    result.add_argument("--fast-gt", action="store_true", help="Native preloaded single-call GT path; no Codex CLI")
+    result.add_argument("--unattended", action="store_true", help="Fresh fast GT validation without manual checks or resume")
+    result.add_argument("--subtask-timeout", type=int, default=180)
+    result.add_argument("--browser-url", help="Already running isolated frontend for the current flow")
+    result.add_argument("--browser-check", type=Path, help="Frozen typed browser flow for a single-step smoke")
     result.add_argument("--output", type=Path, required=True)
-    result.add_argument("--model", default="gpt-5.6-luna")
+    result.add_argument("--model", default=None)
+    result.add_argument("--provider-profile", choices=["experimental-luna", "qwen"])
     result.add_argument("--port", type=int, default=18931)
     result.add_argument("--budget-usd", type=float, default=20.0)
-    result.add_argument("--request-timeout", type=int, default=300)
+    result.add_argument("--request-timeout", type=int, default=600)
     result.add_argument("--case-timeout", type=float, default=14400)
     result.add_argument("--resume", action="store_true")
+    result.add_argument("--acceptance", choices=["standard", "lenient"], default="standard")
+    result.add_argument("--debug-max-rounds", type=int, choices=range(3, 9), default=3,
+                        help="Bounded local debugging continuation; lightweight production defaults to implementation plus two repairs")
+    result.add_argument("--max-steps", type=int, choices=range(1, 13), help="Bound a first sample; incomplete prefixes are not exported as full GT")
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
-    result = asyncio.run(execute(args))
+    os.environ.setdefault("OPENAI_STREAM_LOG", str(args.output.resolve() / "response_stream.jsonl"))
+    if args.fast_gt:
+        if args.browser_check and args.max_steps != 1:
+            raise SystemExit("--browser-check currently requires --max-steps 1")
+        if not 1 <= args.subtask_timeout <= 180:
+            raise SystemExit("--subtask-timeout must be between 1 and 180")
+        from src.orchestration.fast_edit_gt import execute as execute_fast
+        result = asyncio.run(execute_fast(args))
+        print(json.dumps({k:v for k,v in result.items() if k not in {'response','reference'}}, ensure_ascii=False))
+        return 0 if result['status'] in {'ok', 'partial'} else 2
+    if args.provider_profile == "qwen":
+        raise SystemExit("qwen profile currently requires --fast-gt")
+    result = asyncio.run(asyncio.wait_for(execute(args), timeout=args.case_timeout))
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("status") == "ok" else 2
 

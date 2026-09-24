@@ -1,4 +1,6 @@
 # docker-compose.yml — single-service harness with OS-level isolation.
+# G2 Edit example:
+#   docker compose run --rm --entrypoint uv harness run python scripts/run_g2_compound_edit.py --case /app/workdir/one_case.json --output /app/workdir/run --model gpt-5.6-luna --max-steps 1
 #
 # Usage:
 #   docker compose run --rm harness "<prompt>" --workdir /app/workdir --plan-only
@@ -46,6 +48,12 @@ services:
       - ANTHROPIC_BASE_URL
       - EVALUATOR_VISION_API_KEY
       - EVALUATOR_VISION_BASE_URL
+      - NJULINK_API_KEY
+      - OPENAI_API_KEY
+      - OPENAI_BASE_URL
+      - OPENAI_WIRE_API
+      - HTTP_PROXY
+      - HTTPS_PROXY
       # Endpoint-shape switch — controls anthropic vs openai-compatible payload.
       - EVALUATOR_VISION_ENDPOINT_TYPE
       # Model overrides.

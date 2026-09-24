@@ -546,13 +546,15 @@ def test_perform_visual_review_request_propagates_json_parse_errors(
         )
 
 
-def test_tokenwave_visual_review_reuses_native_proxy_transport(tmp_path, monkeypatch):
+@pytest.mark.parametrize("base,wire", [("https://api.tokenwave.us/v1", "chat"), ("https://api.nju-link.com", "responses")])
+def test_tokenwave_visual_review_reuses_native_proxy_transport(tmp_path, monkeypatch, base, wire):
     from src.agents.openai_runner import OpenAIHTTPClient
     workdir, paths, file_comm = _seed_workdir(tmp_path)
     captured = {}
     async def complete(self, **payload):
         captured.update(payload)
-        assert self.config.openai_base_url == 'https://api.tokenwave.us/v1'
+        assert self.config.openai_base_url == base
+        assert self.config.openai_wire_api == wire
         return {'choices': [{'message': {'content': _success_review_text()}}],
                 'usage': {'prompt_tokens': 12, 'completion_tokens': 8}}
     monkeypatch.setattr(OpenAIHTTPClient, 'complete', complete)
@@ -560,7 +562,7 @@ def test_tokenwave_visual_review_reuses_native_proxy_transport(tmp_path, monkeyp
     review, stats = vision_scorer._perform_visual_review_request(
         config=_vision_config(evaluator_vision_model='gpt-5.5',
             evaluator_vision_endpoint_type='openai',
-            evaluator_vision_base_url='https://api.tokenwave.us/v1'),
+            evaluator_vision_base_url=base, openai_base_url=base, openai_wire_api=wire),
         file_comm=file_comm, workdir=workdir, sprint_num=1,
         sprint_context={'title':'t', 'goal':'g', 'deliverables':[], 'exit_criteria':[]},
         screenshot_paths=paths)

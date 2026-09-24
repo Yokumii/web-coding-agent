@@ -1,0 +1,11 @@
+.wc-table { font:inherit; color:inherit; }
+.wc-table input,.wc-table button { font:inherit; }
+.wc-table__scroll { overflow-x:auto; }
+.wc-table table { width:100%; border-collapse:collapse; }
+.wc-table th,.wc-table td { text-align:start; padding:.5rem; border-bottom:1px solid #aaa6; }
+@media(max-width:600px) {
+ .wc-table thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+ .wc-table tr { display:block; margin-block:.75rem; border:1px solid #aaa6; }
+ .wc-table td { display:flex; justify-content:space-between; gap:1rem; }
+ .wc-table td::before { content:attr(data-label); font-weight:bold; }
+}
