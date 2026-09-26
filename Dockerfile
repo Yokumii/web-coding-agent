@@ -1,54 +1,58 @@
 # syntax=docker/dockerfile:1.7
 
-# Microsoft Playwright image bundles Chromium + system libs + Node 20.
-# Pinned to keep Chromium / system-libs reproducible between hosts.
-FROM mcr.microsoft.com/playwright:v1.49.1-jammy
+FROM node:20-bookworm-slim AS node-runtime
+
+# Match the Python Playwright version pinned by uv.lock. The image provides
+# Chromium and its Linux system dependencies for the physical x86_64 host.
+FROM mcr.microsoft.com/playwright/python:v1.61.0-noble
 
 # Explicit root for the apt layer; the base image's default user is
 # undocumented and could change between tags.
 USER root
 
-# Jammy's default Python is 3.10; the project requires >=3.11.
-# python3.11-venv is required because uv creates ephemeral venvs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv ca-certificates curl \
+        ca-certificates curl git lsof \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user (pwuser, UID 1000) is provided by the base image.
-# Switch before installing uv so the binary lands in $HOME/.local/bin.
-USER pwuser
-ENV HOME=/home/pwuser
-ENV PATH="${HOME}/.local/bin:${PATH}"
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
+ENV UV_INSTALL_DIR=/usr/local/bin
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-WORKDIR /app
+WORKDIR /app/harness
+COPY --chown=pwuser:pwuser harness/pyproject.toml harness/uv.lock harness/.python-version ./
 
-# Copy lockfiles + Python pin first so the dependency layer caches across
-# src/ edits. .python-version pins uv to /usr/bin/python3.11.
-COPY --chown=pwuser:pwuser pyproject.toml uv.lock .python-version ./
-
-# Keep the dev group so pytest is available inside the container.
 RUN uv sync --frozen
+RUN chmod -R a+rX /opt/uv-python /app/harness/.venv
 
-COPY --chown=pwuser:pwuser src/ ./src/
-COPY --chown=pwuser:pwuser tests/ ./tests/
-COPY --chown=pwuser:pwuser scripts/ ./scripts/
+COPY reverse/validate/package.json reverse/validate/package-lock.json /opt/reverse-validator/
+RUN npm ci --prefix /opt/reverse-validator --omit=dev --no-audit --no-fund
+
+COPY --chown=pwuser:pwuser harness/.agents/ ./.agents/
+COPY --chown=pwuser:pwuser harness/config/ ./config/
+COPY --chown=pwuser:pwuser harness/src/ ./src/
+COPY --chown=pwuser:pwuser harness/tests/ ./tests/
+COPY --chown=pwuser:pwuser harness/scripts/ ./scripts/
+COPY --chown=pwuser:pwuser harness/docker/ ./docker/
+COPY --chown=pwuser:pwuser reverse/validate/ /app/reverse/validate/
+
+RUN chmod 0755 /app/harness/docker/entrypoint.sh \
+    && mkdir -p /app/workdir \
+    && chown pwuser:pwuser /app/workdir
 
 # Chromium's setuid sandbox can't run as a non-root user in an
 # unprivileged container, and the MCP CLI doesn't always forward
 # --no-sandbox. See playwright/playwright issue #883.
 ENV PLAYWRIGHT_MCP_SANDBOX=false
-
 ENV PYTHONUNBUFFERED=1
-
-# The read-only root FS in compose rejects ~/.cache/uv writes at startup
-# ("Could not acquire lock"). Redirect uv's cache to /tmp (tmpfs).
 ENV UV_CACHE_DIR=/tmp/uv-cache
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV NODE_PATH=/opt/reverse-validator/node_modules
 
-# Invoke the harness via `python -m src.main` because pyproject.toml
-# lacks a [build-system] section, so `uv sync` does not install the
-# project as a package and the `harness` console script is never
-# created. CLI args appended to `docker run` flow straight in.
-ENTRYPOINT ["uv", "run", "python", "-m", "src.main"]
-CMD ["--help"]
+USER root
+ENTRYPOINT ["/app/harness/docker/entrypoint.sh"]
+CMD ["uv", "run", "python", "-m", "src.main", "--help"]

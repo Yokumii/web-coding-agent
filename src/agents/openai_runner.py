@@ -262,14 +262,19 @@ class OpenAIHTTPClient:
         return result
 
     async def _stream_responses(self, client, base, key, payload):
-        """Recover a no-tool Product Session request via the same provider/model."""
+        """Run the existing agent loop over the Responses streaming protocol."""
         import httpx
-        if payload.get("tools"):
-            raise ValueError("Responses recovery currently supports no-tool requests only")
         instructions, inputs = [], []
         for message in payload.get("messages", []):
             if message["role"] == "system":
                 instructions.append(str(message.get("content") or ""))
+                continue
+            if message["role"] == "tool":
+                inputs.append({
+                    "type": "function_call_output",
+                    "call_id": message["tool_call_id"],
+                    "output": str(message.get("content") or ""),
+                })
                 continue
             content = message.get("content") or ""
             if isinstance(content, list):
@@ -282,10 +287,28 @@ class OpenAIHTTPClient:
                     else:
                         raise ValueError("unsupported Responses recovery message content")
                 content = converted
-            inputs.append({"role": message["role"], "content": content})
+            if content:
+                inputs.append({"role": message["role"], "content": content})
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                inputs.append({
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": function["name"],
+                    "arguments": function.get("arguments") or "{}",
+                })
         request = {"model": payload["model"], "instructions": "\n\n".join(instructions),
                    "input": inputs, "max_output_tokens": payload.get("max_tokens", 12000),
                    "stream": True, "store": False}
+        if payload.get("tools"):
+            request["tools"] = [{
+                "type": "function",
+                "name": item["function"]["name"],
+                "description": item["function"].get("description", ""),
+                "parameters": item["function"].get("parameters", {}),
+                **({"strict": item["function"]["strict"]} if "strict" in item["function"] else {}),
+            } for item in payload["tools"]]
+            request["tool_choice"] = payload.get("tool_choice", "auto")
         if payload.get("reasoning_effort"):
             request["reasoning"] = {"effort": payload["reasoning_effort"]}
         if payload.get("response_format", {}).get("type") == "json_object":
@@ -351,19 +374,28 @@ class OpenAIHTTPClient:
                         completed = event.get("response")
                         record("terminal_event", event_type=event_type,
                                status=(completed or {}).get("status"),
+                               error=str((completed or {}).get("error") or '')[:1000].replace(key,'[redacted]'),
                                usage=(completed or {}).get("usage") or {})
                         # The terminal event ends the response. Some gateways
                         # keep the HTTP connection open indefinitely afterwards.
                         break
                     if event_type == "error":
-                        if (event.get("error") or {}).get("code") == "stream_read_error":
-                            raise ResponsesStreamReadError("upstream stream_read_error")
+                        error = event.get("error") or {}
+                        code = error.get("code") if isinstance(error, dict) else None
+                        code = code or event.get("code")
+                        if code in {"stream_read_error", "upstream_http2_stream_error", "server_error"}:
+                            raise ResponsesStreamReadError(f"transient upstream error: {code}")
                         raise RuntimeError(f"streamed responses error: {event}")
+            if completed and completed.get("status") != "completed":
+                error = completed.get("error") or {}
+                if error.get("code") in {"stream_read_error", "upstream_http2_stream_error", "server_error"}:
+                    raise ResponsesStreamReadError(f"transient upstream error: {error.get('code')}")
             if not completed or completed.get("status") != "completed":
                 raise RuntimeError(
                     "responses stream ended without a completed response: "
                     f"status={(completed or {}).get('status')}, events={event_count}, "
-                    f"output_chars={output_chars}"
+                    f"output_chars={output_chars}, "
+                    f"error={str((completed or {}).get('error') or '')[:1000].replace(key,'[redacted]')}"
                 )
         except BaseException as exc:
             if trace_path and output_deltas:
@@ -376,11 +408,22 @@ class OpenAIHTTPClient:
         record("request_completed", usage=completed.get("usage") or {})
         content = "".join(part.get("text", "") for item in completed.get("output", [])
                           for part in item.get("content", []) if part.get("type") == "output_text")
-        if not content.strip():
-            raise RuntimeError("completed Responses request returned no text")
+        tool_calls = [{
+            "id": item.get("call_id") or item.get("id"),
+            "type": "function",
+            "function": {
+                "name": item["name"],
+                "arguments": item.get("arguments") or "{}",
+            },
+        } for item in completed.get("output", []) if item.get("type") == "function_call"]
+        if not content.strip() and not tool_calls:
+            raise RuntimeError("completed Responses request returned no text or tool call")
         usage = completed.get("usage") or {}
-        return {"choices": [{"index": 0, "finish_reason": "stop",
-                             "message": {"role": "assistant", "content": content}}],
+        message = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return {"choices": [{"index": 0, "finish_reason": "tool_calls" if tool_calls else "stop",
+                             "message": message}],
                 "usage": {**usage, "prompt_tokens": usage.get("input_tokens", 0),
                           "completion_tokens": usage.get("output_tokens", 0)}}
 
@@ -409,14 +452,20 @@ class OpenAIHTTPClient:
                     try:
                         async with asyncio.timeout(self.timeout):
                             return await self._stream_responses(client, base, key, payload)
-                    except ResponsesStreamReadError:
+                    except (
+                        asyncio.TimeoutError,
+                        ResponsesStreamReadError,
+                        httpx.RemoteProtocolError,
+                        httpx.ReadError,
+                        httpx.ConnectError,
+                    ) as exc:
                         if attempt == retries:
                             raise
                         delay = 5 * (attempt + 1)
                         if trace_path := os.getenv("OPENAI_STREAM_LOG"):
                             with Path(trace_path).open("a", encoding="utf-8") as trace:
                                 trace.write(json.dumps({"event": "request_retry", "model": payload["model"],
-                                    "reason": "stream_read_error", "attempt": attempt + 2,
+                                    "reason": type(exc).__name__, "attempt": attempt + 2,
                                     "delay_seconds": delay, "failed_request_usage": "unavailable"}) + "\n")
                         await asyncio.sleep(delay)
             if protocol != "chat":
@@ -584,8 +633,13 @@ async def run_openai_agent(*, prompt: str, config: HarnessConfig, workdir: Path,
                         ),
                     })
                 t = time.monotonic()
-                response = await asyncio.wait_for(client.complete(model=model, messages=messages,
-                    tools=openai_tool_schemas(allow_bash=allow_bash, allow_playwright=allow_playwright), tool_choice="auto"), limits.request_timeout)
+                response = await client.complete(
+                    model=model,
+                    messages=messages,
+                    tools=openai_tool_schemas(allow_bash=allow_bash, allow_playwright=allow_playwright),
+                    tool_choice="auto",
+                    reasoning_effort="low" if config.openai_wire_api == "responses" else None,
+                )
                 api_ms += int((time.monotonic()-t)*1000)
                 raw_usage = response.get("usage", {})
                 request_input_tokens = raw_usage.get(

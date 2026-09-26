@@ -50,6 +50,15 @@ def test_stop_cleans_owned_process_group():
         os.killpg(process.pid,0)
 
 
+def test_transient_rsi_lock_does_not_change_runtime_hash(tmp_path):
+    root=tmp_path/'.agents/skills'
+    root.mkdir(parents=True)
+    (root/'SKILL.md').write_text('skill')
+    before=batch._runtime_hash(tmp_path)
+    (root/'.rsi.lock').touch()
+    assert batch._runtime_hash(tmp_path)==before
+
+
 def test_independent_guard_kills_hung_worker_and_preview(tmp_path,monkeypatch):
     import argparse
     import socket
@@ -74,7 +83,7 @@ time.sleep(60)
     monkeypatch.setattr(guard,'ROOT',tmp_path)
     started=time.monotonic()
     result=guard.run(argparse.Namespace(case=case,output=tmp_path/'output',dependencies=deps,
-        port=port,model='unused',provider_profile='qwen',subtask_timeout=180))
+        port=port,model='unused',provider_profile='qwen',case_timeout=180))
     assert result['status']=='error'
     assert 'TimeoutError' in result['error']
     assert time.monotonic()-started<10

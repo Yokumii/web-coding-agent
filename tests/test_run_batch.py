@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import shutil
@@ -342,9 +343,28 @@ async def test_batch_does_not_label_unfinished_harness_as_ok(monkeypatch, tmp_pa
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("resume_prefix", [False, True])
+async def test_batch_does_not_mislabel_an_inner_timeout_as_case_timeout(monkeypatch, tmp_path: Path):
+    async def fake_harness(*_args, **_kwargs):
+        raise asyncio.TimeoutError("provider request timed out")
+
+    monkeypatch.setattr("scripts.run_batch.run_harness", fake_harness)
+    result = await run_batch(
+        [BatchTask(id="inner-timeout", prompt="test")],
+        output_dir=tmp_path / "runs", results_path=tmp_path / "results.jsonl",
+        workers=1, base_port=6450, timeout_seconds=5,
+    )
+
+    assert result[0]["status"] == "error"
+    assert "TimeoutError" in result[0]["error"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("resume_prefix", "fail_second"),
+    [(False, False), (True, False), (False, True)],
+)
 async def test_edit_chain_uses_each_accepted_target_as_next_source_and_exports_diff(
-    monkeypatch, tmp_path: Path, resume_prefix,
+    monkeypatch, tmp_path: Path, resume_prefix, fail_second,
 ):
     seed = tmp_path / "seed"
     seed.mkdir()
@@ -375,6 +395,8 @@ async def test_edit_chain_uses_each_accepted_target_as_next_source_and_exports_d
     async def fake_harness(prompt, workdir, config, **kwargs):
         del config
         prior_counts.append(len(kwargs.get("prior_accepted_checks") or []))
+        if prompt == "second" and fail_second:
+            raise RuntimeError("second edit failed")
         frontend = workdir / "frontend"
         with (frontend / "app.js").open("a") as handle:
             handle.write(f"// {prompt}\n")
@@ -421,6 +443,11 @@ async def test_edit_chain_uses_each_accepted_target_as_next_source_and_exports_d
         workers=1, base_port=6500, timeout_seconds=10,
     )
 
+    if fail_second:
+        assert result[0]["status"] == "error"
+        assert [item["edit_id"] for item in result[0]["steps"]] == ["q1"]
+        assert "second edit failed" in result[0]["error"]
+        return
     assert result[0]["status"] == "ok"
     assert prior_counts == [0, 1]
     assert all(Path(item["ground_truth"]["patch"]).is_file() for item in result[0]["steps"])

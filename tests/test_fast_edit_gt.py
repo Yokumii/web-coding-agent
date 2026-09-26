@@ -1,17 +1,110 @@
 import pytest
 from src.orchestration.fast_edit_gt import apply_candidate, references, lenient_check, scoped_payload
 from scripts.export_trajectory_dataset import apply_patches
-from src.orchestration.fast_edit_gt import causal_check, repair_paths
+from src.orchestration.fast_edit_gt import causal_check, repair_paths, review_source
 from src.orchestration.fast_edit_gt import skill_instructions
+
+
+def test_implementation_response_has_no_check_edit_authority():
+    from src.orchestration.fast_edit_gt import response_format
+    schema = response_format({}, implementation_only=True)['json_schema']['schema']
+    assert set(schema['properties']) == {'copies','patches','new_files'}
+    assert schema['additionalProperties'] is False
+
+
+def test_duplicate_and_noop_patches_preserve_exact_replay():
+    source = [{'path':'index.html','code':'<main>old</main>'}]
+    patch = {'path':'index.html','search':'old','replace':'new'}
+    target, edits = apply_candidate(source, {'copies':[], 'patches':[
+        patch, dict(patch), {'path':'index.html','search':'new','replace':'new'}]}, {}, 'Edit')
+    assert apply_patches(source, edits) == target
+    assert target[0]['code'] == '<main>new</main>'
+
+
+def test_whole_file_anchor_still_exports_local_diff():
+    source = [{'path':'index.html','code':'<main>old</main>\n<footer>unchanged</footer>'}]
+    target, edits = apply_candidate(source, {'copies':[], 'patches':[{
+        'path':'index.html','search':source[0]['code'],
+        'replace':source[0]['code'].replace('old','new')}]}, {}, 'Edit')
+    assert apply_patches(source, edits) == target
+    assert 'unchanged' in target[0]['code']
+
+
+def test_react_source_without_package_uses_react_wrapper():
+    refs = references([{'path':'src/App.tsx','code':'export default () => <main/>'}], 'Shopping Cart')
+    assert any(p.endswith('/Component.jsx') for p in refs)
+
+
+def test_copied_core_requires_host_dependency_path():
+    code=[{'path':'index.html','code':'<main id="tree"></main>'}]
+    refs={'components/tree.mjs':'export function mount() {}'}
+    with pytest.raises(ValueError,match='not connected'):
+        apply_candidate(code,{'copies':list(refs)},refs,'Tree View')
+    payload={'copies':list(refs),'patches':[{'path':'index.html','search':'</main>',
+        'replace':'</main><script type="module" src="adapter.mjs"></script>'}],
+        'new_files':[{'path':'adapter.mjs','code':'import {mount} from "./components/tree.mjs"; mount();'}]}
+    target, patches=apply_candidate(code,payload,refs,'Tree View')
+    assert apply_patches(code,patches)==target
+
+
+def test_classic_import_fails_before_browser_and_module_adapter_passes():
+    from src.orchestration.fast_edit_gt import validate_classic_scripts
+    original={'index.html':'<script src="app.js"></script>','app.js':'console.log("ready")'}
+    invalid={**original,'app.js':'import {mount} from "./core.mjs"; mount();'}
+    with pytest.raises(ValueError,match='classic script does not compile'):
+        validate_classic_scripts(original,invalid)
+    validate_classic_scripts(original,{**invalid,'index.html':'<script type="module" src="app.js"></script>'})
+
+
+def test_product_repair_requires_exact_current_source_evidence():
+    from src.orchestration.fast_edit_gt import has_defect_evidence
+    code=[{'path':'app.js','code':'broken.mount(null);'}]
+    assert not has_defect_evidence({'classification':'product_defect','reason':'review said no reuse'},code)
+    assert not has_defect_evidence({'classification':'product_defect','defect_path':'app.js','defect_snippet':'made up'},code)
+    assert has_defect_evidence({'classification':'product_defect','defect_path':'app.js','defect_snippet':'broken.mount(null)'},code)
+
+
+def test_new_adapter_missing_import_resolves_only_unique_supplied_reference():
+    code=[{'path':'index.html','code':'<main></main>'}]
+    refs={'components/edit-skills/tree/core.mjs':'export function mount() {}'}
+    payload={'copies':list(refs),'patches':[{'path':'index.html','search':'</main>',
+        'replace':'</main><script type="module" src="components/edit-skills/adapter.mjs"></script>'}],
+        'new_files':[{'path':'components/edit-skills/adapter.mjs',
+            'code':'import {mount} from "./edit-skills/tree/core.mjs"; mount();'}]}
+    target, patches=apply_candidate(code,payload,refs,'Tree View')
+    assert 'from "./tree/core.mjs"' in next(x['code'] for x in target if x['path'].endswith('adapter.mjs'))
+    assert apply_patches(code,patches)==target
+
+
+def test_html_quote_repair_is_tag_local_and_preserves_script_strings(tmp_path):
+    from src.orchestration.fast_edit_gt import normalize_html_quotes
+    source='<button class="ab-btn"" data-panel="ai">AI</button><script>const s=\'<b class="x"">\';</script>'
+    target=normalize_html_quotes([{'path':'index.html','code':source}],tmp_path)
+    assert target[0]['code']=='<button class="ab-btn" data-panel="ai">AI</button><script>const s=\'<b class="x"">\';</script>'
+
+
+def test_staged_candidate_keeps_valid_files_for_wiring_only_recovery():
+    from src.orchestration.fast_edit_gt import UnmountedCandidate, require_core_connection
+    code=[{'path':'index.html','code':'<main></main>'}]
+    refs={'components/core.mjs':'export function mount() {}'}
+    with pytest.raises(UnmountedCandidate) as error:
+        apply_candidate(code,{'copies':list(refs),'new_files':[{
+            'path':'adapter.mjs','code':'import {mount} from "./components/core.mjs"; mount();'}]},refs,'Edit')
+    staged=error.value.target
+    target,_=apply_candidate(staged,{'copies':[],'patches':[{'path':'index.html','search':'</main>',
+        'replace':'</main><script type="module" src="adapter.mjs"></script>'}]},{},'Edit')
+    require_core_connection(target,refs)
+    assert next(x['code'] for x in target if x['path']=='adapter.mjs')==next(x['code'] for x in staged if x['path']=='adapter.mjs')
 
 
 def test_selected_skill_includes_complete_document_and_content_hash():
     import hashlib
-    from src.orchestration.edit_skills import SKILLS_ROOT
+    from src.orchestration.edit_skills import SKILLS_ROOT, shared_edit_skill_contract
     context=skill_instructions('Shopping Cart')
     source=(SKILLS_ROOT/context['name']/'SKILL.md').read_text()
-    assert context['instructions']==source
-    assert context['sha256']==hashlib.sha256(source.encode()).hexdigest()
+    effective=shared_edit_skill_contract()+'\n\n'+source
+    assert context['instructions']==effective
+    assert context['sha256']==hashlib.sha256(effective.encode()).hexdigest()
     assert skill_instructions('not-a-known-type') is None
 
 
@@ -125,6 +218,23 @@ def test_references_follow_source_framework():
     assert any(p.endswith('Component.jsx') for p in refs)
     assert any(p.endswith('infinite-scroll.mjs') for p in refs)
     assert not any(p.endswith('.vue') or p.endswith('.js') for p in refs)
+
+
+def test_vanilla_references_have_real_module_exports():
+    refs=references([{'path':'index.html','code':'<main></main>'}],'Tree View')
+    module=next(code for path,code in refs.items() if path.endswith('tree.mjs'))
+    assert 'export { mountTreeView }' in module
+    assert not any(path.endswith(('.jsx','.vue','.js')) for path in refs)
+
+
+def test_reviewer_sees_unchanged_entry_dependencies():
+    before=[{'path':'index.html','code':'<script type="module" src="js/app.js"></script>'},
+        {'path':'js/app.js','code':"import {open} from './views/panel'; open();"},
+        {'path':'js/views/panel.js','code':'export function open() {}'},
+        {'path':'styles.css','code':'body {}'}]
+    after=before+[{'path':'adapter.mjs','code':'export const adapter = 1'}]
+    assert {x['path'] for x in review_source(before,after)}=={
+        'index.html','js/app.js','js/views/panel.js','adapter.mjs'}
 
 
 def test_line_edits_use_original_coordinates_and_export_exact_patches():

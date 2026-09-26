@@ -65,11 +65,11 @@ Sprint 中有真实浏览器证据的失败版本到后续恢复派生 `natural_
 - 前端运行时失败的本地日志
 - 按阶段记录成本，分别执行 planner/generator/evaluator 累计上限，并设有总预算硬上限；失败或中断调用的 append-only trace 用量会计入恢复后的阶段累计值，不会在 resume 时清零
 - 增量 Edit 的 DOM 契约保护：显式 Edit 从已验收 seed 建立基线；Generate 的第二个及以后 Sprint 从上一已验收 checkpoint 建立逐路由语义 DOM/ARIA 基线。每个基线双采样，不稳定则 fail closed；v4 contract 只开放目标 selector 对应的最深 fragment（每目标路由最多四个），同一 `main` 内的兄弟 fragment 和所有非目标路由仍受保护；检查独立于截图/像素评分。
-- harness 主导的最小路径引导：每条 UI check 必须声明站内 route。harness 根据静态 HTML 页面、具体文件系统路由、显式 React Router 映射、字面 `registerRoute()` hash 路由、源码热点和 import/link 边建立页面归属及 change cone；连贯的多路由 Edit 会为每个目标路由开放一个排名最高的起点，目标路由本地文件优先，非目标文件保持关闭。若多页共用一个源码文件，只有能由字面路由机械定位出的目标页顶层对象/类/函数区域可以开放；共享 Store/State 只允许增加与目标路由或检查同名的成员，已有成员和无关标识符保持保护。每个 exact patch 必须位于获准区域内，同文件兄弟页面模块与整文件覆盖继续被拒绝，所有结果写入 append-only ledger。
-- 项目原生设计引导：最小路径计划会盘点 CSS custom properties、定义文件和使用次数，Generator 优先复用已有颜色、间距、圆角、字体和动效 token；盘点到 token 不等于自动开放受保护的全局样式表。
+- harness 主导的推荐范围引导：每条 UI check 声明站内 route。harness 根据页面、路由、源码热点和 import/link 关系给出紧凑的候选文件与源码区域排序；它只用于提示 Editing Agent，不再充当读写权限或依赖解锁系统。极端 sanity check 仍拒绝明显破坏性或格式错误的候选。
+- 项目原生设计引导：推荐范围会盘点 CSS custom properties、定义文件和使用次数，Generator 优先复用已有颜色、间距、圆角、字体和动效 token。
 - 0805 全 40 类 Edit 的 typed browser contract：新计划禁止任意 `evaluate` JavaScript，但支持有界 hash route 与 `assert_hash`；`set_storage_value` 可建立确定性的 local/sessionStorage 状态夹具，`assert_computed_style` 可在不看截图的情况下检查少量渲染属性。每条 flow 必须以一至四个相关且有界的 DOM/text/value/count/pathname/hash/computed-style/attribute/ARIA/focus/storage/console assertions 结束。Tab 检查必须给出确定的起始 selector，初始空状态检查必须排在同一路由的写状态流程之前。真实 Chromium 还执行 hover、右键、拖拽、内存文件上传、异步 selector 等待、reload、viewport 调整和 print/color-scheme 媒体模拟。历史 `evaluate` 只可回放，不能进入新正式出口。
 - accepted checkpoint tape：通过的 typed flow 按 requirement/impact/Sprint/round 追加保存。普通 Edit 只重放受影响检查，并给每个受保护路由保留一个关键 sentinel；每第 5 个 accepted Edit 与缺少新元数据的历史 tape 做全量重放。已验收行为丢失是具体 regression，tape 损坏或超预算属于基础设施失败。
-- 反事实最小性证书：功能性 patch atom 在隔离的真实浏览器候选中逐个删除；目标局部 CSS 还必须由已通过的目标路由视觉复核覆盖，因为功能 oracle 无法判断视觉必要性。若失败只来自证据策略更新，后续 round 保持源码逐字节不变，并链接上一次真正 applied + validated 的 mutation ledger，不再让 Generator 为评分器修复而碰代码。新策略证书必须精确记录 source/destination（Repair 还记录真实 failure round）。
+- 轻量 Edit 验收：生成或 Repair 后启动真实页面，收集 runtime 与截图，再由 ITG/FTI/STC Judge 判定。只有启动失败、空白页、致命 JavaScript、无限加载、明显破坏或 patch 应用失败属于 runtime fatal；基础设施故障单独恢复或报告。
 - AIR 单次任务生成完整读取最多 48 个源码文件/140K 字符且不静默截断；更大项目明确拒绝并转入工具读取路径，不会把部分上下文伪称为 `all_files_included`。
 - 一等 Edit 入口：`--task-mode edit` 冻结干净的既有 frontend Git 基线，并物化一张紧凑 Edit card，保存精确增量指令、add/refine/replace/withdraw 需求关系、影响标签、目标路由/检查、冲突与视觉策略。连贯的多页/多文件 Edit 仍是一个 Sprint，独立改动在上游拆分。
 - 证据驱动 Repair：确定性失败跳过付费语义 judge，直接写 `repair_packet_round_N.json`；下一轮只接收失败检查/回归、证据引用、允许源码路径和动态文件/行数预算。无法定位的失败不会启动开放式 Repair。
@@ -77,7 +77,7 @@ Sprint 中有真实浏览器证据的失败版本到后续恢复派生 `natural_
 - 多类型用户输入：重复使用 `--input` 可加入 PNG/JPEG/WebP/GIF 或受限大小的文本/源码文件。输入按内容哈希暂存在 `.harness/inputs/`；图片会作为真正的多模态消息送入 Planner、Generator 和视觉复核，并进入 image-edit v2 导出。
 - 通用并发 `scripts/run_batch.py`：独立端口、单 case 超时、逐条 append 状态、成功 case 断点跳过、可选 verified seed、Edit 路由与多模态输入。
 - `scripts/export_run_folders.py`：只消费严格 trajectory exporter 已接受的记录，生成人工可读目录，不再从 commit/Sprint 猜测正式任务类型。
-- 严格 Edit-first 谱系：相邻 accepted checkpoint 是 canonical Edit；`checkpoint_generate` 与 `complete_generate` 是累计需求的派生视图；真实失败到同 Sprint 恢复是 `natural_repair`。正式 Edit/Repair 还必须具备稳定 v4 fragment scope、applied + validated 最小路径 ledger、`certified` 反事实证书、typed accepted tape 与可精确重放 patch；JSONL 只追加且可断点幂等。
+- 严格 Edit-first 谱系：相邻 accepted checkpoint 是 canonical Edit；`checkpoint_generate` 与 `complete_generate` 是累计需求的派生视图；真实失败到同 Sprint 恢复是 `natural_repair`。正式 Edit/Repair 通过推荐范围状态、validation/build 证据、typed accepted tape 与可精确重放 patch 关联 accepted mutation；JSONL 只追加且可断点幂等。
 - Generate 显著差异筛选：严格导出保持不可变，`scripts/curate_generate_materiality.py` 另建 release。它保留首个从零 Generate；中间 checkpoint 必须有人类或语义 reviewer 明确确认相对初始及上一条已选 Generate 均有显著差异；终态只保留一个 `complete_generate`，并删除与它同 destination commit 的 checkpoint 视图。代码量阈值只能作为证据，不能自行替代语义判断。
 
 ### Edit 事务、Generate checkpoint 与回归保护
@@ -101,25 +101,19 @@ generator 启动前，harness 会结合可执行 action selector 与源码依赖
 {"owner":"harness","allowed_root_keys":["main:unnamed"],"allow_new_roots":false}
 ```
 
-模型不能修改这两个策略文件。已有源码只能用唯一匹配的 exact patch 修改；整文件覆盖、
-越出 change cone、过宽 patch 以及 Bash 文件/依赖写操作会在执行前被拒绝。依赖文件只有
-在 plan 中存在明确 import/link 边时才可进入范围；决策写入
-`.harness/minimal_path_ledger_round_N.jsonl`。
-
-通常只开放一个初始源码入口；同一个产品语义明确跨多个目标路由时，每个目标路由各开放
-一个排名最高的入口，默认最多触及 6 个本地/依赖文件。共享 Store/State 只能新增与目标
-路由或检查锚点相关的成员，已有成员、同文件其他页面模块和无关标识符继续受保护。
+这些文件只提供推荐修改范围、可能依赖和应避免的无关页面。Generator 与 Repair 在代码或
+运行时证据明确时可以扩大范围；`.harness/recommended_scope_state_round_N.json` 只记录本轮
+实际触及的文件，供下一轮 Repair 优先检查。完成后仅用轻量 sanity check 识别整项目重写
+或大量无关新文件。
 
 显式 Edit 的 Planner 只允许一个 Sprint，并写出 `.harness/edit_card.json`。同一项
 产品语义需要同时修改两个页面或多个文件时仍是一个事务；彼此独立的需求由上游拆开。
 默认 `EDIT_MAX_ROUNDS=10` 只是失败恢复上限，通过后立即退出。每个失败轮必须写出
 可定位的 `repair_packet_round_N.json`，否则不会继续让模型开放式排查。
 
-多路由契约按 Edit 收窄：显式声明的多个目标路由只是全局上界；当前事务只开放其
-typed browser checks 覆盖的页面，其他页面仍受保护。路由无法解析或 planner
-漂移到未授权页面时，在修改源码前失败。
-Stop gate 还会把最终 Git diff 与 ledger 中实际成功的 mutation 对账，阻止构建脚本或
-provider 特殊工具间接改动受保护源码。
+推荐范围按当前 Edit 的 typed browser checks 排序相关页面与文件，但不关闭其他路径，
+也不在修改前设置读写门禁。生成结果仍须通过 runtime、截图、Judge、accepted checkpoint
+与 exact patch 重放证据。
 
 DOM 契约最多允许两个已命名 baseline surface 内发生变化；其他 surface 被删除或语义变化，
 或未授权新增 surface，都会作为 regression 使该轮失败，并写入
@@ -564,6 +558,8 @@ trace 中的有用信号：
 
 ## 架构说明
 
+执行入口、快速 GT 验证分支和 Skill 职责见 [当前架构与流程](docs/pipeline.md)。下面列出通用 Harness 的模块。
+
 当前 harness 使用：
 
 - `src/agents/sdk_runner.py`：Claude Agent SDK 集成、工具门控、trace 写入
@@ -585,7 +581,6 @@ trace 中的有用信号：
 - `scripts/recover_accepted_tapes.py`：仅凭既有通过证据恢复缺失 tape，并在最终状态真实重放
 - `scripts/export_run_folders.py`：严格 trajectory 记录的人工可读视图
 - `scripts/curate_generate_materiality.py`：带语义审查证据和终态 commit 去重的不可变 Generate 筛选
-- `scripts/validate_webcompass_edit_case.py`：零 LLM 的真实多页 Edit → 失败候选 → 证据驱动 Repair 验证
 
 ## 安全模型
 
@@ -616,25 +611,6 @@ uv run pytest tests -q
 ```
 
 测试覆盖 harness 控制流、SDK 集成、运行时行为、评分逻辑，以及本地 E2E 中发现的回归用例。
-
-可额外运行一个不调用 LLM 的真实 WebCompass 对齐多页样本：
-
-```bash
-uv run python scripts/validate_webcompass_edit_case.py
-```
-
-脚本会物化真实 source，证明功能原先不存在，让 4 个真实 GT patch 逐个通过最小路径授权，保存第一次失败 Edit 的浏览器证据，零成本生成 Repair packet，只做一次有界 Repair，再验证 DOM、ARIA、按钮 property、sessionStorage 与两个非目标路由 sentinel。每次运行都在 `logs/edit_first_20260828/` 下新建追加式目录。
-
-还可以运行 5 个真实样本的零 LLM Edit 矩阵：
-
-```bash
-uv run python scripts/validate_webcompass_edit_matrix.py
-```
-
-它覆盖单页、内联状态、多页共享文件、两路由/五文件和 hash-router，并把 accepted、
-候选拒收与基础设施错误分开统计；同时验证共享状态的定向增量、computed style、受保护
-路由 sentinel 和反事实 `non_minimal` 证书。当前生产与验收约束见
-[`docs/synthesis/pipeline.md`](docs/synthesis/pipeline.md)。
 
 ## 许可
 

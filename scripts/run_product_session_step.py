@@ -101,8 +101,9 @@ async def execute(payload):
         budget = float("inf") if payload.get("no_api_budget") else payload["budget_usd"]
         config = HarnessConfig(agent_runtime="openai", openai_api_key=os.environ["TOKENWAVE_OPENAI_API_KEY"],
             openai_base_url=os.environ.get("TOKENWAVE_OPENAI_BASE_URL", "https://api.tokenwave.us/v1"),
-            planner_model="gpt-5.5", generator_model="gpt-5.5", evaluator_model="gpt-5.5",
-            evaluator_vision_model="gpt-5.5", evaluator_mode="full", playwright_headless=True,
+            planner_model="gpt-5.6-luna", generator_model="gpt-5.6-luna",
+            evaluator_model="gpt-5.6-luna", evaluator_vision_model="gpt-5.6-luna",
+            evaluator_mode="full", playwright_headless=True,
             evaluator_evidence_route="typed",
             evaluator_vision_endpoint_type="openai", evaluator_vision_max_retries=0,
             evaluator_vision_api_key=os.environ["TOKENWAVE_OPENAI_API_KEY"],

@@ -663,29 +663,25 @@ def _minimal_path_artifacts_ready(harness: Path, round_num: int) -> bool:
     return baseline.get("version") == 4 and baseline.get("stable") is True
 
 
-def _minimal_path_decisions(harness: Path, round_num: int) -> list[str]:
-    ledger_path = harness / f"minimal_path_ledger_round_{round_num}.jsonl"
-    if not ledger_path.is_file():
-        return []
-    decisions: list[str] = []
-    for line in ledger_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        if isinstance(item, dict):
-            decisions.append(str(item.get("decision", "")))
-    return decisions
-
-
 def _linked_mutation_round(harness: Path, round_num: int) -> int | None:
     """Resolve the actual mutation behind a possibly zero-mutation evidence round."""
-    decisions = _minimal_path_decisions(harness, round_num)
-    if "applied" in decisions and "validation_pass" in decisions:
+    state = _read_json(harness / f"recommended_scope_state_round_{round_num}.json", {})
+    if (
+        state.get("touched_paths")
+        and state.get("validation_last_ok") is True
+        and _minimal_path_artifacts_ready(harness, round_num)
+    ):
         return round_num
-
     build_map = _read_json(harness / "round_build_map.json", {})
     current = build_map.get(str(round_num)) if isinstance(build_map, dict) else None
+    if (
+        isinstance(current, dict)
+        and current.get("source_commit")
+        and current.get("destination_commit")
+        and current.get("source_commit") != current.get("destination_commit")
+        and _minimal_path_artifacts_ready(harness, round_num)
+    ):
+        return round_num
     if (
         not isinstance(current, dict)
         or not current.get("source_commit")
@@ -695,6 +691,16 @@ def _linked_mutation_round(harness: Path, round_num: int) -> int | None:
     destination = str(current["destination_commit"])
     sprint = current.get("sprint")
     candidates: list[int] = []
+    for candidate in range(1, round_num):
+        candidate_state = _read_json(
+            harness / f"recommended_scope_state_round_{candidate}.json", {}
+        )
+        if (
+            candidate_state.get("touched_paths")
+            and candidate_state.get("validation_last_ok") is True
+            and _minimal_path_artifacts_ready(harness, candidate)
+        ):
+            candidates.append(candidate)
     for raw_round, build in build_map.items():
         try:
             candidate = int(raw_round)
@@ -709,9 +715,7 @@ def _linked_mutation_round(harness: Path, round_num: int) -> int | None:
             or not _minimal_path_artifacts_ready(harness, candidate)
         ):
             continue
-        candidate_decisions = _minimal_path_decisions(harness, candidate)
-        if "applied" in candidate_decisions and "validation_pass" in candidate_decisions:
-            candidates.append(candidate)
+        candidates.append(candidate)
     return max(candidates, default=None)
 
 
@@ -739,51 +743,22 @@ def _failure_has_runtime_evidence(
 
 
 def _minimal_path_provenance(harness: Path, round_num: int) -> dict[str, Any]:
-    """Summarize online guidance separately from post-hoc minimality proof."""
+    """Summarize advisory source guidance separately from acceptance evidence."""
     mutation_round = _linked_mutation_round(harness, round_num) or round_num
     plan_path = harness / f"minimal_path_plan_round_{mutation_round}.json"
     plan = _read_json(plan_path, {})
     if not isinstance(plan, dict) or plan.get("owner") != "harness":
         return {"status": "legacy_not_required"}
-    ledger_path = harness / f"minimal_path_ledger_round_{mutation_round}.jsonl"
-    ledger: list[dict[str, Any]] = []
-    if ledger_path.is_file():
-        for line in ledger_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(item, dict):
-                ledger.append(item)
-    counts = {
-        decision: sum(item.get("decision") == decision for item in ledger)
-        for decision in ("allow", "deny")
-    }
-    transitions = {
-        decision: sum(item.get("decision") == decision for item in ledger)
-        for decision in (
-            "observe",
-            "applied",
-            "failed",
-            "validation_pass",
-            "validation_fail",
-        )
-    }
-    state_path = harness / f"minimal_path_state_round_{mutation_round}.json"
+    state_path = harness / f"recommended_scope_state_round_{mutation_round}.json"
     state = _read_json(state_path, {})
-    has_applied_outcomes = any(
-        item.get("decision") == "applied" for item in ledger
-    )
-    touched_decision = "applied" if has_applied_outcomes else "allow"
     cone = plan.get("source_change_cone") or {}
     dom = plan.get("dom_change_cone") or {}
     route_scope = plan.get("route_scope") or {}
     return {
-        "status": "enforced",
+        "status": "advisory",
         "mutation_round": mutation_round,
         "evidence_round": round_num,
         "plan_artifact": f".harness/{plan_path.name}",
-        "ledger_artifact": f".harness/{ledger_path.name}",
         "state_artifact": (
             f".harness/{state_path.name}" if state_path.is_file() else None
         ),
@@ -797,23 +772,8 @@ def _minimal_path_provenance(harness: Path, round_num: int) -> dict[str, Any]:
             route_scope.get("cross_route_shared_paths") or []
         ),
         "off_target_paths": list(route_scope.get("off_target_paths") or []),
-        "decision_counts": counts,
-        "transition_counts": transitions,
-        "controller_phase": state.get("phase"),
-        "validation_attempt_revision": state.get("validation_attempt_revision"),
-        "validation_success_revision": state.get("validation_success_revision"),
+        "touched_paths": list(state.get("touched_paths") or []),
         "validation_last_ok": state.get("validation_last_ok"),
-        "touched_paths": sorted({
-            str(item["path"])
-            for item in ledger
-            if item.get("decision") == touched_decision and item.get("path")
-        }),
-        "dependency_expansions": sorted({
-            str(item["path"])
-            for item in ledger
-            if item.get("expansion_reason") == "recorded_dependency_edge"
-            and item.get("path")
-        }),
     }
 
 

@@ -1654,18 +1654,7 @@ def test_atomic_edit_planner_recovers_normalized_response_without_second_call(
     assert stats is not None
     assert stats.token_usage == {"input_tokens": 80, "output_tokens": 40}
     checks = file_comm.read_ui_verification_plan()["sprints"][0]["checks"]
-    assert [item["id"] for item in checks] == [
-        "physical-pages__part1",
-        "physical-pages__part2",
-    ]
-    assert checks[1]["route"] == "/settings.html"
-    assert checks[1]["actions"][-1] == {
-        "action": "assert_storage_value",
-        "storage": "local",
-        "key": "preferences",
-        "value": "saved",
-        "match": "contains",
-    }
+    assert [item["id"] for item in checks] == ["physical-pages"]
     edit_card = json.loads((file_comm.dir / "edit_card.json").read_text())
     assert edit_card["status"] == "ready"
     assert edit_card["target_routes"] == ["/", "/settings.html"]

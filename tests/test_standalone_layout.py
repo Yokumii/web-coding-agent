@@ -26,7 +26,6 @@ def test_launchers_default_runtime_data_to_standalone_repo(script_name: str) -> 
 @pytest.mark.parametrize(
     "script_name",
     [
-        "run_minimal_path_calibration.sh",
         "run_minimality_calibration.sh",
     ],
 )

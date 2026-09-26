@@ -6,7 +6,13 @@ import subprocess
 
 import pytest
 
-from src.orchestration.edit_skills import EDIT_SKILLS, SKILLS_ROOT, render_edit_skill, selected_edit_skill
+from src.orchestration.edit_skills import (
+    EDIT_SKILLS,
+    SKILLS_ROOT,
+    reference_destinations,
+    render_edit_skill,
+    selected_edit_skill,
+)
 
 
 SKILL = SKILLS_ROOT / "webcompass-shopping-cart"
@@ -47,7 +53,7 @@ def test_selection_uses_current_structured_type_only(tmp_path):
     assert render_edit_skill(tmp_path) == ""
 
 
-def test_rendered_skill_exposes_signatures_without_reference_body(tmp_path):
+def test_generate_skill_exposes_signatures_without_reference_body(tmp_path):
     (tmp_path / ".harness").mkdir()
     (tmp_path / ".harness/edit_task_contract.json").write_text(json.dumps({
         "schema_version": "edit-task-contract-v1",
@@ -56,7 +62,27 @@ def test_rendered_skill_exposes_signatures_without_reference_body(tmp_path):
     prompt = render_edit_skill(tmp_path)
     assert "mountRealtimeDashboard" in prompt
     assert "Use copy_from to reuse this immutable implementation" in prompt
-    assert "const root = document.createElement" not in prompt
+    assert "body is intentionally not inlined" in prompt
+    assert "const root = document.createElement(\"section\")" not in prompt
+
+
+def test_repair_reuses_installed_skill_without_repeating_canonical_body(tmp_path):
+    (tmp_path / ".harness").mkdir()
+    (tmp_path / ".harness/edit_task_contract.json").write_text(json.dumps({
+        "schema_version": "edit-task-contract-v1",
+        "chain_metadata": {"task_type": "Shopping Cart", "edit_skill_stack": "vanilla"},
+    }))
+    render_edit_skill(tmp_path)
+    for destination in reference_destinations(tmp_path).values():
+        target = tmp_path / destination
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("// current locally adapted core\n")
+
+    prompt = render_edit_skill(tmp_path, mode="repair")
+
+    assert "Skill core is already installed" in prompt
+    assert "Full immutable reference source:" not in prompt
+    assert "Host integration example" in prompt
 
 
 @pytest.mark.anyio

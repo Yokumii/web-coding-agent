@@ -7,7 +7,7 @@
 ## 权威文档
 
 - `README.md` / `README.zh-CN.md`：安装、CLI、配置、运行模式、输出布局和安全模型。
-- `docs/synthesis/pipeline.md`：当前 Product Session 与六类数据导出语义，是数据生产的首要依据。
+- `docs/pipeline.md`：当前 Product Session 与六类数据导出语义，是数据生产的首要依据。
 - `.agents/skills/`：按任务读取对应 skill；`runs/`、`logs/` 是运行证据，不是全局规则。
 
 ## 核心语义
@@ -20,7 +20,7 @@
 
 ## 验收与导出
 
-- 每个 Edit 只有一个连续 `browser_check`；真实操作证明主要功能可用。快速 GT 在同一 180 秒预算内最多三轮局部 Repair，回归旧功能不锁死数量、文案或暂态布局。
+- 快速 Edit GT 的共享验证路径由 `--reverse-validate-root` 显式启用，调用 `reverse/validate` 检查和修复；未指定时仍保留 Harness 浏览器检查分支。各入口、参数优先级和验证范围见 `docs/pipeline.md`。每个完整 case 只设 40 分钟硬上限，快速路径的步骤和 LLM Repair 不另设轮次上限。
 - 记录源码哈希、精确 patch、页面清单、图片角色/状态映射、浏览器证据和 lineage；不要以截图或单测代替真实验收。
 - 六类导出通过 `scripts/export_trajectory_dataset.py` / `scripts/export_session_six_tasks.py`，消费 `dataset_index.json` 指向的不可变分片，不 glob 历史文件。
 - Edit/Repair 窗口按 4–12 项保存；Repair 问题按独立问题计数；Image Repair 图片顺序为 current 后 target。

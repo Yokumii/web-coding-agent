@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from src.agents.openai_runner import (
     EvaluationToolPolicy,
     OpenAIHTTPClient,
     OpenAIRunLimits,
+    ResponsesStreamReadError,
     _is_finalization_command,
     _compact_messages,
     run_openai_agent,
@@ -752,6 +754,103 @@ async def test_tokenwave_responses_recovery_preserves_prompt_and_usage(monkeypat
 
 
 @pytest.mark.anyio
+async def test_responses_converts_function_tools_and_tool_turns(monkeypatch):
+    import httpx
+    original = httpx.AsyncClient
+    requests = []
+
+    def respond(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if len(requests) == 1:
+            assert body["tools"] == [{
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }]
+            assert body["tool_choice"] == "auto"
+            output = [{
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": '{"path":"index.html"}',
+            }]
+        else:
+            assert body["input"][-2:] == [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": '{"path":"index.html"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "<main>Current</main>",
+                },
+            ]
+            output = [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "done"}],
+            }]
+        event = {"type": "response.completed", "response": {
+            "status": "completed", "output": output,
+            "usage": {"input_tokens": 8, "output_tokens": 3},
+        }}
+        return httpx.Response(200, text="data: " + json.dumps(event) + "\n\n")
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    client = OpenAIHTTPClient(HarnessConfig(
+        openai_base_url="https://example.test/v1",
+        openai_api_key="test",
+        openai_wire_api="responses",
+    ), 20)
+    tools = [{"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a file",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }}]
+    first = await client.complete(
+        model="gpt-5.5",
+        messages=[{"role": "user", "content": "Inspect the page"}],
+        tools=tools,
+        tool_choice="auto",
+    )
+    tool_call = first["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["id"] == "call_1"
+    assert tool_call["function"] == {
+        "name": "read_file",
+        "arguments": '{"path":"index.html"}',
+    }
+
+    second = await client.complete(
+        model="gpt-5.5",
+        messages=[
+            {"role": "user", "content": "Inspect the page"},
+            first["choices"][0]["message"],
+            {"role": "tool", "tool_call_id": "call_1", "content": "<main>Current</main>"},
+        ],
+        tools=tools,
+        tool_choice="auto",
+    )
+    assert second["choices"][0]["message"]["content"] == "done"
+
+
+@pytest.mark.anyio
 async def test_responses_profile_preserves_exact_endpoint_model_and_headers(monkeypatch):
     import httpx
     original = httpx.AsyncClient
@@ -785,6 +884,7 @@ async def test_responses_terminal_event_does_not_wait_for_connection_close(monke
         async def __aiter__(self):
             yield ('data: '+json.dumps({'type':'response.output_text.delta','delta':'secret generated text'})+'\n\n').encode()
             yield ('data: '+json.dumps({'type':'response.'+status,'response':{'status':status,
+                'error':{'code':'server_error','message':'backend failed test-secret'} if status=='failed' else None,
                 'output':[{'content':[{'type':'output_text','text':'done'}]}],
                 'usage':{'input_tokens':3,'output_tokens':1}}})+'\n\n').encode()
             raise AssertionError('Client read beyond the terminal event')
@@ -796,13 +896,16 @@ async def test_responses_terminal_event_does_not_wait_for_connection_close(monke
         result=await client.complete(model='gpt-5.6-luna',messages=[{'role':'user','content':'secret prompt'}])
         assert result['choices'][0]['message']['content']=='done'
     else:
-        with pytest.raises(RuntimeError,match='without a completed response'):
+        expected = ResponsesStreamReadError if status == 'failed' else RuntimeError
+        with pytest.raises(expected):
             await client.complete(model='gpt-5.6-luna',messages=[])
     assert closed
     records=[json.loads(line) for line in log.read_text().splitlines()]
     terminal=next(r for r in records if r['event']=='terminal_event')
     assert terminal['status']==status and terminal['output_chars']==21
     assert terminal['usage']['input_tokens']==3
+    if status=='failed':
+        assert 'server_error' in terminal['error'] and '[redacted]' in terminal['error']
     assert 'secret' not in log.read_text()
 
 
@@ -870,3 +973,94 @@ async def test_responses_only_retries_diagnosed_stream_read_failures(monkeypatch
     retries = [e for e in events if e['event']=='request_retry']
     assert len(retries) == expected_calls-1
     assert all(e['failed_request_usage']=='unavailable' for e in retries)
+
+
+@pytest.mark.anyio
+async def test_responses_retries_incomplete_chunked_read(monkeypatch, tmp_path):
+    import httpx
+    original = httpx.AsyncClient
+    calls = []
+    sleeps = []
+
+    class Interrupted(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise httpx.RemoteProtocolError("incomplete chunked read")
+            yield b""  # pragma: no cover
+
+    def respond(_request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(200, stream=Interrupted())
+        event = {'type':'response.completed','response':{'status':'completed','output':[
+            {'type':'message','content':[{'type':'output_text','text':'{}'}]}],
+            'usage':{'input_tokens':1,'output_tokens':1}}}
+        return httpx.Response(200, text='data: '+json.dumps(event)+'\n\n')
+
+    async def no_wait(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: original(transport=httpx.MockTransport(respond), **kw))
+    monkeypatch.setattr('src.agents.openai_runner.asyncio.sleep', no_wait)
+    monkeypatch.setenv('OPENAI_STREAM_LOG', str(tmp_path/'stream.jsonl'))
+    config = HarnessConfig(openai_base_url='https://api.nju-link.com', openai_api_key='test',
+        openai_wire_api='responses', openai_stream_read_retries=2)
+
+    result = await OpenAIHTTPClient(config, 10).complete(model='gpt-5.6-luna', messages=[])
+
+    assert result['usage']['input_tokens'] == 1
+    assert len(calls) == 2
+    assert sleeps == [5]
+
+
+@pytest.mark.anyio
+async def test_responses_retries_a_bounded_request_timeout(monkeypatch):
+    calls = []
+    sleeps = []
+
+    async def stream(self, *_args):
+        calls.append(1)
+        if len(calls) == 1:
+            raise asyncio.TimeoutError
+        return {"choices": [{"message": {"content": "{}"}}], "usage": {}}
+
+    async def no_wait(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(OpenAIHTTPClient, "_stream_responses", stream)
+    monkeypatch.setattr("src.agents.openai_runner.asyncio.sleep", no_wait)
+    config = HarnessConfig(
+        openai_base_url="https://api.nju-link.com", openai_api_key="test",
+        openai_wire_api="responses", openai_stream_read_retries=2,
+    )
+
+    result = await OpenAIHTTPClient(config, 10).complete(
+        model="gpt-5.6-luna", messages=[]
+    )
+
+    assert result["choices"][0]["message"]["content"] == "{}"
+    assert len(calls) == 2
+    assert sleeps == [5]
+
+
+@pytest.mark.anyio
+async def test_responses_retries_upstream_http2_stream_error(monkeypatch):
+    import httpx
+    original = httpx.AsyncClient
+    calls = []
+    def respond(request):
+        calls.append(1)
+        event = ({'type':'error','sequence_number':0,'code':'upstream_http2_stream_error',
+            'message':'Upstream HTTP/2 stream failed','param':None} if len(calls)==1 else
+            {'type':'response.completed','response':{'status':'completed','output':[
+                {'type':'message','content':[{'type':'output_text','text':'{}'}]}],
+                'usage':{'input_tokens':1,'output_tokens':1}}})
+        return httpx.Response(200,text='data: '+json.dumps(event)+'\n\n')
+    async def no_wait(*_):
+        return None
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw: original(transport=httpx.MockTransport(respond),**kw))
+    monkeypatch.setattr('src.agents.openai_runner.asyncio.sleep',no_wait)
+    config=HarnessConfig(openai_base_url='https://api.nju-link.com',openai_api_key='test',
+        openai_wire_api='responses',openai_stream_read_retries=2)
+    result=await OpenAIHTTPClient(config,10).complete(model='gpt-5.6-luna',messages=[])
+    assert result['usage']['input_tokens']==1
+    assert len(calls)==2

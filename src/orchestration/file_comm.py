@@ -24,12 +24,12 @@ from src.orchestration.schemas import (
 T = TypeVar("T", bound=_Artifact)
 _TEXT_ARTIFACTS = ("spec.md", "progress.md", "build_log.md")
 _ROUND_TEXT_PATTERNS = ("feedback_round_*.md",)
-_ROUND_IMAGE_PATTERNS = ("visual_round_*.png",)
+_ROUND_IMAGE_PATTERNS = ("visual_round_*.png", "after_round_*.png")
 _EDIT_SCOPE_PATTERNS = ("edit_scope_round_*.json",)
 _RUN_CONTROL_PATTERNS = (
     "minimal_path_plan_round_*.json",
-    "minimal_path_state_round_*.json",
-    "minimal_path_ledger_round_*.jsonl",
+    "recommended_scope_round_*.json",
+    "recommended_scope_state_round_*.json",
     "minimality_round_*.json",
     "browser_evidence_round_*.json",
     "accepted_tape_replay_round_*.json",
@@ -260,6 +260,7 @@ class FileComm:
 
     def reset_run_artifacts(self) -> None:
         """在新一轮执行前清理本轮临时产物。"""
+        self._path("before.png").unlink(missing_ok=True)
         for name in _TEXT_ARTIFACTS:
             self._path(name).unlink(missing_ok=True)
         self._path("target_profile.json").unlink(missing_ok=True)

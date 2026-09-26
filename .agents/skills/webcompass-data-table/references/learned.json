@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "revision": "0e1a1d1450d287f0c63f35fb9d418e30853e73d9decf606d3e748e3490e74ad6",
+  "previous_revision": null,
+  "helpers": [
+    {
+      "name": "formatDelta",
+      "code": "function formatDelta(hours) {\n  const abs = Math.abs(hours);\n  if (abs >= 24) {\n    const d = Math.floor(abs / 24);\n    const h = abs % 24;\n    return `${d} Day${d > 1 ? 's' : ''}${h ? ` ${h}h` : ''}`;\n  }\n  return `${abs} Hour${abs !== 1 ? 's' : ''}`;\n}",
+      "usage": "formatDelta(48.5)",
+      "tests": [
+        {
+          "args_json": "[25]",
+          "expected_json": "\"1 Day 1h\""
+        },
+        {
+          "args_json": "[48]",
+          "expected_json": "\"2 Days\""
+        },
+        {
+          "args_json": "[1]",
+          "expected_json": "\"1 Hour\""
+        },
+        {
+          "args_json": "[0]",
+          "expected_json": "\"0 Hours\""
+        }
+      ]
+    }
+  ],
+  "source": "runs/validation_8_20260925/skill_core_smoke_v4/skill_core_smoke_001/rsi_queue/6a32480b6bdc7b22f0a0.json",
+  "validation": "runs/validation_8_20260925/skill_core_rsi_retry_data_table",
+  "evidence_ref": "runs/validation_8_20260925/skill_core_smoke_v4/skill_core_smoke_001/step_02/checkpoint.json"
+}

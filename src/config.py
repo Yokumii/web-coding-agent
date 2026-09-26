@@ -73,8 +73,20 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass
 class HarnessConfig:
+    reverse_validate_root: str = ""
+    reverse_validate_node: str = "node"
+    reverse_validate_playwright_module: str = ""
+    reverse_validate_chromium: str = ""
+    reverse_validate_extra_node_modules: str = ""
+    reverse_validate_timeout_seconds: int = 180
     lightweight_edit_production: bool = field(
         default_factory=lambda: _env_bool("LIGHTWEIGHT_EDIT_PRODUCTION", False)
+    )
+    # In this mode Edit review is intentionally limited to one runtime
+    # snapshot and one ITG/FTI/STC judge call.  It never runs planner-authored
+    # browser contracts or accepted-tape replay.
+    lightweight_edit_judge_retries: int = field(
+        default_factory=lambda: _env_int("LIGHTWEIGHT_EDIT_JUDGE_RETRIES", 2)
     )
     edit_skills_enabled: bool = field(default_factory=lambda: _env_bool("EDIT_SKILLS_ENABLED", False))
     edit_originality_required: bool = True
@@ -121,6 +133,9 @@ class HarnessConfig:
     )
     minimal_path_guidance_enabled: bool = field(
         default_factory=lambda: _env_bool("MINIMAL_PATH_GUIDANCE_ENABLED", True)
+    )
+    minimal_path_mode: str = field(
+        default_factory=lambda: _env_str("MINIMAL_PATH_MODE", "recommended")
     )
     edit_frozen_compound_mode: bool = field(
         default_factory=lambda: _env_bool("EDIT_FROZEN_COMPOUND_MODE", False)

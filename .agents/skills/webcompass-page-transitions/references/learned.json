@@ -1,0 +1,32 @@
+{
+  "revision": "8d055d185773e1298e1a99d4c68809bd202350c89db3f5153aa020471124cf52",
+  "helpers": [
+    {
+      "name": "getViewTransforms",
+      "code": "function getViewTransforms(style, back) {\n  switch (style) {\n    case 'slide':\n      return {\n        out: `translateX(${back ? '10%' : '-10%'})`,\n        in: `translateX(${back ? '-10%' : '10%'})`\n      };\n    case 'zoom':\n      return {\n        out: `scale(${back ? '1.1' : '0.9'})`,\n        in: `scale(${back ? '0.9' : '1.1'})`\n      };\n    case 'flip':\n      return {\n        out: `rotateY(${back ? '90deg' : '-90deg'})`,\n        in: `rotateY(${back ? '-90deg' : '90deg'})`\n      };\n    case 'fade':\n    default:\n      return {\n        out: 'scale(1)',\n        in: 'scale(1)' // Fallback\n      };\n  }\n}",
+      "usage": "const t = getViewTransforms('slide', true); // t.out === 'translateX(10%)'",
+      "tests": [
+        {
+          "args_json": "[\"slide\", false]",
+          "expected_json": "{\"out\":\"translateX(-10%)\",\"in\":\"translateX(10%)\"}"
+        },
+        {
+          "args_json": "[\"zoom\", true]",
+          "expected_json": "{\"out\":\"scale(1.1)\",\"in\":\"scale(0.9)\"}"
+        },
+        {
+          "args_json": "[\"flip\", false]",
+          "expected_json": "{\"out\":\"rotateY(-90deg)\",\"in\":\"rotateY(90deg)\"}"
+        },
+        {
+          "args_json": "[\"unknown_style\", true]",
+          "expected_json": "{\"out\":\"scale(1)\",\"in\":\"scale(1)\"}"
+        }
+      ]
+    }
+  ],
+  "source": "runs/rsi_smoke_20260925/rsi_queue/603888bf825649325500.json",
+  "validation": "runs/rsi_smoke_20260925/learning_v6",
+  "evidence_ref": "runs/fast_gt_20260924/batch_v18/WebGen-Bench.prompt_3481/step_03/checkpoint.json",
+  "transfer_validation": "runs/rsi_smoke_20260925/transfer_run/result.json"
+}

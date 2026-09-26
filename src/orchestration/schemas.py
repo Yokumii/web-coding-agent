@@ -311,6 +311,12 @@ class Grades(_Artifact):
     repair_packet: dict[str, Any] | None = None
     evidence_route: dict[str, Any] | None = None
     visual_evidence_decision: dict[str, Any] | None = None
+    # Low-cost WebCompass Edit review artifacts.
+    lightweight_judge: dict[str, Any] | None = None
+    runtime_summary: dict[str, Any] | None = None
+    diff_sha256: str | None = None
+    screenshots: dict[str, Any] | None = None
+    scope_sanity: dict[str, Any] | None = None
 
     @classmethod
     def filename(cls, *, round_num: int, **params: Any) -> str:

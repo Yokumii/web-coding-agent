@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import difflib
 from dataclasses import replace
 from html.parser import HTMLParser
 from pathlib import Path
@@ -28,7 +29,7 @@ from src.orchestration.edit_skills import render_edit_skill, staged_reference_re
 from src.orchestration.file_comm import FileComm
 from src.orchestration.git_journal import ensure_repo
 from src.orchestration.minimal_path_guidance import (
-    MinimalPathPolicy,
+    EditScopeState,
     effective_patch_line_count,
     expected_fragment_consumes_scope_slot,
     plan_name,
@@ -65,6 +66,9 @@ _GENERATE_REQUIRED_READS = (
 _MAX_REPAIR_FILES = 4
 _MAX_REPAIR_CHANGED_LINES = 1000
 _MAX_ATOMIC_SEMANTIC_ATTEMPTS = 1
+_MAX_ATOMIC_SYNTAX_RECOVERY_ATTEMPTS = 5
+_ATOMIC_RUNAWAY_OPERATION_LIMIT = 128
+_MAX_ATOMIC_REPAIR_OUTPUT_TOKENS = 4096
 _REMOTE_URL_RE = re.compile(r"https?://[^\s'\"<>),]+", re.IGNORECASE)
 _HTML_VOID_TAGS = {
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
@@ -74,6 +78,10 @@ _HTML_VOID_TAGS = {
 
 class AtomicCandidateRejected(RuntimeError):
     """A paid compact candidate failed deterministic local validation."""
+
+
+class AtomicSyntaxRejected(RuntimeError):
+    """A transient candidate contains parser-rejected JavaScript or JSX."""
 
 
 class _OpenHTMLTagParser(HTMLParser):
@@ -357,12 +365,192 @@ def _validate_javascript_syntax(
             text=True,
             capture_output=True,
         )
-        return result.returncode == 0, result.stdout + result.stderr
+        output = result.stdout + result.stderr
+        # Keep diagnostics tied to the actual candidate file. Node otherwise
+        # reports the temporary .mjs path used for ESM parsing, which deprives
+        # the correction turn of an actionable source location.
+        output = output.replace(str(check_path), relative_path)
+        return result.returncode == 0, output
     except OSError as exc:
         return False, str(exc)
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _validate_jsx_syntax(
+    frontend_dir: Path, relative_path: str
+) -> tuple[bool, str]:
+    """Parse JSX/TSX with the project's installed esbuild without executing it."""
+    target = frontend_dir / relative_path
+    loader = {
+        ".jsx": "jsx",
+        ".tsx": "tsx",
+        ".ts": "ts",
+    }.get(target.suffix.lower(), "jsx")
+    script = (
+        "const fs=require('fs');const esbuild=require('esbuild');"
+        "const p=process.argv[1],loader=process.argv[2];"
+        "esbuild.transformSync(fs.readFileSync(p,'utf8'),"
+        "{loader,sourcefile:p,format:'esm'});"
+    )
+    try:
+        result = subprocess.run(
+            ["node", "-e", script, relative_path, loader],
+            cwd=frontend_dir,
+            text=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        return False, str(exc)
+    output = result.stdout + result.stderr
+    if result.returncode != 0 and "Cannot find module 'esbuild'" in output:
+        # Some non-Vite projects intentionally have no JSX parser dependency.
+        # Parser unavailability is infrastructure state, not a candidate defect.
+        return True, ""
+    return result.returncode == 0, output
+
+
+def _validate_candidate_script_syntax(
+    frontend_dir: Path, relative_path: str
+) -> tuple[bool, str]:
+    suffix = Path(relative_path).suffix.lower()
+    if suffix in {".js", ".mjs", ".cjs"}:
+        return _validate_javascript_syntax(frontend_dir, relative_path)
+    if suffix in {".jsx", ".tsx", ".ts"}:
+        return _validate_jsx_syntax(frontend_dir, relative_path)
+    return True, ""
+
+
+def _syntax_error_signature(error: str) -> str:
+    """Identify a parser error by file, line, and first stable error message."""
+    location = _syntax_error_location(error)
+    message = re.search(
+        r"(?m)^.*(?:SyntaxError:|\[ERROR\]|ERROR:).*?$", error
+    )
+    return "|".join(
+        [
+            location[0] if location else "unknown",
+            str(location[1]) if location else "0",
+            (message.group(0).strip() if message else error.strip().splitlines()[0])[:300],
+        ]
+    )
+
+
+def _syntax_error_location(error: str) -> tuple[str, int] | None:
+    location = re.search(
+        r"(?m)(?P<path>[^\s:]+\.(?:js|mjs|cjs|jsx|ts|tsx)):(?P<line>\d+)",
+        error,
+    )
+    if location is None:
+        return None
+    return location.group("path").removeprefix("frontend/"), int(location.group("line"))
+
+
+def _syntax_related_candidate_fingerprint(raw: str, error: str) -> str:
+    """Compare only operations capable of changing the parser-rejected file."""
+    location = _syntax_error_location(error)
+    try:
+        payload = extract_json_object(raw)
+    except Exception:
+        return raw.strip()
+    if location is None:
+        relevant = {
+            "operations": payload.get("operations") or [],
+            "patches": payload.get("patches") or [],
+            "new_files": payload.get("new_files") or [],
+        }
+    else:
+        target = f"frontend/{location[0]}"
+        relevant = {
+            key: [
+                item for item in (payload.get(key) or [])
+                if isinstance(item, dict)
+                and _atomic_frontend_path(item.get("path")) == target
+            ]
+            for key in ("operations", "patches", "new_files")
+        }
+    return json.dumps(relevant, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _numbered_source_excerpt(source: str, start: int, end: int) -> str:
+    lines = source.splitlines()
+    if not lines:
+        return "(empty file)"
+    start = max(1, min(start, len(lines)))
+    end = max(start, min(end, len(lines)))
+    return "\n".join(
+        f"{number:>6} | {lines[number - 1]}" for number in range(start, end + 1)
+    )
+
+
+def _syntax_recovery_context(
+    *,
+    payload: dict[str, Any],
+    frontend: Path,
+    originals: dict[Path, str],
+    error: str,
+    failed_diff: str,
+) -> str:
+    """Build a local packet with the failed operation and both boundary states."""
+    location = _syntax_error_location(error)
+    relative = location[0] if location else ""
+    target_path = f"frontend/{relative}" if relative else ""
+    related: list[dict[str, Any]] = []
+    for key in ("operations", "patches", "new_files"):
+        for item in payload.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            if not target_path or _atomic_frontend_path(item.get("path")) == target_path:
+                related.append({"collection": key, **item})
+
+    target = (frontend / relative).resolve() if relative else None
+    original = originals.get(target, "") if target is not None else ""
+    boundary_start: int | None = None
+    boundary_end: int | None = None
+    for item in related:
+        if item.get("op") == "replace_lines":
+            start = item.get("start_line")
+            end = item.get("end_line")
+        elif item.get("op") == "insert_after":
+            start = end = item.get("after_line")
+        else:
+            start = end = None
+        if isinstance(start, int) and isinstance(end, int):
+            boundary_start = start if boundary_start is None else min(boundary_start, start)
+            boundary_end = end if boundary_end is None else max(boundary_end, end)
+
+    sections = [
+        "Parser error:\n" + error[:4000],
+        "Current failed operation(s), including the complete replacement/content:\n```json\n"
+        + json.dumps(related, ensure_ascii=False, indent=2)
+        + "\n```",
+    ]
+    if original and boundary_start is not None and boundary_end is not None:
+        sections.append(
+            "Immutable source around the operation boundaries before applying the candidate:\n"
+            "```text\n"
+            + _numbered_source_excerpt(
+                original, boundary_start - 12, boundary_end + 12
+            )
+            + "\n```"
+        )
+    if target is not None and target.is_file() and location is not None:
+        sections.append(
+            "Applied failed candidate around the parser location:\n```text\n"
+            + _numbered_source_excerpt(
+                target.read_text(encoding="utf-8"), location[1] - 20, location[1] + 20
+            )
+            + "\n```"
+        )
+    if failed_diff:
+        sections.append(
+            "Current candidate diff:\n```diff\n"
+            + failed_diff[:16000]
+            + ("\n... [diff truncated]" if len(failed_diff) > 16000 else "")
+            + "\n```"
+        )
+    return "\n\n".join(sections)
 
 
 def _atomic_rejection_feedback(exc: Exception) -> str:
@@ -387,6 +575,94 @@ def _atomic_rejection_feedback(exc: Exception) -> str:
             "range unchanged."
         )
     return message
+
+
+def _failed_atomic_candidate_diff(
+    frontend: Path,
+    originals: dict[Path, str],
+    created_paths: set[Path],
+) -> str:
+    """Render the exact transient source produced by a rejected candidate."""
+    chunks: list[str] = []
+    for target in sorted(set(originals) | created_paths, key=lambda path: str(path)):
+        try:
+            relative = target.relative_to(frontend).as_posix()
+        except ValueError:
+            continue
+        before = originals.get(target, "")
+        after = target.read_text(encoding="utf-8") if target.is_file() else ""
+        chunks.extend(
+            difflib.unified_diff(
+                before.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile=f"a/{relative}" if target in originals else "/dev/null",
+                tofile=f"b/{relative}",
+                n=5,
+            )
+        )
+    return "".join(chunks)
+
+
+def _failed_atomic_error_source(
+    frontend: Path,
+    error: str,
+    candidate_paths: set[Path],
+) -> str:
+    """Return numbered candidate source around exact diagnostic locations."""
+    rendered: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for match in re.finditer(
+        r"(?m)(?P<path>(?:frontend/)?[^\s:]+\.(?:js|mjs|cjs|jsx|ts|tsx|html?|css)):(?P<line>\d+)",
+        error,
+    ):
+        relative = match.group("path").removeprefix("frontend/")
+        line_number = int(match.group("line"))
+        key = (relative, line_number)
+        target = (frontend / relative).resolve()
+        if key in seen or target not in candidate_paths or not target.is_file():
+            continue
+        seen.add(key)
+        lines = target.read_text(encoding="utf-8").splitlines()
+        start = max(1, line_number - 8)
+        end = min(len(lines), line_number + 8)
+        excerpt = "\n".join(
+            f"{number:>6} | {lines[number - 1]}" for number in range(start, end + 1)
+        )
+        rendered.append(f"{relative}:{line_number}\n{excerpt}")
+    return "\n\n".join(rendered)
+
+
+def _atomic_correction_messages(
+    previous_candidate: str,
+    correction_feedback: str,
+) -> list[dict[str, str]]:
+    if previous_candidate:
+        return [
+            {"role": "assistant", "content": previous_candidate},
+            {
+                "role": "user",
+                "content": (
+                    "Repair the failed candidate above in place using the exact candidate "
+                    "diff, error, and source excerpt below. Keep every correct operation and "
+                    "change only the operation(s) that caused the failure. Return the entire "
+                    "corrected JSON candidate because the Harness reapplies it atomically; do "
+                    "not regenerate the Edit, broaden its files, or rewrite unrelated code.\n\n"
+                    + correction_feedback
+                ),
+            },
+        ]
+    if correction_feedback:
+        return [
+            {
+                "role": "user",
+                "content": (
+                    "The candidate could not be recovered as structured JSON. Use this exact "
+                    "local rejection as a hard constraint and regenerate one valid candidate:\n\n"
+                    + correction_feedback
+                ),
+            }
+        ]
+    return []
 
 
 def _normalize_atomic_patch_response(payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -446,8 +722,8 @@ def _normalize_atomic_new_files(payload: dict[str, Any]) -> list[dict[str, str]]
 def _atomic_new_path_allowed(
     config: HarnessConfig, relative: str, planned_new_paths: set[str]
 ) -> bool:
-    """Only enforce planner file predictions when minimality checking is enabled."""
-    return not config.minimality_guard_enabled or relative in planned_new_paths
+    """Allow route-local files; post-edit sanity checks broad collateral changes."""
+    return relative.startswith("frontend/")
 
 
 def _atomic_transaction_sort_key(
@@ -531,6 +807,72 @@ def _normalize_atomic_operations(
             continue
         raise ValueError(f"unsupported atomic operation: {operation}")
     return output
+
+
+def _validate_atomic_candidate_operations(
+    *,
+    workdir: Path,
+    mode: GeneratorMode,
+    payload: dict[str, Any],
+    operations: list[dict[str, Any]],
+    patches: list[dict[str, str]],
+    new_files: list[dict[str, str]],
+) -> None:
+    """Reject degenerate atomic output before any source file is mutated."""
+    total = len(operations) + len(patches) + len(new_files)
+    if total > _ATOMIC_RUNAWAY_OPERATION_LIMIT:
+        raise ValueError(
+            f"atomic candidate is runaway with {total} operations; "
+            f"maximum safety ceiling is {_ATOMIC_RUNAWAY_OPERATION_LIMIT}"
+        )
+
+    fingerprints: set[str] = set()
+    insertion_points: set[tuple[str, int]] = set()
+    for item in operations:
+        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if fingerprint in fingerprints:
+            raise ValueError("atomic candidate contains a duplicate operation")
+        fingerprints.add(fingerprint)
+        operation = str(item.get("op") or "")
+        relative = str(item.get("path") or "")
+        target = workdir / relative
+        if operation == "insert_after":
+            content = str(item.get("content") or "")
+            if not content.strip():
+                raise ValueError(f"atomic insertion is blank: {relative}")
+            point = (relative, int(item.get("after_line", -1)))
+            if point in insertion_points:
+                raise ValueError(
+                    f"atomic candidate repeats an insertion point: {relative}:{point[1]}"
+                )
+            insertion_points.add(point)
+            if target.is_file() and content.strip() in target.read_text(encoding="utf-8"):
+                raise ValueError(f"atomic insertion duplicates existing source: {relative}")
+        if operation in {"replace_lines", "insert_after"} and target.is_file():
+            current = target.read_text(encoding="utf-8")
+            updated, _ = _apply_sha_line_operations(
+                current,
+                [item],
+                expected_path=relative,
+                expected_sha256=str(item.get("file_sha256") or ""),
+                preserve_operations=True,
+            )
+            if updated == current:
+                raise ValueError(f"atomic operation produces no source change: {relative}")
+        if operation == "copy_from" and target.exists():
+            raise ValueError(f"atomic copy operation produces no source change: {relative}")
+
+    for item in patches:
+        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if fingerprint in fingerprints:
+            raise ValueError("atomic candidate contains a duplicate exact patch")
+        fingerprints.add(fingerprint)
+        if item.get("old_text") == item.get("new_text"):
+            raise ValueError(f"atomic exact patch produces no source change: {item.get('path')}")
+
+    for item in new_files:
+        if not str(item.get("content") or "").strip():
+            raise ValueError(f"atomic new file is blank: {item.get('path')}")
 
 
 def _apply_sha_line_operations(
@@ -1084,6 +1426,16 @@ def _recent_repair_runtime_errors(
     seen: set[str] = set()
     lower = max(0, before_round - max(1, lookback_rounds))
     for source_round in range(before_round, lower, -1):
+        grade = file_comm.read_grades(source_round) or {}
+        runtime = grade.get("runtime_summary") or {}
+        for error in runtime.get("fatal_runtime_errors") or []:
+            message = " ".join(str(error or "").split())[:400]
+            if not message or message in seen:
+                continue
+            seen.add(message)
+            found.append({"source_round": source_round, "error": message})
+            if len(found) >= max_errors:
+                return found
         path = file_comm.dir / f"repair_packet_round_{source_round}.json"
         if not path.is_file():
             continue
@@ -1325,7 +1677,11 @@ def _atomic_executor_eligible(
         "style" not in requested_roles
         and all(Path(path).suffix.lower() in {".css", ".scss", ".wxss"} for path in omitted)
     )
-    if not (initial <= selected and (not omitted or omitted_only_unrequested_style)):
+    if not supplied and not (
+        initial <= selected and (not omitted or omitted_only_unrequested_style)
+    ):
+        return False
+    if supplied and not selected:
         return False
     # The compact executor has no tools. Partial files require the existing
     # tool-enabled path so the model can inspect missing functions/dependencies.
@@ -1349,20 +1705,42 @@ def _atomic_exact_response_format(mode: str, references: dict | None = None) -> 
         return {"type": "object", "properties": properties,
                 "required": list(properties), "additionalProperties": False}
     string = {"type": "string"}
+    copy_operation = obj({
+        "op": {"type": "string", "enum": ["copy_from"]}, "source": string, "path": string,
+        "line_edits": {"type": "array", "items": string, "maxItems": 0},
+    })
+    replace_operation = obj({
+        "op": {"type": "string", "enum": ["replace_lines"]}, "path": string,
+        "start_line": {"type": "integer"}, "end_line": {"type": "integer"},
+        "replacement": string,
+    })
+    insert_operation = obj({
+        "op": {"type": "string", "enum": ["insert_after"]}, "path": string,
+        "after_line": {"type": "integer"}, "content": string,
+    })
     fields = {
-        "operations": {"type": "array", "items": obj({
-            "op": {"type": "string", "enum": ["copy_from"]}, "source": string, "path": string,
-            "line_edits": {"type": "array", "items": string, "maxItems": 0}})},
+        "operations": {"type": "array", "items": {
+            "anyOf": [copy_operation, replace_operation, insert_operation]}},
         "patches": {"type": "array", "items": obj({"path": string, "old_text": string, "new_text": string})},
-        "new_files": {"type": "array", "items": obj({"path": string, "content": string})},
+        "new_files": {"type": "array", "items": obj({"path": string, "content": string}),
+                      "maxItems": 4},
     }
+    if mode == "generate":
+        fields["self_check"] = obj({
+            "mounted_or_called": {"type": "boolean"},
+            "correct_route": {"type": "boolean"},
+            "uses_host_state": {"type": "boolean"},
+            "controls_wired": {"type": "boolean"},
+            "preserves_existing": {"type": "boolean"},
+            "core_requirements_complete": {"type": "boolean"},
+        })
     if mode == "repair":
         fields["repair_task_descriptions"] = {"type": "array", "items": obj({
             "task_type": string, "description": string,
             "evidence_ids": {"type": "array", "items": string},
             "issue_locations": {"type": "array", "items": obj({"element_path": string, "kind": string})}})}
     if references:
-        copy_fields = fields["operations"]["items"]["properties"]
+        copy_fields = copy_operation["properties"]
         copy_fields["source"] = {"type": "string", "enum": list(references)}
         copy_fields["path"] = {"type": "string", "enum": list(references.values())}
     return {"type": "json_schema", "json_schema": {
@@ -1378,8 +1756,10 @@ async def _run_atomic_patch_executor(
     mode: GeneratorMode,
     prompt: str,
     baseline_commit: str,
-    mutation_policy: MinimalPathPolicy,
+    mutation_policy: EditScopeState,
     semantic_attempt: int = 1,
+    syntax_recovery_attempt: int = 0,
+    previous_syntax_signature: str = "",
     previous_candidate: str = "",
     correction_feedback: str = "",
     candidate_override: str = "",
@@ -1389,7 +1769,11 @@ async def _run_atomic_patch_executor(
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     supplied_plan = bool((file_comm.read_state() or {}).get("supplied_atomic_plan"))
     frozen_compound = config.edit_frozen_compound_mode
-    max_semantic_attempts = 2 if frozen_compound and config.edit_skills_enabled else _MAX_ATOMIC_SEMANTIC_ATTEMPTS
+    max_semantic_attempts = (
+        2 if mode == "repair" and frozen_compound
+        else 4 if frozen_compound and config.edit_skills_enabled
+        else _MAX_ATOMIC_SEMANTIC_ATTEMPTS
+    )
     allow_semantic_correction = max_semantic_attempts > 1
     system_prompt = (
         (REPAIR_SYSTEM_PROMPT if mode == "repair" else EDIT_SYSTEM_PROMPT)
@@ -1401,9 +1785,7 @@ async def _run_atomic_patch_executor(
         "all operations for one file are applied together. For a Harness-planned new page, use "
         "{\"op\":\"copy_from\",\"source\":...,\"path\":...,\"source_sha256\":...,"
         "\"line_edits\":[...]}; omit path/file_sha256 inside its nested line_edits. "
-        "Do not echo old/search text. The Allowed source cone gives a hard total patch-line "
-        "budget: count the larger of removed/replacement lines for every operation and keep "
-        "their sum within it. Never replace an entire file or repeat unchanged functions. "
+        "Do not echo old/search text. Never repeat unchanged functions. "
         "For additive JavaScript, prefer insert_after plus tiny wiring replacements at stable "
         "boundaries. Legacy patches/new_files remain accepted only when the compact protocol "
         "cannot express the change. Do not describe commands."
@@ -1413,32 +1795,38 @@ async def _run_atomic_patch_executor(
             (REPAIR_SYSTEM_PROMPT if mode == "repair" else EDIT_SYSTEM_PROMPT)
             + '\nReturn one complete JSON candidate: {"operations":[{"op":"copy_from",'
             '"source":"selected reference path","path":"permitted component path","line_edits":[]}],'
-            '"patches":[{"path":"frontend/file","old_text":"unique original source snippet",'
-            '"new_text":"replacement source snippet"}]}. '
-            "Use copy_from only for reference files. Existing files must use exact-text patches, "
-            "not line-number operations. Each old_text is literal source, without the displayed "
-            "line-number prefix, and occurs exactly once in that file. Insertions replace a short "
-            "unique anchor with the anchor plus new code. Return the entire corrected candidate "
+            '"patches":[],"new_files":[]}. Use copy_from only for selected reference files. '
+            "For existing files, use the supplied line numbers with replace_lines or insert_after; "
+            "Harness binds each operation to the displayed immutable file SHA. Never include the "
+            "display-only line-number prefix in replacement/content. Return the entire corrected candidate "
             "after a rejection, because all its previous edits were rolled back. "
-            "For a NEW copied reference, patch its destination using the reference's original "
-            "snippet. If the destination ALREADY EXISTS, copy_from preserves it unchanged: "
-            "use the CURRENT destination source shown in the source context for old_text, "
-            "never the canonical reference snippet. Keep copy_from.line_edits empty. "
+            "A destination introduced by copy_from in THIS candidate is immutable for the entire "
+            "candidate: keep copy_from.line_edits empty and never target that new destination with "
+            "another operation. Adapt labels, host data, wiring, and business behavior only in the "
+            "supplied existing host files. A copied destination may be edited only when it already "
+            "exists on disk before this candidate and its current source is explicitly supplied. "
         )
+        if mode == "generate":
+            system_prompt += (
+                " Follow the Integration Contract in order: locate its target route/section, reuse "
+                "its host data/state, mount the Skill, wire callbacks back to that owner, then add "
+                "styling. Before returning, inspect the final candidate against every self_check "
+                "field. Fix any false item first, then return all six booleans with the final JSON. "
+                "This self-check is implementation guidance, not a new Harness acceptance gate."
+            )
         system_prompt += (
             " Frozen compound Edit policy: implement the complete requested behavior in the "
-            "existing project with the smallest coherent exact patch. Browser checks are "
+            "existing project with the smallest coherent patch. Browser checks are "
             "necessary acceptance evidence, not permission to add empty selector-only shells. "
             "Reuse the original structure, styling, data and behavior; do not broadly rewrite "
-            "or restyle the page. Respect the supplied patch-line and touched-file budgets, and "
-            "never overwrite an existing file. Omit file_sha256/source_sha256 from operations: "
-            "Harness binds the supplied immutable revisions. For a localized change inside a "
-            "long/minified line, use {\"patches\":[{\"path\":...,\"old_text\":...,"
+            "or restyle the page. There is no patch-line or touched-file budget. Never overwrite "
+            "an existing file. Omit file_sha256/source_sha256 from operations: "
+            "Harness binds the supplied immutable revisions. Only for a localized change inside a "
+            "long/minified line that line operations cannot express, use {\"patches\":[{\"path\":...,\"old_text\":...,"
             "\"new_text\":...}]}; each old_text must occur exactly once. Do not mix patches "
             "and line operations for the same file."
-            " For existing-file edits prefer the exact-text patches protocol with a short "
-            "unique old_text and its replacement. This overrides the compact/no-search-text "
-            "preference above; use copy_from for new reference files. Load classic Skill "
+            " Prefer SHA-bound line operations for every normal existing-file edit; use copy_from "
+            "for selected reference files. Load classic Skill "
             "scripts before any script that calls their entry points; preserve the host's "
             "defer/module ordering."
             " Preserve existing IDs and DOM nodes referenced by host handlers. When enriching "
@@ -1469,20 +1857,22 @@ async def _run_atomic_patch_executor(
             "existing fields referenced by its handlers and wire new fields to actual elements."
         )
     if supplied_plan and mode == "repair":
-        from src.orchestration.webcompass_protocol import REPAIR_TYPE_DEFINITIONS
         system_prompt += (
             " In the same JSON response as the code operations, also include "
             "repair_task_descriptions:[{task_type,description,evidence_ids:[failed check IDs], "
-            "issue_locations:[{element_path,kind}]}]. "
-            "Use one entry per independently fixable defect, not one per defect category: two "
-            "different controls missing names are two issues; the same issue seen in several "
-            "states is one. Group symptoms fixed by one shared root-cause change together. "
-            "For deterministic risk findings copy exact element_path and kind into issue_locations. "
-            "Describe only the defect already reproduced in the supplied browser evidence, "
-            "not extra defects. Choose the exact applicable type from the following definitions. "
-            "Return [] if none fits; never invent a category. This is repair metadata, not an "
-            "additional evaluation or a request to run more checks. "
-            + json.dumps(REPAIR_TYPE_DEFINITIONS, ensure_ascii=False)
+            "issue_locations:[{element_path,kind}]}]. Add one concise entry for each supplied "
+            "Judge issue, using its ITG/FTI/STC dimension as task_type and its existing description "
+            "and evidence ID. Do not discover, classify, or add defects; use [] when there is no "
+            "Judge issue. This is metadata only."
+        )
+        system_prompt += (
+            " Prefer fewer operations when they express the same valid repair. Modify existing "
+            "code before adding code. Never emit blank, duplicate, no-op, or "
+            "repeated same-line insertions, and never insert an implementation already present "
+            "in the current source. Do not output unrelated functions, whole-file replacements, "
+            "or unchanged code. For errors such as 'already mounted' or 'already initialized', "
+            "first remove or merge the duplicate mount/initialization at its existing call site; "
+            "do not reimplement the component."
         )
     if config.edit_skills_enabled and selected_reference_files(workdir):
         system_prompt += (
@@ -1499,8 +1889,28 @@ async def _run_atomic_patch_executor(
         "literal source code with real line breaks and ordinary quotes, not backslash-n "
         "or backslash-quote sequences outside JavaScript string literals."
     )
-    content: str | list[dict[str, Any]] = prompt
-    images = task_input_image_paths(workdir)
+    if syntax_recovery_attempt:
+        system_prompt = (
+            "You are performing candidate-local Syntax Recovery only. Change only the failed "
+            "operation identified in the recovery packet. You MAY change that operation's "
+            "start_line, end_line, or after_line when needed to consume a leftover brace, "
+            "parenthesis, JSX closing tag, or adjacent syntax boundary. You MAY also change its "
+            "replacement/content. Every boundary field is a 1-based line number in the immutable "
+            "source excerpt, never a line number from the applied failed candidate. Use the smallest "
+            "adjacent expansion visible in that immutable excerpt and never exceed its file bounds. "
+            "Preserve every unrelated operation, path, feature, and metadata field exactly. Do not "
+            "redesign, refactor, add behavior, remove behavior, or change styling. Return the entire "
+            "corrected JSON candidate, with code strings serialized exactly once. JSON only."
+        )
+        content = (
+            "Correct only the reported JavaScript/JSX syntax error in the failed candidate. "
+            "The next message contains the exact candidate and the parser diagnostic with a "
+            "small numbered source excerpt."
+        )
+        images: list[Path] = []
+    else:
+        content = prompt
+        images = task_input_image_paths(workdir)
     if images:
         content = openai_user_content(prompt, images)
     client = OpenAIHTTPClient(config, config.agent_request_timeout_seconds)
@@ -1509,33 +1919,7 @@ async def _run_atomic_patch_executor(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": content},
     ]
-    if previous_candidate:
-        messages.extend(
-            [
-                {"role": "assistant", "content": previous_candidate},
-                {
-                    "role": "user",
-                    "content": (
-                        "The candidate above was fully rolled back. Correct that same "
-                        "candidate using the exact local evidence below. Return compact "
-                        "JSON only; preserve complete syntax boundaries, do not broaden "
-                        "files, and do not rewrite a whole file.\n\n"
-                        + correction_feedback
-                    ),
-                },
-            ]
-        )
-    elif correction_feedback:
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "A trace-backed candidate was fully rolled back. Use this exact local "
-                    "rejection as a hard constraint, but produce a fresh minimal candidate "
-                    "instead of copying the rejected shape:\n\n" + correction_feedback
-                ),
-            }
-        )
+    messages.extend(_atomic_correction_messages(previous_candidate, correction_feedback))
     source_revisions = None
     if supplied_plan:
         context = read_edit_context(file_comm.dir, round_num) or {}
@@ -1553,7 +1937,13 @@ async def _run_atomic_patch_executor(
             model=config.generator_model,
             messages=messages,
             temperature=0,
-            max_tokens=12000 if (file_comm.read_state() or {}).get("supplied_atomic_plan") else 4096,
+            max_tokens=(
+                _MAX_ATOMIC_REPAIR_OUTPUT_TOKENS
+                if mode == "repair"
+                else 12000 if (file_comm.read_state() or {}).get("supplied_atomic_plan")
+                else 4096
+            ),
+            reasoning_effort="low" if config.openai_wire_api == "responses" else None,
             response_format=_atomic_exact_response_format(mode, skill_destinations) if frozen_compound else {"type": "json_object"},
             **({"_protocol": "responses"} if supplied_plan and
                int(os.environ.get("PRODUCT_SESSION_RECOVERY_ATTEMPT", "1")) >= 3 else {}),
@@ -1577,11 +1967,6 @@ async def _run_atomic_patch_executor(
         "validation_success_revision": mutation_policy.validation_success_revision,
         "validation_last_ok": mutation_policy.validation_last_ok,
     }
-    ledger_before = (
-        mutation_policy.ledger_path.read_bytes()
-        if mutation_policy.ledger_path.is_file()
-        else None
-    )
     with trace_path.open("a", encoding="utf-8") as trace:
         trace.write(json.dumps({
             "event": "run_start",
@@ -1604,45 +1989,53 @@ async def _run_atomic_patch_executor(
             "estimated_cost_usd": estimate_cost_usd(config.generator_model, usage),
         }, ensure_ascii=False) + "\n")
         trace.flush()
-        payload = extract_json_object(raw)
-        for operation in payload.get("operations") or []:
-            source = str(operation.get("source") or "") if isinstance(operation, dict) else ""
-            if source.startswith("frontend/.harness/edit_skill/") and source[9:] in skill_revisions:
-                operation["source"] = source[9:]
-        core_sources = {source for source in skill_destinations if Path(source).suffix in {".js", ".mjs"}}
-        copied_sources = {item.get("source") for item in payload.get("operations", [])
-                          if isinstance(item, dict) and item.get("op") == "copy_from"}
-        if core_sources and not any(
-            source in copied_sources or (workdir / skill_destinations[source]).is_file()
-            for source in core_sources
-        ):
-            reason = "Selected Edit Skill core must be reused via copy_from; independent reimplementation is not allowed"
-            trace.write(json.dumps({"event": "run_error", "error": reason,
-                                    "attempt_usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}}, ensure_ascii=False) + "\n")
-            trace.flush()
-            raise AtomicCandidateRejected(reason)
-        compact_operations = _normalize_atomic_operations(payload, source_revisions)
-        patches = _normalize_atomic_patch_response(payload) if payload.get("patches") or any(
-            isinstance(item, dict) and (item.get("op") or item.get("operation")) == "patches"
-            for item in payload.get("operations") or []
-        ) else []
-        new_files = _normalize_atomic_new_files(payload)
-        if not compact_operations and not patches and not new_files:
-            raise ValueError("atomic Edit executor returned no exact patches or planned new files")
-        minimal_plan = json.loads(
-            (workdir / ".harness" / plan_name(round_num)).read_text(encoding="utf-8")
-        )
-        planned_new_paths = set(
-            (minimal_plan.get("source_change_cone") or {}).get("planned_new_paths") or []
-        )
-        context = read_edit_context(workdir / ".harness", round_num) or {}
-        visible_source_paths = {
-            str(item.get("path"))
-            for item in context.get("source_windows") or []
-            if isinstance(item, dict) and item.get("path")
-        }
-        visible_source_paths.update(skill_revisions)
+        payload: dict[str, Any] = {}
         try:
+            payload = extract_json_object(raw)
+            for operation in payload.get("operations") or []:
+                source = str(operation.get("source") or "") if isinstance(operation, dict) else ""
+                if source.startswith("frontend/.harness/edit_skill/") and source[9:] in skill_revisions:
+                    operation["source"] = source[9:]
+            core_sources = {source for source in skill_destinations if Path(source).suffix in {".js", ".mjs"}}
+            copied_sources = {item.get("source") for item in payload.get("operations", [])
+                              if isinstance(item, dict) and item.get("op") == "copy_from"}
+            if core_sources and not any(
+                source in copied_sources or (workdir / skill_destinations[source]).is_file()
+                for source in core_sources
+            ):
+                raise AtomicCandidateRejected(
+                    "Selected Edit Skill core must be reused via copy_from; "
+                    "independent reimplementation is not allowed"
+                )
+            compact_operations = _normalize_atomic_operations(payload, source_revisions)
+            patches = _normalize_atomic_patch_response(payload) if payload.get("patches") or any(
+                isinstance(item, dict) and (item.get("op") or item.get("operation")) == "patches"
+                for item in payload.get("operations") or []
+            ) else []
+            new_files = _normalize_atomic_new_files(payload)
+            if not compact_operations and not patches and not new_files:
+                raise ValueError("atomic Edit executor returned no exact patches or planned new files")
+            _validate_atomic_candidate_operations(
+                workdir=workdir,
+                mode=mode,
+                payload=payload,
+                operations=compact_operations,
+                patches=patches,
+                new_files=new_files,
+            )
+            minimal_plan = json.loads(
+                (workdir / ".harness" / plan_name(round_num)).read_text(encoding="utf-8")
+            )
+            planned_new_paths = set(
+                (minimal_plan.get("source_change_cone") or {}).get("planned_new_paths") or []
+            )
+            context = read_edit_context(workdir / ".harness", round_num) or {}
+            visible_source_paths = {
+                str(item.get("path"))
+                for item in context.get("source_windows") or []
+                if isinstance(item, dict) and item.get("path")
+            }
+            visible_source_paths.update(skill_revisions)
             patch_line_count = 0
             for item in compact_operations:
                 if item["op"] == "replace_lines":
@@ -1702,6 +2095,8 @@ async def _run_atomic_patch_executor(
                     item, mutation_policy.initial_paths
                 )
             )
+            validation_failures: list[str] = []
+            syntax_failures: list[str] = []
             for operation, relative, item in transactions:
                 target = (workdir / relative).resolve()
                 try:
@@ -1797,9 +2192,7 @@ async def _run_atomic_patch_executor(
                         raise ValueError(f"atomic new file is empty: {relative}")
                     policy_inputs = [("write_file", {"path": relative, "content": updated})]
                 if target.exists() and updated == current:
-                    trace.write(json.dumps({"event": "tool", "name": "skip_noop_patch",
-                                            "ok": True, "path": relative}) + "\n")
-                    continue
+                    raise ValueError(f"atomic operation produces no source change: {relative}")
                 is_skill_copy = operation == "copy_from" and item.get("source") in skill_revisions
                 if is_skill_copy:
                     # Reviewed library bytes are reuse, not generated edits. Only
@@ -1814,17 +2207,9 @@ async def _run_atomic_patch_executor(
                     effective_patch_lines += max(
                         1, effective_patch_line_count(current if target.exists() else "", updated)
                     )
-                if (not supplied_plan or frozen_compound) and effective_patch_lines > max_patch_lines:
-                    raise ValueError(
-                        f"Atomic candidate changes {effective_patch_lines} effective patch lines, "
-                        f"exceeding the hard total budget of {max_patch_lines}; preserve unchanged "
-                        "context and narrow the semantic edit."
-                    )
                 if supplied_plan and not frozen_compound:
                     if not relative.startswith("frontend/"):
                         raise ValueError(f"patch must target frontend source: {relative}")
-                    if relative in mutation_policy.off_target_paths:
-                        raise ValueError(f"patch targets a non-target page: {relative}")
                 else:
                     for policy_operation, tool_input in policy_inputs:
                         denial = mutation_policy.check(policy_operation, tool_input)
@@ -1862,18 +2247,21 @@ async def _run_atomic_patch_executor(
                 )
                 validation_ok = diff_check.returncode == 0
                 validation_output = diff_check.stdout + diff_check.stderr
-                if validation_ok and Path(relative).suffix.lower() in {".js", ".mjs", ".cjs"}:
-                    validation_ok, syntax_output = _validate_javascript_syntax(
-                        frontend, relative.removeprefix("frontend/")
-                    )
+                syntax_ok, syntax_output = _validate_candidate_script_syntax(
+                    frontend, relative.removeprefix("frontend/")
+                )
+                if not syntax_ok:
+                    syntax_failures.append(syntax_output)
+                validation_ok = validation_ok and syntax_ok
+                if syntax_output:
                     validation_output += syntax_output
                 mutation_policy.observe_validation(
                     ok=validation_ok,
                     output=validation_output,
                     tool="harness atomic mutation validation",
                 )
-                if not validation_ok:
-                    raise RuntimeError(validation_output)
+                if diff_check.returncode != 0:
+                    validation_failures.append(validation_output)
             if config.edit_skills_enabled and frozen_compound:
                 for wiring in vanilla_reference_wiring(workdir, mutation_policy.local_paths):
                     target = workdir / wiring["path"]
@@ -1882,8 +2270,6 @@ async def _run_atomic_patch_executor(
                         current, wiring["old_text"], wiring["new_text"])
                     updated = current.replace(wiring["old_text"], wiring["new_text"], 1)
                     effective_patch_lines += max(1, effective_patch_line_count(current, updated))
-                    if effective_patch_lines > max_patch_lines:
-                        raise ValueError("Reference wiring exceeds the current patch budget")
                     denial = mutation_policy.check("apply_patch", wiring)
                     if denial:
                         raise ValueError(denial)
@@ -1893,6 +2279,12 @@ async def _run_atomic_patch_executor(
                     changed_paths.append(wiring["path"].removeprefix("frontend/"))
                     trace.write(json.dumps({"event": "tool", "name": "wire_reference", "ok": True,
                                             **wiring}, ensure_ascii=False) + "\n")
+            if syntax_failures:
+                raise AtomicSyntaxRejected(
+                    "\n\n".join(dict.fromkeys(syntax_failures))
+                )
+            if validation_failures:
+                raise RuntimeError("\n\n".join(dict.fromkeys(validation_failures)))
             if not changed_paths:
                 raise ValueError("Atomic candidate produces no source changes")
             subprocess.run(
@@ -1920,6 +2312,56 @@ async def _run_atomic_patch_executor(
                 "output": commit.stdout.strip(),
             }, ensure_ascii=False) + "\n")
         except Exception as exc:
+            candidate_paths = set(originals) | created_paths
+            failed_diff = _failed_atomic_candidate_diff(
+                frontend, originals, created_paths
+            )
+            failed_source = _failed_atomic_error_source(
+                frontend, str(exc), candidate_paths
+            )
+            syntax_context = (
+                _syntax_recovery_context(
+                    payload=payload,
+                    frontend=frontend,
+                    originals=originals,
+                    error=str(exc),
+                    failed_diff=failed_diff,
+                )
+                if isinstance(exc, AtomicSyntaxRejected)
+                else ""
+            )
+            failed_candidate_dir = file_comm.dir / "failed_candidates"
+            failed_candidate_dir.mkdir(parents=True, exist_ok=True)
+            failed_candidate_path = (
+                failed_candidate_dir
+                / (
+                    f"round_{round_num}_attempt_{semantic_attempt}"
+                    + (
+                        f"_syntax_{syntax_recovery_attempt}.json"
+                        if syntax_recovery_attempt
+                        else ".json"
+                    )
+                )
+            )
+            failed_candidate_path.write_text(
+                json.dumps(
+                    {
+                        "round": round_num,
+                        "attempt": semantic_attempt,
+                        "syntax_recovery_attempt": syntax_recovery_attempt,
+                        "candidate": raw,
+                        "candidate_summary": _atomic_candidate_summary(payload),
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "failed_diff": failed_diff,
+                        "error_source": failed_source,
+                        "syntax_recovery_context": syntax_context,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             for target, original in originals.items():
                 target.write_text(original, encoding="utf-8")
             for target in created_paths:
@@ -1933,7 +2375,6 @@ async def _run_atomic_patch_executor(
                 )
             # The filesystem edit is transactional, so its policy evidence must
             # be transactional too.  Otherwise a rejected partial candidate can
-            # unlock dependency files that were never actually changed.
             mutation_policy.initial_paths = set(policy_snapshot["initial_paths"])
             mutation_policy.observed_paths = set(policy_snapshot["observed_paths"])
             mutation_policy.tool_observed_paths = set(
@@ -1951,10 +2392,6 @@ async def _run_atomic_patch_executor(
             )
             mutation_policy.validation_last_ok = policy_snapshot["validation_last_ok"]
             mutation_policy._persist_state()
-            if ledger_before is None:
-                mutation_policy.ledger_path.unlink(missing_ok=True)
-            else:
-                mutation_policy.ledger_path.write_bytes(ledger_before)
             trace.write(json.dumps({
                 "event": "run_error",
                 "error": f"{type(exc).__name__}: {exc}",
@@ -1969,16 +2406,84 @@ async def _run_atomic_patch_executor(
                 "estimated_cost_usd": estimate_cost_usd(
                     config.generator_model, usage
                 ),
+                "failed_candidate_artifact": str(
+                    failed_candidate_path.relative_to(workdir)
+                ),
                 "fallback": (
-                    "compact_semantic_correction"
+                    "candidate_local_syntax_recovery"
+                    if isinstance(exc, AtomicSyntaxRejected)
+                    and syntax_recovery_attempt < _MAX_ATOMIC_SYNTAX_RECOVERY_ATTEMPTS
+                    else "compact_semantic_correction"
                     if allow_semantic_correction
                     and semantic_attempt < max_semantic_attempts
-                    else "stop_after_compact_correction"
+                    else "stop_after_candidate_correction"
                 ),
             }, ensure_ascii=False) + "\n")
             trace.flush()
             if candidate_override:
                 raise AtomicCandidateRejected(str(exc)) from exc
+            if isinstance(exc, AtomicSyntaxRejected):
+                signature = _syntax_error_signature(str(exc))
+                same_error = bool(
+                    previous_syntax_signature and signature == previous_syntax_signature
+                )
+                unchanged_related_operation = bool(
+                    previous_candidate
+                    and _syntax_related_candidate_fingerprint(raw, str(exc))
+                    == _syntax_related_candidate_fingerprint(previous_candidate, str(exc))
+                )
+                same_error_stalled = same_error and unchanged_related_operation
+                if (
+                    syntax_recovery_attempt < _MAX_ATOMIC_SYNTAX_RECOVERY_ATTEMPTS
+                    and not same_error_stalled
+                ):
+                    logger.warning(
+                        "[bold yellow]Candidate syntax rejected[/]; requesting candidate-local "
+                        f"Syntax Recovery {syntax_recovery_attempt + 1}/"
+                        f"{_MAX_ATOMIC_SYNTAX_RECOVERY_ATTEMPTS}: {exc}"
+                    )
+                    trace.close()
+                    retry_policy = EditScopeState.load(workdir, round_num)
+                    retry = await _run_atomic_patch_executor(
+                        config=config,
+                        file_comm=file_comm,
+                        workdir=workdir,
+                        round_num=round_num,
+                        mode=mode,
+                        prompt=prompt,
+                        baseline_commit=baseline_commit,
+                        mutation_policy=retry_policy or mutation_policy,
+                        semantic_attempt=semantic_attempt,
+                        syntax_recovery_attempt=syntax_recovery_attempt + 1,
+                        previous_syntax_signature=signature,
+                        previous_candidate=raw,
+                        correction_feedback=syntax_context,
+                    )
+                    first_cost = estimate_cost_usd(config.generator_model, usage)
+                    return AgentRunStats(
+                        cost_usd=round(first_cost + retry.cost_usd, 6),
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        duration_api_ms=None,
+                        token_usage={
+                            "input_tokens": input_tokens
+                            + int(retry.token_usage.get("input_tokens") or 0),
+                            "output_tokens": output_tokens
+                            + int(retry.token_usage.get("output_tokens") or 0),
+                        },
+                        usage={
+                            "syntax_recovery_attempts": 1
+                            + int(retry.usage.get("syntax_recovery_attempts") or 0),
+                            "first_attempt": usage,
+                            "syntax_correction_attempt": retry.usage,
+                        },
+                        model_usage={},
+                    )
+                reason = (
+                    "syntax recovery stalled on the same parser error"
+                    if same_error_stalled
+                    else "syntax recovery attempt limit reached"
+                )
+                raise AtomicCandidateRejected(f"{reason}: {exc}") from exc
             if (
                 allow_semantic_correction
                 and semantic_attempt < max_semantic_attempts
@@ -1988,7 +2493,7 @@ async def _run_atomic_patch_executor(
                     f"compact semantic correction: {exc}"
                 )
                 trace.close()
-                retry_policy = MinimalPathPolicy.load(workdir, round_num)
+                retry_policy = EditScopeState.load(workdir, round_num)
                 retry = await _run_atomic_patch_executor(
                     config=config,
                     file_comm=file_comm,
@@ -2001,8 +2506,18 @@ async def _run_atomic_patch_executor(
                     semantic_attempt=semantic_attempt + 1,
                     previous_candidate=raw,
                     correction_feedback=(
-                        "Hard patch budget and rejected candidate shape:\n"
+                        "Failed candidate summary:\n"
                         + _atomic_candidate_summary(payload)
+                        + "\n\nFailed candidate diff (this is the code that failed):\n```diff\n"
+                        + (failed_diff or "(candidate failed before producing a source diff)")
+                        + "\n```"
+                        + (
+                            "\n\nExact failed source around the reported line:\n```text\n"
+                            + failed_source
+                            + "\n```"
+                            if failed_source
+                            else ""
+                        )
                         + "\n\nExact local rejection:\n"
                         + _atomic_rejection_feedback(exc)
                     ),
@@ -2198,6 +2713,28 @@ def _git_output(frontend_dir: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def _current_atomic_diff(file_comm: FileComm, round_num: int, limit: int = 20_000) -> str:
+    """Return the current Edit's cumulative diff, excluding accepted-prefix history."""
+    build_map_path = file_comm.dir / "round_build_map.json"
+    frontend = file_comm.dir.parent / "frontend"
+    if not build_map_path.is_file() or not (frontend / ".git").is_dir():
+        return "(current atomic diff unavailable)"
+    try:
+        build_map = json.loads(build_map_path.read_text(encoding="utf-8"))
+        entries = [
+            value for key, value in sorted(build_map.items(), key=lambda item: int(item[0]))
+            if int(key) < round_num and isinstance(value, dict)
+        ]
+        baseline = str(entries[0].get("source_commit") or "") if entries else ""
+        diff = _git_output(frontend, "diff", "--unified=3", baseline, "HEAD", "--") if baseline else ""
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return "(current atomic diff unavailable)"
+    if len(diff) <= limit:
+        return diff or "(no current atomic diff)"
+    half = limit // 2
+    return diff[:half] + "\n... current atomic diff truncated ...\n" + diff[-half:]
+
+
 async def _ensure_generator_baseline(frontend_dir: Path) -> str:
     frontend_dir.mkdir(parents=True, exist_ok=True)
     await ensure_repo(frontend_dir)
@@ -2269,7 +2806,7 @@ def _trace_confirms_commit(trace_path: Path, commit_hash: str, subject: str) -> 
 
 
 def _last_replayable_atomic_candidate(trace_path: Path) -> str:
-    """Return the last locally rejected candidate for zero-cost resume replay."""
+    """Replay only a complete response that was never locally accepted or rejected."""
     if not trace_path.is_file():
         return ""
     candidate = ""
@@ -2284,7 +2821,8 @@ def _last_replayable_atomic_candidate(trace_path: Path) -> str:
                 # A complete response can fail normalization before any mutation.
                 replayable = candidate
             elif event.get("event") == "run_error" and candidate:
-                replayable = candidate
+                replayable = ""
+                candidate = ""
             elif event.get("event") == "tool":
                 replayable = ""
     except (OSError, ValueError, TypeError):
@@ -2434,174 +2972,6 @@ def _validate_uncommitted_frontend_paths(
     return True, ""
 
 
-def _recover_deferred_model_patches(
-    frontend_dir: Path,
-    file_comm: FileComm,
-    workdir: Path,
-    round_num: int,
-) -> set[str]:
-    """Replay exact model patches blocked only by our validation barrier.
-
-    The recovery is deliberately narrow: the model must already have emitted
-    an exact ``apply_patch`` call, the corresponding tool result must say that
-    only the post-mutation validation barrier blocked it, and all currently
-    modified files must be trace-proven model writes. The Harness supplies the
-    missing local validation, never new product code.
-    """
-
-    trace_path = RoundArtifacts(file_comm, round_num).trace_path("generator")
-    mutation_policy = MinimalPathPolicy.load(workdir, round_num)
-    if mutation_policy is None or not trace_path.is_file():
-        return set()
-    try:
-        changed_paths = set(
-            filter(
-                None,
-                _git_output(frontend_dir, "diff", "HEAD", "--name-only").splitlines(),
-            )
-        )
-        changed_paths.update(
-            filter(
-                None,
-                _git_output(
-                    frontend_dir, "ls-files", "--others", "--exclude-standard"
-                ).splitlines(),
-            )
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return set()
-    if not changed_paths or not changed_paths.issubset(
-        _trace_written_frontend_paths(trace_path)
-    ):
-        return set()
-    # The controller normally persisted these writes at tool time. Rehydrate
-    # only trace-proven dirty paths so recovery also survives a process exit
-    # between the filesystem write and the state-file flush.
-    mutation_policy.touched_paths.update(
-        f"frontend/{path}" for path in changed_paths
-    )
-    if changed_paths and mutation_policy.mutation_revision == 0:
-        mutation_policy.mutation_revision = 1
-    valid, validation_output = _validate_uncommitted_frontend_paths(
-        frontend_dir, changed_paths
-    )
-    if not valid:
-        return set()
-    mutation_policy.observe_validation(
-        ok=True,
-        output=validation_output,
-        tool="harness_recovery_prevalidation",
-    )
-
-    pending: list[tuple[int, str, dict[str, Any]]] = []
-    deferred: list[tuple[int, dict[str, Any]]] = []
-    try:
-        for sequence, line in enumerate(
-            trace_path.read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            event = json.loads(line)
-            if event.get("event") == "assistant":
-                for call in ((event.get("message") or {}).get("tool_calls") or []):
-                    function = call.get("function") if isinstance(call, dict) else None
-                    if not isinstance(function, dict):
-                        continue
-                    name = str(function.get("name") or "")
-                    if name != "apply_patch":
-                        continue
-                    raw_args = function.get("arguments", "{}")
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    if isinstance(args, dict):
-                        pending.append((sequence, name, args))
-            elif event.get("event") == "tool" and pending:
-                name = str(event.get("name") or "")
-                match = next(
-                    (
-                        index
-                        for index, (_sequence, pending_name, _args) in enumerate(pending)
-                        if pending_name == name
-                    ),
-                    None,
-                )
-                if match is None:
-                    continue
-                source_sequence, _pending_name, args = pending.pop(match)
-                output = str(event.get("output") or "")
-                if (
-                    event.get("ok") is False
-                    and "A post-mutation validation attempt is required before the harness widens"
-                    in output
-                ):
-                    deferred.append((source_sequence, args))
-    except (OSError, ValueError, TypeError, AttributeError):
-        return set()
-
-    recovered: set[str] = set()
-    recovery_events: list[dict[str, Any]] = []
-    for source_sequence, args in deferred:
-        relative = str(args.get("path") or "").replace("\\", "/")
-        if not relative.startswith("frontend/"):
-            continue
-        target = (workdir / relative).resolve()
-        try:
-            target.relative_to(workdir.resolve())
-        except ValueError:
-            continue
-        old_text = args.get("old_text")
-        new_text = args.get("new_text")
-        if not isinstance(old_text, str) or not isinstance(new_text, str):
-            continue
-        if not target.is_file():
-            continue
-        current = target.read_text(encoding="utf-8", errors="replace")
-        if current.count(old_text) != 1:
-            continue
-        denial = mutation_policy.check("apply_patch", args)
-        if denial:
-            continue
-        target.write_text(current.replace(old_text, new_text, 1), encoding="utf-8")
-        mutation_policy.observe_result(
-            "apply_patch", args, ok=True, output="replayed deferred model patch"
-        )
-        path = relative.removeprefix("frontend/")
-        valid, validation_output = _validate_uncommitted_frontend_paths(
-            frontend_dir, changed_paths | {path}
-        )
-        mutation_policy.observe_validation(
-            ok=valid,
-            output=validation_output,
-            tool="harness_recovery_validation",
-        )
-        if not valid:
-            target.write_text(current, encoding="utf-8")
-            return set()
-        changed_paths.add(path)
-        recovered.add(path)
-        recovery_events.append(
-            {
-                "event": "harness_recovery_patch",
-                "ok": True,
-                "path": relative,
-                "source_event_sequence": source_sequence,
-                "source_author": "native_model_deferred_tool_call",
-                "reason": "replayed after required zero-token Harness validation",
-            }
-        )
-    if recovered:
-        recovery_events.append(
-            {
-                "event": "harness_recovery_validation",
-                "ok": True,
-                "paths": sorted(f"frontend/{path}" for path in changed_paths),
-                "source_author": "native_model_deferred_tool_call",
-            }
-        )
-        with trace_path.open("a", encoding="utf-8") as trace:
-            for event in recovery_events:
-                trace.write(json.dumps(event, ensure_ascii=False) + "\n")
-            trace.flush()
-    return recovered
-
-
 def _trace_usage_totals(trace_path: Path) -> dict[str, Any]:
     """Sum the last cumulative usage snapshot from every appended agent run."""
     totals = {"input_tokens": 0, "output_tokens": 0}
@@ -2644,15 +3014,11 @@ def _checkpoint_interrupted_model_work(
 ) -> str | None:
     """Atomically checkpoint a *previously model-written* uncommitted edit.
 
-    This recovery never changes product source. For a forward Edit it requires
-    the harness-owned scope contract; for a root Generate it accepts untracked
-    model-written files. The harness independently validates exact provenance
-    and syntax before committing; browser evaluation still decides acceptance.
+    This recovery never changes product source. The harness independently validates
+    exact provenance and syntax before committing; browser evaluation still decides
+    acceptance. Recommended scope is advisory and cannot block recovery.
     """
     if mode != "generate":
-        return None
-    is_forward_edit = (workdir / "seed_manifest.json").is_file()
-    if is_forward_edit and _validate_edit_scope(workdir, round_num) is not None:
         return None
     try:
         changed_paths = set(filter(
@@ -2800,253 +3166,6 @@ def _validate_repair_scope(
     return None
 
 
-def _validate_minimal_path_final_diff(
-    frontend_dir: Path,
-    baseline_commit: str,
-    mutation_policy: MinimalPathPolicy | None,
-) -> str | None:
-    """Reject source changes that bypassed the online minimal-path controller.
-
-    Tool-time denials are necessary but insufficient: an allowed build script or
-    provider-specific tool can still mutate a protected file indirectly. The
-    final committed diff must therefore be explained by successful, recorded
-    source mutations in the harness ledger.
-    """
-    if mutation_policy is None:
-        return None
-    try:
-        changed = {
-            f"frontend/{path}"
-            for path in _git_output(
-                frontend_dir, "diff", "--name-only", f"{baseline_commit}..HEAD", "--"
-            ).splitlines()
-            if path
-        }
-    except (OSError, subprocess.CalledProcessError) as exc:
-        return f"Minimal-path final diff validation failed: {exc}."
-    code_changed = {
-        path for path in changed
-        if Path(path).suffix.lower() in {
-            ".html", ".htm", ".css", ".scss", ".js", ".jsx", ".ts", ".tsx",
-            ".vue", ".svelte", ".json", ".json5", ".svg", ".qml", ".ets",
-            ".wxml", ".wxss",
-        }
-    }
-    unsupported_asset_changes = sorted(changed - code_changed)
-    unexplained = sorted(code_changed - mutation_policy.touched_paths)
-    guarded_shared_paths = set(mutation_policy.guarded_shared_regions)
-    protected = sorted(
-        code_changed & (
-            mutation_policy.protected_paths
-            | mutation_policy.off_target_paths
-            | (mutation_policy.cross_route_shared_paths - guarded_shared_paths)
-        )
-    )
-    if protected:
-        return (
-            "Committed Edit changed protected multi-page source: "
-            + ", ".join(protected)
-            + ". Restore those files exactly; only target-route source may change."
-        )
-    for path in sorted(code_changed & guarded_shared_paths):
-        frontend_relative = Path(path).relative_to("frontend").as_posix()
-        try:
-            before = subprocess.run(
-                ["git", "show", f"{baseline_commit}:{frontend_relative}"],
-                cwd=frontend_dir,
-                check=True,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            ).stdout
-            after = (frontend_dir / frontend_relative).read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except (OSError, subprocess.CalledProcessError) as exc:
-            return f"Guarded shared-source final validation failed for {path}: {exc}."
-        region_error = mutation_policy.validate_guarded_shared_file(
-            path, before=before, after=after
-        )
-        if region_error:
-            return region_error
-    if unsupported_asset_changes:
-        return (
-            "Committed Edit changed non-code assets that are outside the current portable "
-            "patch contract: " + ", ".join(unsupported_asset_changes) + ". Preserve existing "
-            "assets and use supplied images as references; asset mutation needs an explicit "
-            "resource-manifest contract."
-        )
-    if unexplained:
-        return (
-            "Committed source changes bypassed the harness minimal-path ledger: "
-            + ", ".join(unexplained)
-            + ". Restore them or apply the intended exact patch through the selected path."
-        )
-    return None
-
-
-def _is_forward_static_seed(workdir: Path) -> bool:
-    manifest = workdir / "seed_manifest.json"
-    if not manifest.is_file():
-        return False
-    try:
-        import json
-        source = Path(json.loads(manifest.read_text(encoding="utf-8"))["source_frontend"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
-    return (source / "index.html").is_file() and not (source / "package.json").is_file()
-
-
-def _validate_generator_runnable_files(frontend_dir: Path, workdir: Path) -> str | None:
-    if _is_forward_static_seed(workdir):
-        return None
-    package_json = frontend_dir / "package.json"
-    if not package_json.is_file():
-        return (
-            "The frontend is missing package.json. Create a runnable frontend package with "
-            "at least a dev script, validate it, and commit it inside frontend/.git."
-        )
-    return None
-
-
-def _validate_edit_scope(
-    workdir: Path,
-    round_num: int,
-    *,
-    required: bool = False,
-    baseline_filename: str | None = None,
-) -> str | None:
-    """Make the declared edit boundary an explicit generator deliverable."""
-    if not required and not (workdir / "seed_manifest.json").is_file():
-        return None
-    path = workdir / ".harness" / f"edit_scope_round_{round_num}.json"
-    if not path.is_file():
-        return f"Scoped edit/repair requires `{path.relative_to(workdir)}` before stopping."
-    try:
-        import json
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return f"Forward edit scope is not valid JSON: {exc}"
-    roots = payload.get("allowed_root_keys") if isinstance(payload, dict) else None
-    if not isinstance(roots, list) or not all(isinstance(item, str) for item in roots):
-        return "Forward edit scope must contain a string list `allowed_root_keys`."
-    if len(set(roots)) != len(roots):
-        return "Forward edit scope root keys must be distinct."
-    harness_baseline = payload.get("baseline") if isinstance(payload, dict) else None
-    if baseline_filename is None and isinstance(harness_baseline, str):
-        candidate = Path(harness_baseline)
-        if (
-            candidate.is_absolute()
-            or ".." in candidate.parts
-            or candidate.parent.as_posix() not in {".", ".harness"}
-        ):
-            return "Forward edit scope contains an invalid harness baseline reference."
-        baseline_filename = candidate.name
-    baseline_path = workdir / ".harness" / (
-        baseline_filename or "edit_dom_baseline.json"
-    )
-    try:
-        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-        valid_roots = {str(item["key"]) for item in baseline.get("roots", [])}
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        return f"Forward edit baseline roots are unavailable: {exc}"
-    unknown = sorted(set(roots) - valid_roots)
-    if unknown:
-        return "Forward edit scope contains unknown baseline roots: " + ", ".join(unknown)
-    if baseline.get("version") == 4:
-        if baseline.get("stable") is not True:
-            return "Semantic edit baseline is unstable; source mutation is blocked."
-        fragments = payload.get("allowed_fragment_keys")
-        if not isinstance(fragments, list) or not all(
-            isinstance(item, str) for item in fragments
-        ):
-            return "Semantic edit scope must contain a string list `allowed_fragment_keys`."
-        valid_fragments = {
-            str(item["key"])
-            for item in baseline.get("fragments", [])
-            if isinstance(item, dict) and item.get("key")
-        }
-        unknown_fragments = sorted(set(fragments) - valid_fragments)
-        if unknown_fragments:
-            return "Semantic edit scope contains unknown baseline fragments: " + ", ".join(
-                unknown_fragments
-            )
-        expected_new = payload.get("expected_new_fragments")
-        if not isinstance(expected_new, list) or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("route"), str)
-            or not isinstance(item.get("selector"), str)
-            or not item.get("selector")
-            or not isinstance(item.get("max_count"), int)
-            or isinstance(item.get("max_count"), bool)
-            or not 1 <= item.get("max_count") <= 50
-            for item in expected_new
-        ):
-            return (
-                "Semantic edit scope `expected_new_fragments` must use explicit "
-                "route/selector contracts with max_count in 1..50."
-            )
-    if baseline.get("version") in {3, 4}:
-        target_routes = payload.get("target_routes")
-        protected_routes = payload.get("protected_routes")
-        if (
-            not isinstance(target_routes, list)
-            or not target_routes
-            or not all(isinstance(item, str) for item in target_routes)
-            or not isinstance(protected_routes, list)
-            or not all(isinstance(item, str) for item in protected_routes)
-        ):
-            return "Multi-route edit scope requires string lists `target_routes` and `protected_routes`."
-        target_set = set(target_routes)
-        protected_set = set(protected_routes)
-        if target_set & protected_set:
-            return "Multi-route edit scope target and protected routes must be disjoint."
-        root_routes = {
-            str(item.get("key")): str(item.get("route", ""))
-            for item in baseline.get("roots", [])
-            if isinstance(item, dict) and item.get("key")
-        }
-        counts: dict[str, int] = {}
-        for root in roots:
-            route = root_routes.get(root, "")
-            if not route or route not in target_set or route in protected_set:
-                return "Multi-route edit scope may only allow roots owned by target routes."
-            counts[route] = counts.get(route, 0) + 1
-        if any(count > 2 for count in counts.values()):
-            return "Multi-route edit scope may declare at most two roots per target route."
-        if baseline.get("version") == 4:
-            fragment_routes = {
-                str(item.get("key")): str(item.get("route", "/"))
-                for item in baseline.get("fragments", [])
-                if isinstance(item, dict) and item.get("key")
-            }
-            fragment_counts: dict[str, int] = {}
-            for fragment in payload.get("allowed_fragment_keys", []):
-                route = fragment_routes.get(fragment, "")
-                if not route or route not in target_set or route in protected_set:
-                    return "Multi-route edit scope may only allow fragments owned by target routes."
-                fragment_counts[route] = fragment_counts.get(route, 0) + 1
-            for contract in payload.get("expected_new_fragments", []):
-                route = str(contract.get("route", ""))
-                if not route or route not in target_set or route in protected_set:
-                    return "Multi-route edit scope may only expect fragments on target routes."
-                if expected_fragment_consumes_scope_slot(contract):
-                    fragment_counts[route] = fragment_counts.get(route, 0) + 1
-            limits = payload.get("max_fragments_per_route", {})
-            if not isinstance(limits, dict) or any(
-                route not in target_set or type(limit) is not int or limit < 0
-                for route, limit in limits.items()
-            ):
-                return "Invalid per-route fragment budget."
-            if any(count > limits.get(route, 4) for route, count in fragment_counts.items()):
-                return "Multi-route edit scope exceeds its declared fragment budget."
-    elif len(roots) > 2:
-        return "Forward edit scope may declare at most two distinct root keys."
-    if not isinstance(payload.get("allow_new_roots", False), bool):
-        return "Forward edit scope field `allow_new_roots` must be boolean."
-    return None
-
-
 def _is_scope_contract_only_repair(grades: dict[str, Any]) -> bool:
     """Whether a repair needs only the forward-edit declaration artifact."""
     if grades.get("edit_scope_audit") != "fail":
@@ -3055,10 +3174,10 @@ def _is_scope_contract_only_repair(grades: dict[str, Any]) -> bool:
         return False
     if grades.get("regression_passed") is not False:
         return False
-    for check in grades.get("ui_checks", []):
+    for check in grades.get("ui_checks") or []:
         if not isinstance(check, dict) or str(check.get("status", "")).lower() != "pass":
             return False
-    for criterion in grades.get("target_exit_criteria_results", []):
+    for criterion in grades.get("target_exit_criteria_results") or []:
         if not isinstance(criterion, dict) or criterion.get("passed") is not True:
             return False
     return True
@@ -3067,7 +3186,7 @@ def _is_scope_contract_only_repair(grades: dict[str, Any]) -> bool:
 def _make_generator_stop_hook(
     frontend_dir: Path, baseline_commit: str, mode: GeneratorMode, workdir: Path, round_num: int,
     target_profile: dict[str, Any] | None = None, scope_contract_only: bool = False,
-    mutation_policy: MinimalPathPolicy | None = None,
+    mutation_policy: EditScopeState | None = None,
 ):
     async def _hook(_input: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
         state_path = workdir / ".harness/harness_state.json"
@@ -3084,10 +3203,6 @@ def _make_generator_stop_hook(
             error = validate_target_submission(frontend_dir, target_profile)
         if error is None and not scope_contract_only:
             error = _validate_generator_commits(frontend_dir, baseline_commit, mode)
-        if error is None and not scope_contract_only:
-            error = _validate_minimal_path_final_diff(
-                frontend_dir, baseline_commit, mutation_policy
-            )
         if error is None:
             is_forward = (workdir / "seed_manifest.json").is_file()
             repair_baseline = workdir / ".harness" / repair_baseline_name(round_num)
@@ -3239,6 +3354,7 @@ def _build_generator_prompt(
     resume_uncommitted_work: bool = False,
     recovered_commit: str | None = None,
     frozen_compound: bool = False,
+    reverse_validate_only: bool = False,
 ) -> str:
     """构造 generator 单轮提示词，按 generate/repair 两种模式切换细节。"""
     round_artifacts = RoundArtifacts(file_comm, round_num)
@@ -3249,6 +3365,7 @@ def _build_generator_prompt(
     scope_contract_only = isinstance(prior_grades, dict) and _is_scope_contract_only_repair(prior_grades)
     target_guidance = target_profile_guidance(target_profile)
     is_forward_edit = (file_comm.dir.parent / "seed_manifest.json").is_file()
+    supplied_atomic_plan = bool((file_comm.read_state() or {}).get("supplied_atomic_plan"))
     repair_frame_path = file_comm.dir / repair_baseline_name(round_num)
     has_repair_frame = mode == "repair" and repair_frame_path.is_file()
     minimal_path_ref = f".harness/{plan_name(round_num)}"
@@ -3286,16 +3403,21 @@ def _build_generator_prompt(
             compact_scope["dependency_paths"] = dependencies
         if guarded:
             compact_scope["guarded_shared_regions"] = guarded
+        checks_section = ""
+        if not reverse_validate_only:
+            checks_section = (
+                "\n## Target browser checks\n\n"
+                + json.dumps(compact_checks, ensure_ascii=False, separators=(",", ":"))
+                + "\n\n## Hard DOM topology invariants\n\n"
+                + json.dumps(topology_invariants, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+                + _render_control_topology_directives(topology_invariants)
+            )
         return (
             "Mode: edit\nTrajectory Role: incremental_edit\n"
             f"Round: {round_num}\nSprint: {sprint_num}\n"
             f"Goal: {sprint_context.get('goal')}\n"
-            "\n## Target browser checks\n\n"
-            + json.dumps(compact_checks, ensure_ascii=False, separators=(",", ":"))
-            + "\n\n## Hard DOM topology invariants\n\n"
-            + json.dumps(topology_invariants, ensure_ascii=False, separators=(",", ":"))
-            + "\n"
-            + _render_control_topology_directives(topology_invariants)
+            + checks_section
             + "\n\n## Allowed source cone\n\n"
             + json.dumps(compact_scope, ensure_ascii=False, separators=(",", ":"))
             + "\n\n"
@@ -3372,6 +3494,13 @@ def _build_generator_prompt(
             "allowed_source_paths": repair_packet.get("allowed_source_paths") or [],
             "recent_runtime_errors": recent_runtime_errors,
         }
+        if frozen_compound:
+            compact_packet = {
+                "bugs": compact_packet["bugs"],
+                "required_actions": compact_packet["required_actions"],
+                "recent_runtime_errors": compact_packet["recent_runtime_errors"],
+                "allowed_source_paths": compact_packet["allowed_source_paths"],
+            }
         checks = []
         verification_plan = file_comm.read_ui_verification_plan() or {}
         for sprint in verification_plan.get("sprints") or []:
@@ -3385,6 +3514,8 @@ def _build_generator_prompt(
             }
             for item in checks
         ]
+        if frozen_compound:
+            compact_checks = []
         topology_invariants = _control_topology_invariants(compact_checks)
         failure_directives = _render_failed_action_directives(
             repair_packet, compact_checks
@@ -3448,6 +3579,24 @@ def _build_generator_prompt(
             compact_scope["dependency_paths"] = dependencies
         if guarded:
             compact_scope["guarded_shared_regions"] = guarded
+        if frozen_compound:
+            visible_paths = [
+                str(item.get("path"))
+                for item in edit_context.get("source_windows") or []
+                if isinstance(item, dict) and item.get("path")
+            ]
+            compact_scope["initial_paths"] = visible_paths
+            compact_scope.pop("dependency_paths", None)
+        current_diff = _current_atomic_diff(file_comm, round_num)
+        checks_section = (
+            "\n\n## Target browser checks\n\n"
+            + json.dumps(compact_checks, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n## Hard DOM topology invariants\n\n"
+            + json.dumps(topology_invariants, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+            + _render_control_topology_directives(topology_invariants)
+            if not frozen_compound else ""
+        )
         return (
             f"Mode: repair\nTrajectory Role: repair\nRound: {round_num}\nSprint: {sprint_num}\n"
             f"Goal: {sprint_context.get('goal')}\n\n"
@@ -3455,24 +3604,21 @@ def _build_generator_prompt(
             + json.dumps(compact_packet, ensure_ascii=False, separators=(",", ":"))
             + "\n\n## Derived repair directives\n\n"
             + failure_directives
-            + "\n\n## Target browser checks\n\n"
-            + json.dumps(compact_checks, ensure_ascii=False, separators=(",", ":"))
-            + "\n\n## Hard DOM topology invariants\n\n"
-            + json.dumps(topology_invariants, ensure_ascii=False, separators=(",", ":"))
-            + "\n"
-            + _render_control_topology_directives(topology_invariants)
+            + checks_section
             + "\n\n## Allowed source cone\n\n"
             + json.dumps(compact_scope, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n## Current atomic Edit diff\n\n```diff\n"
+            + current_diff
+            + "\n```\n"
             + "\n\n"
             + render_edit_context(edit_context)
             + "\n\nThe source blocks above are the current on-disk snapshot for this Repair round. "
             "Use the runtime error location to connect evidence to the exact source. "
-            "The Harness exposes the complete frontend source when it fits the Repair context budget; "
-            "if a file is still truncated, read the missing range before patching. "
-            "Never reuse an old_text anchor from an earlier Repair round or from the reference Skill: "
-            "derive every patch from the current file contents. "
-            "Fix ALL reproduced defects in this packet together in this single Repair response, "
-            "including multiple issues of the same type. Preserve unrelated behavior. "
+            "If a required file is truncated, read only the missing range before patching. "
+            "Use SHA-bound line operations against the current source; use exact old_text only "
+            "for a long/minified line that cannot be expressed safely by line operations. "
+            "Only solve the current Judge issue. Preserve every already-correct feature and do "
+            "not reimplement the whole Edit or rewrite unrelated regions. "
             "Run the smallest validation and create one atomic fix commit. "
             "The next Harness evaluation verifies the result; do not self-report success or add new features."
         )
@@ -3513,7 +3659,7 @@ def _build_generator_prompt(
             "- This round extends an accepted product checkpoint and is a natural incremental Edit "
             "inside the parent Generate trajectory, even when the low-level generator mode is `generate`.\n",
             f"- FIRST read `{minimal_path_ref}`. The harness already materialized "
-            f"`.harness/edit_scope_round_{round_num}.json` and a live minimal-path state; do not "
+            f"`.harness/edit_scope_round_{round_num}.json` and recommended scope state; do not "
             "create, copy, or edit those harness-owned artifacts.\n",
             "- The Harness-selected source window below is already inspected. Exact patches wholly "
             "inside it do not need another source read; inspect only a focused missing line range "
@@ -3521,38 +3667,30 @@ def _build_generator_prompt(
             "- Read `design_system_context` in the same plan. Reuse its existing CSS custom "
             "properties for target-local styling before introducing literal visual values or "
             "new tokens. This is guidance; browser evidence still decides behavior and state.\n",
-            "- Treat `route_scope.target_routes` as the only page owners in scope. "
-            "`off_target_paths` are closed outright. A cross-route shared file is closed unless "
-            "`source_change_cone.guarded_shared_regions` names an exact target-route object, "
-            "class, or function; any admitted patch must stay wholly inside it. A shared file "
-            "also opens normally when every owning route is targeted by this sprint.\n",
-            "- A guarded shared stylesheet uses `mutation_mode=target_scoped_css`. Change only "
-            "complete CSS rules whose every comma-separated selector branch contains one of its "
-            "`allowed_anchors`. Keep the anchor outside functional pseudo-classes such as "
-            "`:is()`/`:where()`/`:not()`/`:has()`, and do not escape it with `+` or `~`. Prefer "
-            "an exact target ID or `[data-testid]`/`[data-page]` root; a generic component class "
-            "does not authorize a shared-style change. This guard is fail-closed for edits inside "
-            "at-rules or modern nested selector blocks, so use an already target-local stylesheet "
-            "when responsive nesting is required.\n",
-            "- After every successful source mutation, run the smallest applicable syntax, diff, "
-            "build, or test validation. Only then can a path connected by a recorded dependency "
-            "edge be unlocked; protected and unplanned new source paths remain rejected.\n",
-            "- If the initial path completes the contract, do not widen. A successful validation "
-            "after the latest mutation is required before commit.\n",
-            "- Existing source overwrites are rejected. Use exact, unique patches within the plan's "
-            "line and touched-file budgets. Reads, applied mutations, validation transitions, denials, "
-            "and dependency widening are recorded in the minimal-path ledger.\n",
+            "- Treat `recommended_scope.target_files` as the first inspection set. "
+            "`recommended_scope.likely_dependencies` may be opened when a concrete import, "
+            "data, style, or route dependency is observed; record the reason and keep the "
+            "patch focused. `recommended_scope.protected_unrelated_pages` are protected "
+            "recommendations. Avoid broad unrelated scans, rewrites, or new files.\n",
+            "- After a source mutation, run the smallest applicable syntax, diff, build, or test "
+            "validation. Expand beyond the recommendation whenever the source or failure evidence "
+            "shows a concrete dependency; explain the connection and keep the patch focused.\n",
+            "- If the target files complete the contract, stop there. Keep the change focused and "
+            "avoid broad scans, whole-project rewrites, or unrelated new files.\n",
+            "- Prefer exact, unique patches and preserve existing source context. The post-edit "
+            "scope sanity check will flag large unrelated diffs, whole-project rewrites, and "
+            "unrelated new files.\n",
             "- If `source_change_cone.route_isolation_strategy.status` is `recommended`, follow it "
             "as the preferred path: patch only its `entry_path` to load the "
             "`planned_companion_path` and, when present, `planned_style_path`; run a focused "
-            "validation to unlock those dependencies, then create the small route-local files. "
+            "validation, then create the small route-local files. "
             "Reuse the accepted page's persistence "
             "protocol, but do not wrap or rewrite an accepted page script to make the new route run.\n",
-            "- This is an execution policy enforced by the harness. The later counterfactual "
-            "certificate remains an independent final check.\n",
+            "- This channel is guidance plus a post-edit extreme-case sanity check, not a file "
+            "permission system. Repair may freely follow concrete evidence into other dependencies.\n",
             "\n" + render_edit_context(edit_context) + "\n" if edit_context else "",
         ])
-    if is_forward_edit and not minimal_path_owned:
+    if is_forward_edit and not minimal_path_owned and not supplied_atomic_plan:
         try:
             baseline = json.loads((file_comm.dir / "edit_dom_baseline.json").read_text(encoding="utf-8"))
             root_keys = [str(item["key"]) for item in baseline.get("roots", [])]
@@ -3568,7 +3706,7 @@ def _build_generator_prompt(
             "- The harness independently rejects semantic DOM/ARIA changes outside this declared scope.\n",
             "- If the frozen seed is a plain HTML/CSS/JS site, do not create package.json, lockfiles, dev servers, or dependencies; the harness serves it statically.\n",
         ])
-    elif has_repair_frame and not minimal_path_owned:
+    elif has_repair_frame and not minimal_path_owned and not supplied_atomic_plan:
         try:
             baseline = json.loads(repair_frame_path.read_text(encoding="utf-8"))
             root_keys = [str(item["key"]) for item in baseline.get("roots", [])]
@@ -3646,7 +3784,7 @@ def _build_generator_prompt(
                 [minimal_path_ref, f".harness/edit_scope_round_{round_num}.json"]
                 if minimal_path_owned
                 else [f".harness/edit_scope_round_{feedback_round}.json"]
-                if is_forward_edit
+                if is_forward_edit and not supplied_atomic_plan
                 else [f".harness/{repair_baseline_name(round_num)}"]
                 if has_repair_frame
                 else []
@@ -3681,7 +3819,7 @@ def _build_generator_prompt(
                 "off-target page source. If a mutation is denied, use its returned next "
                 "action instead of expanding to an unrelated file.\n"
             )
-        elif is_forward_edit:
+        elif is_forward_edit and not supplied_atomic_plan:
             scope_first_action = (
                 f"FIRST ACTION: copy `.harness/edit_scope_round_{feedback_round}.json` to "
                 f"`.harness/edit_scope_round_{round_num}.json` before any investigation. This is a "
@@ -3698,7 +3836,7 @@ def _build_generator_prompt(
             "all product checks passed and scope audit is the only failure, do not modify frontend source "
             "or invent an empty Git commit: update only the scope artifact and required logs.\n"
             )
-        elif has_repair_frame:
+        elif has_repair_frame and not supplied_atomic_plan:
             scope_first_action = (
                 f"FIRST ACTION: write `.harness/edit_scope_round_{round_num}.json` from the "
                 "failed-source semantic roots listed above, before investigating or editing source.\n"
@@ -3709,12 +3847,11 @@ def _build_generator_prompt(
             )
         else:
             scope_first_action = (
-                "The failed source did not render, so no DOM/ARIA repair frame is available; "
-                "start from the exact startup evidence and keep the source diff atomic.\n"
+                "Inspect the current project and failure location, then modify every file genuinely "
+                "needed for this Repair. No scope or patch-size budget applies.\n"
             )
             scope_preservation_guidance = (
-                "Because the source could not render, preserve every unrelated file and line "
-                "byte-for-byte and change only the startup defect.\n"
+                "Preserve unrelated product behavior as guidance; do not create an unrelated refactor.\n"
             )
         mode_lines = [
             "Repair Scope: Fix evaluator-reported issues for the current sprint only\n"
@@ -3725,8 +3862,8 @@ def _build_generator_prompt(
             "## Previous evaluation findings\n\n"
             f"{failures_text}\n\n"
             f"The harness-owned `.harness/repair_packet_round_{feedback_round}.json` is the "
-            "bounded failure handoff when present. Use its failed checks, allowed source paths, "
-            "and dynamic budgets; do not reopen unrelated project exploration.\n\n"
+            "failure handoff when present. Use its current issues and runtime evidence; inspect "
+            "additional source files when the Repair genuinely requires them.\n\n"
             "## Your task\n"
             "Address every failure above. Do not stop until each one is fixed. "
             "There is no self-report file; the next evaluation round verifies your work.\n"
@@ -3749,16 +3886,13 @@ def _build_generator_prompt(
             "unbounded native prompt before updating the user-visible feedback state. Give the aria-live "
             "feedback synchronously or through a bounded fallback, then preserve the native API as a "
             "best-effort enhancement.\n"
-            "After the required scope declaration, make the smallest repair, commit it, and update the build "
-            "log/progress artifacts. These required artifacts take priority over additional exploratory "
-            "tool calls when turns are limited.\n"
+            "After fixing the current issues, commit the repair and update the build log/progress artifacts.\n"
             "Visual evidence is captured independently by the harness in both top and scrolled states. "
             "Never alter required product visibility or interaction behavior merely to make a screenshot show a control.\n"
             f"{scope_preservation_guidance}"
             "Fix ONLY the issues needed for sprint acceptance or regression recovery.\n"
-            "Use localized patches and preserve untouched code exactly; broad rewrites or "
-            "formatting churn make the repair unusable as training data. Normally touch no "
-            "more than four source files.\n"
+            "Preserve unrelated behavior, but modify every source file genuinely needed for the Repair. "
+            "There is no touched-file or patch-size budget.\n"
             "Do not implement new features from future sprints.\n"
             "Do not start work for the next sprint.\n"
         ]
@@ -3789,6 +3923,17 @@ def _build_generator_prompt(
     )
 
     return "".join(common_lines + mode_lines) + common_tail
+
+
+def _is_forward_static_seed(workdir: Path) -> bool:
+    manifest = workdir / "seed_manifest.json"
+    if not manifest.is_file():
+        return False
+    try:
+        source = Path(json.loads(manifest.read_text(encoding="utf-8"))["source_frontend"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return (source / "index.html").is_file() and not (source / "package.json").is_file()
 
 
 def _validate_generator_outputs(file_comm: FileComm, workdir: Path, result_summary: str) -> None:
@@ -3868,16 +4013,6 @@ async def run_generator(
             "[bold green]Generator[/] recovered trace-backed commit %s; requesting only completion confirmation.",
             recovered_commit[:12],
         )
-    if recovered_commit is None:
-        recovered_paths = _recover_deferred_model_patches(
-            frontend_dir, file_comm, workdir, round_num
-        )
-        if recovered_paths:
-            logger.info(
-                "[bold green]Generator[/] replayed %s exact model patch(es) that the "
-                "Harness had deferred only for local validation.",
-                len(recovered_paths),
-            )
     resume_uncommitted_work = bool(_git_output(frontend_dir, "status", "--porcelain"))
     if resume_uncommitted_work:
         checkpoint = _checkpoint_interrupted_model_work(
@@ -3945,9 +4080,19 @@ async def run_generator(
         resume_uncommitted_work=resume_uncommitted_work,
         recovered_commit=recovered_commit,
         frozen_compound=config.edit_frozen_compound_mode,
+        reverse_validate_only=bool(config.reverse_validate_root),
     )
+    integration_path = file_comm.dir / f"integration_contract_round_{round_num}.json"
+    if integration_path.is_file():
+        user_msg += (
+            "\n\n## Harness-owned Integration Contract\n"
+            + integration_path.read_text(encoding="utf-8")
+            + "\nImplement in this order: target route/section -> host data/state -> mount point -> "
+            "Skill API -> callback/write-back -> styles and secondary behavior. Do not copy the "
+            "Skill core first and postpone host wiring.\n"
+        )
     if config.edit_skills_enabled:
-        user_msg += render_edit_skill(workdir)
+        user_msg += render_edit_skill(workdir, mode=mode)
     obligations = chain_obligations(read_edit_task_contract(workdir) or {})
     if obligations:
         user_msg += "\nChain host-state obligations:\n" + json.dumps(obligations, ensure_ascii=False)
@@ -3962,16 +4107,16 @@ async def run_generator(
     target_profile = file_comm.read_target_profile()
     prior_grades = file_comm.read_grades(round_num - 1) if mode == "repair" else None
     scope_contract_only = isinstance(prior_grades, dict) and _is_scope_contract_only_repair(prior_grades)
-    mutation_policy = (
-        MinimalPathPolicy.load(workdir, round_num)
-        if config.minimal_path_guidance_enabled
-        else None
-    )
+    mutation_policy = EditScopeState.load(workdir, round_num)
     if mutation_policy is not None and _atomic_executor_eligible(
         config=config, workdir=workdir, round_num=round_num
     ):
-        replay_candidate = _last_replayable_atomic_candidate(
-            RoundArtifacts(file_comm, round_num).trace_path("generator")
+        replay_candidate = (
+            ""
+            if config.edit_frozen_compound_mode
+            else _last_replayable_atomic_candidate(
+                RoundArtifacts(file_comm, round_num).trace_path("generator")
+            )
         )
         if replay_candidate:
             logger.info(
@@ -4003,7 +4148,7 @@ async def run_generator(
                     "Trace-backed candidate still fails current guards; requesting one "
                     "new bounded candidate."
                 )
-                mutation_policy = MinimalPathPolicy.load(workdir, round_num) or mutation_policy
+                mutation_policy = EditScopeState.load(workdir, round_num) or mutation_policy
                 stats = await _run_atomic_patch_executor(
                     config=config,
                     file_comm=file_comm,
@@ -4037,7 +4182,7 @@ async def run_generator(
         # A compact correction is executed recursively with a freshly loaded
         # policy after the rejected candidate was rolled back.  Reload before
         # the final gate so only the accepted transaction explains the commit.
-        mutation_policy = MinimalPathPolicy.load(workdir, round_num) or mutation_policy
+        mutation_policy = EditScopeState.load(workdir, round_num) or mutation_policy
         completion_gate = _make_generator_stop_hook(
             frontend_dir,
             baseline_commit,
@@ -4054,7 +4199,10 @@ async def run_generator(
         _validate_generator_outputs(file_comm, workdir, "atomic Edit applied")
         return stats
 
-    if (file_comm.read_state() or {}).get("supplied_atomic_plan"):
+    if (
+        (file_comm.read_state() or {}).get("supplied_atomic_plan")
+        and config.minimal_path_guidance_enabled
+    ):
         raise RuntimeError("Product Session requires complete source context for its single-call patch executor")
     result, cost, _assistant_text, permission_denials = await run_sdk_agent(
         prompt=user_msg,

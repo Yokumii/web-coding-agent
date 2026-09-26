@@ -13,6 +13,7 @@ examples/*
 runs/
 /runs
 .harness/
+.agents/skills/.rsi.lock
 .claude/worktrees/
 .claude/settings.local.json
 .playwright-mcp/

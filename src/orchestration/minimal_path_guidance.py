@@ -16,6 +16,7 @@ import difflib
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
@@ -160,12 +161,8 @@ def plan_name(round_num: int) -> str:
     return f"minimal_path_plan_round_{round_num}.json"
 
 
-def ledger_name(round_num: int) -> str:
-    return f"minimal_path_ledger_round_{round_num}.jsonl"
-
-
 def state_name(round_num: int) -> str:
-    return f"minimal_path_state_round_{round_num}.json"
+    return f"recommended_scope_state_round_{round_num}.json"
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -287,7 +284,7 @@ def _repair_priority_source_roles(
     failed_ids = sorted(
         {
             str(item.get("check_id"))
-            for item in grade.get("ui_checks", [])
+            for item in grade.get("ui_checks") or []
             if isinstance(item, dict)
             and str(item.get("status", "")).strip().lower()
             in {"error", "fail", "failed", "timeout"}
@@ -2327,6 +2324,7 @@ def ensure_minimal_path_plan(
     max_patch_lines: int,
     max_touched_files: int,
     eager_dependency_context: bool = False,
+    scope_mode: str = "recommended",
 ) -> dict[str, Any]:
     """Create one immutable harness-owned plan for an edit/repair round."""
     path = harness_dir / plan_name(round_num)
@@ -2340,10 +2338,13 @@ def ensure_minimal_path_plan(
         scope_path = harness_dir / f"edit_scope_round_{round_num}.json"
         if not scope_path.exists():
             _write_json(scope_path, _scope_payload(existing))
+        recommended_path = harness_dir / f"recommended_scope_round_{round_num}.json"
+        if not recommended_path.exists() and existing.get("recommended_scope"):
+            _write_json(recommended_path, existing["recommended_scope"])
         return existing
 
     ui_plan = _read_json(harness_dir / "ui_verification_plan.json", {})
-    checks = _target_checks(ui_plan, sprint_num)
+    checks = _target_checks(ui_plan, sprint_num) or []
     selectors = _extract_selectors(checks)
     tokens = _selector_tokens(selectors)
     requested_roles = _requested_source_roles(checks)
@@ -2734,6 +2735,7 @@ def ensure_minimal_path_plan(
         if local and checks
         else "advisory"
     )
+    normalized_scope_mode = "recommended"
     plan = {
         "schema_version": PLAN_VERSION,
         "source_selection_strategy": SOURCE_SELECTION_STRATEGY,
@@ -2742,6 +2744,19 @@ def ensure_minimal_path_plan(
         "sprint": sprint_num,
         "mode": mode,
         "status": status,
+        "scope_mode": normalized_scope_mode,
+        "recommended_scope": {
+            "target_files": local,
+            "likely_dependencies": dependencies,
+            "protected_unrelated_pages": sorted(
+                set(protected) | set(route_scope.get("off_target_paths") or [])
+            ),
+            "instruction": (
+                "Start with target_files. Open likely_dependencies only when a concrete "
+                "import, data, style, or route dependency is observed. Keep protected "
+                "unrelated_pages untouched unless the dependency is explicit."
+            ),
+        },
         "route_scope": route_scope,
         "target_contract": {
             "check_ids": [str(item.get("id", "")) for item in checks],
@@ -2790,783 +2805,181 @@ def ensure_minimal_path_plan(
             "existing_source_requires_exact_patch": True,
         },
         "widening_policy": {
-            "dependency_tier": (
-                "only_after_source_mutation_and_post_mutation_validation_attempt"
-            ),
-            "protected_tier": "denied",
-            "whole_file_overwrite": "denied_for_existing_frontend_source",
-            "inspection_before_mutation": "required",
-            "commit_after_successful_validation": "required",
+            "scope_mode": normalized_scope_mode,
+            "dependency_tier": "on_demand_after_concrete_dependency_evidence",
+            "protected_tier": "advisory_protected_unrelated_pages",
+            "whole_file_overwrite": "discouraged; checked by post_edit_scope_sanity",
+            "inspection_before_mutation": "target_files_first",
+            "commit_after_successful_validation": "recommended",
         },
     }
     _write_json(path, plan)
     _write_json(
         harness_dir / f"edit_scope_round_{round_num}.json", _scope_payload(plan)
     )
+    _write_json(
+        harness_dir / f"recommended_scope_round_{round_num}.json",
+        plan["recommended_scope"],
+    )
     return plan
 
 
-class MinimalPathPolicy:
-    """Stateful pre-mutation gate backed by a harness-owned plan."""
+def post_edit_scope_sanity(
+    *, workdir: Path, harness_dir: Path, round_num: int, plan: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Run the deliberately small post-edit scope check used by recommended mode."""
+    plan = plan or _read_json(harness_dir / plan_name(round_num), {})
+    frontend = workdir / "frontend"
+    build_map = _read_json(harness_dir / "round_build_map.json", {})
+    source = str((build_map.get(str(round_num)) or {}).get("source_commit") or "")
+    changed: list[str] = []
+    added: list[str] = []
+    changed_lines = 0
+    if frontend.is_dir() and source:
+        try:
+            names = subprocess.run(
+                ["git", "diff", "--name-only", source, "--"],
+                cwd=frontend, check=True, capture_output=True, text=True,
+            ).stdout
+            changed = sorted(
+                f"frontend/{item.strip()}"
+                for item in names.splitlines()
+                if item.strip()
+            )
+            added_output = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=A", source, "--"],
+                cwd=frontend, check=True, capture_output=True, text=True,
+            ).stdout
+            added = sorted(
+                f"frontend/{item.strip()}"
+                for item in added_output.splitlines()
+                if item.strip()
+            )
+            stats = subprocess.run(
+                ["git", "diff", "--numstat", source, "--"],
+                cwd=frontend, check=True, capture_output=True, text=True,
+            ).stdout
+            for line in stats.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                    changed_lines += int(parts[0]) + int(parts[1])
+        except (OSError, subprocess.CalledProcessError):
+            changed = []
+    cone = plan.get("source_change_cone") or {}
+    recommended = plan.get("recommended_scope") or {}
+    allowed = set(recommended.get("target_files") or cone.get("local_paths") or [])
+    allowed |= set(recommended.get("likely_dependencies") or cone.get("dependency_paths") or [])
+    allowed |= set(cone.get("planned_new_paths") or [])
+    new_files = added
+    unrelated = [path for path in changed if path not in allowed]
+    budgets = plan.get("budgets") or {}
+    max_files = max(1, int(budgets.get("max_touched_files", 6)))
+    max_lines = max(1, int(budgets.get("max_patch_lines", 120)))
+    issues: list[str] = []
+    if len(changed) > max_files * 3:
+        issues.append(f"大量文件变更: {len(changed)}")
+    if changed_lines > max_lines * 4 or (len(changed) > 20 and changed_lines > max_lines * 2):
+        issues.append(f"疑似重写整个项目: {changed_lines} changed lines")
+    unrelated_new = [path for path in new_files if path not in allowed]
+    if len(unrelated_new) > 3:
+        issues.append(f"创建大量无关文件: {len(unrelated_new)}")
+    return {
+        "status": "issue" if issues else "pass",
+        "passed": not issues,
+        "issues": issues,
+        "changed_files": changed,
+        "changed_lines": changed_lines,
+        "unrelated_files": unrelated,
+        "new_files": new_files,
+        "unrelated_new_files": unrelated_new,
+        "recommended_scope": recommended,
+    }
+
+
+
+class EditScopeState:
+    """Small state adapter for the recommended scope workflow.
+
+    Scope is advisory during generation. This object only records touched files and
+    validation observations so the post-edit sanity check can inspect the result.
+    It deliberately contains no pre-mutation path gate or dependency unlock logic.
+    """
 
     def __init__(self, workdir: Path, plan: dict[str, Any]) -> None:
         self.workdir = workdir.resolve()
         self.plan = plan
-        self.round_num = int(plan["round"])
+        self.round_num = int(plan.get("round") or 0)
         cone = plan.get("source_change_cone") or {}
         self.local_paths = set(cone.get("local_paths") or [])
-        configured_initial = set(cone.get("initial_paths") or [])
-        hotspots = [
-            str(item.get("path"))
-            for item in cone.get("hotspots") or []
-            if isinstance(item, dict) and item.get("path")
-        ]
-        fallback_initial = hotspots[:1] or sorted(self.local_paths)[:1]
-        if str(plan.get("mode") or "") == "repair" and self.round_num > 1:
-            prior_state = _read_json(
-                self.workdir / ".harness" / state_name(self.round_num - 1), {}
-            )
-            configured_initial.update(
-                str(path)
-                for path in prior_state.get("touched_paths") or []
-                if str(path) in self.local_paths
-            )
-        self.initial_paths = configured_initial or set(fallback_initial)
         self.dependency_paths = set(cone.get("dependency_paths") or [])
         self.protected_paths = set(cone.get("protected_paths") or [])
         route_scope = plan.get("route_scope") or {}
-        self.cross_route_shared_paths = set(
-            route_scope.get("cross_route_shared_paths") or []
-        )
-        self.guarded_shared_regions: dict[str, list[dict[str, Any]]] = {}
-        for item in cone.get("guarded_shared_regions") or []:
-            if isinstance(item, dict) and item.get("path") and item.get("symbol"):
-                self.guarded_shared_regions.setdefault(str(item["path"]), []).append(item)
         self.off_target_paths = set(route_scope.get("off_target_paths") or [])
-        self.dependency_edges = {
-            (str(item.get("from")), str(item.get("to")))
-            for item in cone.get("dependency_edges") or []
-            if isinstance(item, dict)
+        self.cross_route_shared_paths = set(route_scope.get("cross_route_shared_paths") or [])
+        self.guarded_shared_regions = {
+            str(item.get("path")): []
+            for item in cone.get("guarded_shared_regions") or []
+            if isinstance(item, dict) and item.get("path")
         }
         budgets = plan.get("budgets") or {}
         self.max_patch_lines = max(1, int(budgets.get("max_patch_lines", 120)))
-        self.max_touched_files = max(1, int(budgets.get("max_touched_files", 3)))
+        self.max_touched_files = max(1, int(budgets.get("max_touched_files", 6)))
+        self.initial_paths = set(cone.get("initial_paths") or self.local_paths)
+        self.observed_paths: set[str] = set()
+        self.tool_observed_paths: set[str] = set()
+        self.touched_paths: set[str] = set()
+        self.mutation_revision = 0
+        self.validation_attempt_revision = 0
+        self.validation_success_revision = 0
+        self.validation_last_ok: bool | None = None
         self.state_path = self.workdir / ".harness" / state_name(self.round_num)
-        state = _read_json(self.state_path, {})
-        context = _read_json(
-            self.workdir / ".harness" / f"edit_context_round_{self.round_num}.json",
-            {},
-        )
-        self.preloaded_regions: dict[str, list[str]] = {}
-        if isinstance(context, dict) and context.get("schema_version") in {
-            "edit-context-v1",
-            "edit-context-v2",
-        }:
-            for item in context.get("source_windows") or []:
-                if isinstance(item, dict) and item.get("path") and item.get("content"):
-                    self.preloaded_regions.setdefault(str(item["path"]), []).append(
-                        str(item["content"])
-                    )
-            for outline in context.get("source_outlines") or []:
-                if not isinstance(outline, dict) or not outline.get("path"):
-                    continue
-                for entry in outline.get("entries") or []:
-                    if isinstance(entry, dict) and entry.get("content"):
-                        self.preloaded_regions.setdefault(str(outline["path"]), []).append(
-                            str(entry["content"])
-                        )
-        historical_observed = set(state.get("observed_paths") or [])
-        self.tool_observed_paths: set[str] = set(
-            state.get("tool_observed_paths") or historical_observed
-        )
-        self.observed_paths: set[str] = (
-            historical_observed
-            | self.tool_observed_paths
-            | set(self.preloaded_regions)
-        )
-        self.touched_paths: set[str] = set(state.get("touched_paths") or [])
-        self.mutation_revision = int(state.get("mutation_revision") or 0)
-        self.validation_attempt_revision = int(
-            state.get("validation_attempt_revision") or 0
-        )
-        self.validation_success_revision = int(
-            state.get("validation_success_revision") or 0
-        )
-        self.validation_last_ok = state.get("validation_last_ok")
-        self.ledger_path = self.workdir / ".harness" / ledger_name(self.round_num)
         self._persist_state()
 
     @classmethod
-    def from_plan(cls, workdir: Path, plan: dict[str, Any]) -> "MinimalPathPolicy":
-        return cls(workdir, plan)
-
-    @classmethod
-    def load(cls, workdir: Path, round_num: int) -> "MinimalPathPolicy | None":
+    def load(cls, workdir: Path, round_num: int) -> "EditScopeState | None":
         plan = _read_json(workdir / ".harness" / plan_name(round_num), None)
-        if (
-            not isinstance(plan, dict)
-            or plan.get("schema_version") not in SUPPORTED_PLAN_VERSIONS
-        ):
+        if not isinstance(plan, dict):
             return None
         return cls(workdir, plan)
-
-    def _record(
-        self,
-        *,
-        decision: str,
-        tool: str,
-        path: str | None,
-        reason: str,
-        scope_tier: str | None = None,
-        patch_lines: int | None = None,
-        expansion_reason: str | None = None,
-    ) -> None:
-        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = 0
-        if self.ledger_path.is_file():
-            with self.ledger_path.open(encoding="utf-8") as handle:
-                existing = sum(1 for _ in handle)
-        payload: dict[str, Any] = {
-            "sequence": existing + 1,
-            "round": self.round_num,
-            "decision": decision,
-            "tool": tool,
-            "path": path,
-            "reason": reason,
-        }
-        if scope_tier is not None:
-            payload["scope_tier"] = scope_tier
-        if patch_lines is not None:
-            payload["patch_lines"] = patch_lines
-        if expansion_reason is not None:
-            payload["expansion_reason"] = expansion_reason
-        with self.ledger_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            handle.flush()
 
     def _persist_state(self) -> None:
-        unlocked_paths = set(self.initial_paths) | set(self.touched_paths)
-        if self.validation_attempt_revision >= self.mutation_revision:
-            for source, target in self.dependency_edges:
-                if source in self.touched_paths:
-                    unlocked_paths.add(target)
-                if target in self.touched_paths:
-                    unlocked_paths.add(source)
-        if not (self.initial_paths & self.observed_paths):
-            phase = "inspect_initial"
-            next_action = "Read the exact initial source path before proposing a patch."
-        elif self.mutation_revision == 0:
-            phase = "patch_initial"
-            next_action = "Apply one exact unique patch to the inspected initial path."
-        elif self.validation_attempt_revision < self.mutation_revision:
-            phase = "validate_latest_patch"
-            next_action = (
-                "Run the smallest applicable syntax, build, test, or diff validation."
-            )
-        elif (
-            self.validation_success_revision < self.mutation_revision
-            or self.validation_last_ok is not True
-        ):
-            phase = "repair_or_expand"
-            next_action = "Use the failure evidence to repair the touched path or follow one unlocked dependency edge."
-        else:
-            phase = "validated"
-            next_action = "Commit if the target contract is complete; widen only when a recorded dependency is still necessary."
-        _write_json(
-            self.state_path,
-            {
-                "schema_version": "minimal-path-state-v1",
-                "owner": "harness",
-                "round": self.round_num,
-                "observed_paths": sorted(self.observed_paths),
-                "tool_observed_paths": sorted(self.tool_observed_paths),
-                "preloaded_paths": sorted(self.preloaded_regions),
-                "touched_paths": sorted(self.touched_paths),
-                "mutation_revision": self.mutation_revision,
-                "validation_attempt_revision": self.validation_attempt_revision,
-                "validation_success_revision": self.validation_success_revision,
-                "validation_last_ok": self.validation_last_ok,
-                "phase": phase,
-                "unlocked_paths": sorted(unlocked_paths),
-                "next_action": next_action,
-            },
-        )
+        _write_json(self.state_path, {
+            "schema_version": "recommended-scope-state-v1",
+            "round": self.round_num,
+            "observed_paths": sorted(self.observed_paths),
+            "touched_paths": sorted(self.touched_paths),
+            "validation_last_ok": self.validation_last_ok,
+        })
 
-    def _path(self, tool_input: dict[str, Any]) -> tuple[Path, str] | None:
+    def check(self, _tool: str, _tool_input: dict[str, Any]) -> str | None:
+        return None
+
+    def observe_result(self, _tool: str, tool_input: dict[str, Any], *, ok: bool, output: Any) -> None:
+        if not ok:
+            return
         raw = tool_input.get("path") or tool_input.get("file_path")
-        if not isinstance(raw, str) or not raw:
-            return None
-        candidate = Path(raw)
-        if not candidate.is_absolute():
-            candidate = self.workdir / candidate
-        resolved = candidate.resolve()
-        try:
-            relative = resolved.relative_to(self.workdir).as_posix()
-        except ValueError:
-            return None
-        return resolved, relative
-
-    @staticmethod
-    def _patch_pairs(tool: str, tool_input: dict[str, Any]) -> list[tuple[str, str]]:
-        normalized = tool.lower()
-        if normalized in {"write", "write_file"}:
-            copy_pairs = tool_input.get("_harness_copy_pairs")
-            if tool_input.get("_harness_copy_from") and isinstance(copy_pairs, list):
-                return [
-                    (
-                        str(item.get("old_text", "")),
-                        str(item.get("new_text", "")),
-                    )
-                    for item in copy_pairs
-                    if isinstance(item, dict)
-                ]
-            return [("", str(tool_input.get("content", "")))]
-        if normalized in {"apply_patch", "edit"}:
-            old = tool_input.get("old_text", tool_input.get("old_string", ""))
-            new = tool_input.get("new_text", tool_input.get("new_string", ""))
-            return [(str(old), str(new))]
-        if normalized == "multiedit":
-            output: list[tuple[str, str]] = []
-            for item in tool_input.get("edits") or []:
-                if isinstance(item, dict):
-                    output.append(
-                        (
-                            str(item.get("old_string", item.get("old_text", ""))),
-                            str(item.get("new_string", item.get("new_text", ""))),
-                        )
-                    )
-            return output
-        return []
-
-    def _deny(
-        self,
-        tool: str,
-        path: str | None,
-        reason: str,
-        *,
-        patch_lines: int | None = None,
-    ) -> str:
-        self._record(
-            decision="deny",
-            tool=tool,
-            path=path,
-            reason=reason,
-            patch_lines=patch_lines,
-        )
-        return reason
-
-    @staticmethod
-    def _is_validation_command(command: str) -> bool:
-        normalized = " ".join(command.strip().split()).lower()
-        return bool(
-            re.search(
-                r"(?:^|&&\s*)(?:"
-                r"node --check\b|"
-                r"(?:npm|pnpm|yarn)(?:\s+--prefix\s+\S+)?\s+(?:run\s+)?(?:build|check|lint|test|typecheck|validate)\b|"
-                r"git(?:\s+-c\s+\S+)?\s+diff\s+--check\b|"
-                r"pytest\b|uv run pytest\b|tsc\b"
-                r")",
-                normalized,
-            )
-        )
-
-    @staticmethod
-    def _is_commit_command(command: str) -> bool:
-        normalized = " ".join(command.strip().split()).lower()
-        return bool(
-            re.search(
-                r"(?:^|&&\s*)git(?:\s+-c\s+\S+)?\s+commit\b",
-                normalized,
-            )
-        )
-
-    @staticmethod
-    def _is_readonly_package_command(command: str) -> bool:
-        normalized = " ".join(command.strip().split()).lower()
-        matches = list(_PACKAGE_MANAGER_RE.finditer(normalized))
-        return bool(matches) and all(
-            re.match(
-                r"(?:npm|pnpm|yarn)(?:\s+--prefix\s+\S+)?\s+(?:info|list|ls|outdated|view)\b",
-                normalized[match.start() :],
-            )
-            for match in matches
-        )
-
-    def _dependency_predecessor(self, relative: str) -> str | None:
-        return next(
-            (
-                source if target == relative else target
-                for source, target in sorted(self.dependency_edges)
-                if (target == relative and source in self.touched_paths)
-                or (source == relative and target in self.touched_paths)
-            ),
-            None,
-        )
-
-    def _current_guarded_spans(
-        self, relative: str, content: str
-    ) -> list[tuple[int, int]]:
-        spans: list[tuple[int, int]] = []
-        for contract in self.guarded_shared_regions.get(relative, []):
-            region = _named_source_region(content, str(contract.get("symbol", "")))
-            if region is not None and str(region.get("kind")) == str(contract.get("kind")):
-                spans.append((int(region["start"]), int(region["end"])))
-        return spans
-
-    def _guarded_contract_for_span(
-        self, relative: str, content: str, start: int, end: int
-    ) -> dict[str, Any] | None:
-        for contract in self.guarded_shared_regions.get(relative, []):
-            region = _named_source_region(content, str(contract.get("symbol", "")))
-            if (
-                region is not None
-                and str(region.get("kind")) == str(contract.get("kind"))
-                and int(region["start"]) <= start
-                and end <= int(region["end"])
-            ):
-                return contract
-        return None
-
-    def _guarded_projection(
-        self, relative: str, content: str
-    ) -> tuple[str | None, str | None]:
-        contracts = self.guarded_shared_regions.get(relative, [])
-        regions: list[tuple[int, int, str, str]] = []
-        for contract in contracts:
-            symbol = str(contract.get("symbol", ""))
-            kind = str(contract.get("kind", ""))
-            region = _named_source_region(content, symbol)
-            if region is None or str(region.get("kind")) != kind:
-                return None, (
-                    f"Guarded target-route region {symbol!r} cannot be resolved "
-                    f"uniquely in {relative}."
-                )
-            regions.append(
-                (int(region["start"]), int(region["end"]), symbol, kind)
-            )
-        regions.sort()
-        if any(left[1] > right[0] for left, right in zip(regions, regions[1:])):
-            return None, f"Guarded target-route regions overlap in {relative}."
-        parts: list[str] = []
-        cursor = 0
-        for start, end, symbol, kind in regions:
-            parts.append(content[cursor:start])
-            parts.append(f"\0HARNESS_GUARDED_REGION:{kind}:{symbol}\0")
-            cursor = end
-        parts.append(content[cursor:])
-        return "".join(parts), None
-
-    def validate_guarded_shared_file(
-        self, relative: str, *, before: str, after: str
-    ) -> str | None:
-        """Require every byte outside approved shared-file regions to stay fixed."""
-
-        if relative not in self.guarded_shared_regions:
-            return f"No guarded target-route region is authorized for {relative}."
-        contracts = self.guarded_shared_regions.get(relative, [])
-        css_contracts = [
-            item
-            for item in contracts
-            if item.get("mutation_mode") == "target_scoped_css"
-        ]
-        if css_contracts:
-            if len(css_contracts) != len(contracts):
-                return f"Shared stylesheet contracts are ambiguous for {relative}."
-            anchors = sorted(
-                {
-                    str(anchor)
-                    for item in css_contracts
-                    for anchor in item.get("allowed_anchors") or []
-                }
-            )
-            return _validate_target_scoped_css(before, after, anchors)
-        before_projection, before_error = self._guarded_projection(relative, before)
-        if before_error:
-            return before_error
-        after_projection, after_error = self._guarded_projection(relative, after)
-        if after_error:
-            return after_error
-        if before_projection != after_projection:
-            return (
-                f"Committed Edit changed bytes outside the guarded target-route "
-                f"region in {relative}."
-            )
-        for contract in self.guarded_shared_regions.get(relative, []):
-            if contract.get("mutation_mode") != "additive_target_members":
-                continue
-            before_region = _named_source_region(
-                before, str(contract.get("symbol", ""))
-            )
-            after_region = _named_source_region(
-                after, str(contract.get("symbol", ""))
-            )
-            if before_region is None or after_region is None:
-                return (
-                    "Additive shared-state region cannot be resolved after the Edit: "
-                    + str(contract.get("symbol", ""))
-                )
-            error = _validate_additive_target_members(
-                before[int(before_region["start"]) : int(before_region["end"])],
-                after[int(after_region["start"]) : int(after_region["end"])],
-                contract.get("allowed_terms") or [],
-            )
-            if error:
-                return error
-        return None
-
-    def observe_result(
-        self,
-        tool: str,
-        tool_input: dict[str, Any],
-        *,
-        ok: bool,
-        output: Any,
-    ) -> None:
-        """Advance the controller only from an observed tool result.
-
-        Permission is a precondition, not evidence that the action happened.
-        Reads, mutations, and validations therefore update state only here.
-        """
-        normalized = tool.lower()
-        resolved_path = self._path(tool_input)
-        if normalized in {"read", "read_file"} and ok and resolved_path is not None:
-            _absolute, relative = resolved_path
-            if relative.startswith("frontend/"):
-                self.observed_paths.add(relative)
-                self.tool_observed_paths.add(relative)
-                self._record(
-                    decision="observe",
-                    tool=tool,
-                    path=relative,
-                    reason="source inspection completed before mutation",
-                )
-                self._persist_state()
+        if not isinstance(raw, str):
             return
-
-        mutation_tools = {"write", "write_file", "edit", "apply_patch", "multiedit"}
-        if normalized in mutation_tools and resolved_path is not None:
-            _absolute, relative = resolved_path
-            if ok and relative.startswith("frontend/"):
-                self.touched_paths.add(relative)
-                self.mutation_revision += 1
-                self._record(
-                    decision="applied",
-                    tool=tool,
-                    path=relative,
-                    reason="authorized mutation completed",
-                )
-                self._persist_state()
-            elif not ok:
-                self._record(
-                    decision="failed",
-                    tool=tool,
-                    path=relative,
-                    reason=str(output)[:500] or "mutation failed",
-                )
+        relative = raw.replace("\\", "/")
+        if relative.startswith("/frontend/"):
+            relative = relative.lstrip("/")
+        if not relative.startswith("frontend/"):
             return
-
-        if normalized in {"bash", "run_command"}:
-            command = str(tool_input.get("command", ""))
-            if self._is_validation_command(command):
-                self.observe_validation(ok=ok, output=output, tool=tool)
-
-    def observe_validation(self, *, ok: bool, output: Any, tool: str) -> None:
-        """Record a real harness or agent validation checkpoint."""
-        self.validation_attempt_revision = self.mutation_revision
-        self.validation_last_ok = ok
-        if ok:
-            self.validation_success_revision = self.mutation_revision
-        self._record(
-            decision="validation_pass" if ok else "validation_fail",
-            tool=tool,
-            path=None,
-            reason=("post-mutation validation passed" if ok else str(output)[:500]),
-        )
+        self.observed_paths.add(relative)
+        if _tool.lower() in {"write", "write_file", "edit", "apply_patch", "multiedit"}:
+            self.touched_paths.add(relative)
+            self.mutation_revision += 1
         self._persist_state()
 
-    def check(self, tool: str, tool_input: dict[str, Any]) -> str | None:
-        """Return a denial message, or ``None`` when the mutation is admissible."""
-        normalized = tool.lower()
-        if normalized in {"bash", "run_command"}:
-            command = str(tool_input.get("command", ""))
-            validation_command = self._is_validation_command(command)
-            if _MUTATING_SHELL_RE.search(command):
-                return self._deny(
-                    tool,
-                    None,
-                    "Minimal-path mode routes source changes through mutation tools; "
-                    "filesystem/package mutations through Bash are denied.",
-                )
-            if _UNSCOPED_EXECUTION_RE.search(command) and not validation_command:
-                return self._deny(
-                    tool,
-                    None,
-                    "Minimal-path mode denies arbitrary interpreter or script execution; "
-                    "use read-only diagnosis, an explicit validation command, or mutation tools.",
-                )
-            if (
-                _PACKAGE_MANAGER_RE.search(command)
-                and not validation_command
-                and not self._is_readonly_package_command(command)
-            ):
-                return self._deny(
-                    tool,
-                    None,
-                    "Minimal-path mode allows package managers only for read-only inspection "
-                    "or explicit build/test/lint/check validation.",
-                )
-            if (
-                self._is_commit_command(command)
-                and self.mutation_revision > 0
-                and (
-                    self.mutation_revision > self.validation_success_revision
-                    or self.validation_last_ok is not True
-                )
-            ):
-                return self._deny(
-                    tool,
-                    None,
-                    "A successful validation after the latest source mutation is required "
-                    "before commit.",
-                )
-            return None
+    def observe_validation(self, *, ok: bool, output: Any, tool: str) -> None:
+        self.validation_attempt_revision = self.mutation_revision
+        self.validation_last_ok = bool(ok)
+        if ok:
+            self.validation_success_revision = self.mutation_revision
+        self._persist_state()
 
-        mutation_tools = {"write", "write_file", "edit", "apply_patch", "multiedit"}
-        if normalized not in mutation_tools:
-            return None
-        resolved_path = self._path(tool_input)
-        if resolved_path is None:
-            return None
-        absolute, relative = resolved_path
-
-        owned_artifacts = {
-            f".harness/{plan_name(self.round_num)}",
-            f".harness/edit_scope_round_{self.round_num}.json",
-            f".harness/edit_context_round_{self.round_num}.json",
-            f".harness/{ledger_name(self.round_num)}",
-            f".harness/{state_name(self.round_num)}",
-        }
-        if relative in owned_artifacts:
-            return self._deny(
-                tool,
-                relative,
-                "This scope artifact is harness-owned and cannot be changed by the model.",
-            )
-        if not relative.startswith("frontend/"):
-            return None
-        if absolute.suffix.lower() not in CODE_EXTENSIONS:
-            return None
-
-        cross_route_shared = relative in self.cross_route_shared_paths
-        guarded_shared = relative in self.guarded_shared_regions
-        if cross_route_shared and not guarded_shared:
-            owners = (
-                (self.plan.get("route_scope") or {})
-                .get("path_owners", {})
-                .get(relative, [])
-            )
-            return self._deny(
-                tool,
-                relative,
-                "This source is shared with non-target routes and has no mechanically "
-                "identifiable target-route region for this Edit: "
-                + ", ".join(str(item) for item in owners),
-            )
-        if relative in self.off_target_paths:
-            return self._deny(
-                tool,
-                relative,
-                "This source belongs outside the target page route and is protected by the "
-                "multi-page Edit scope.",
-            )
-
-        if normalized in {"write", "write_file"} and absolute.exists():
-            return self._deny(
-                tool,
-                relative,
-                "Existing frontend source cannot be overwritten in minimal-path mode; "
-                "use one exact patch against the harness-selected source location.",
-            )
-
-        predecessor = self._dependency_predecessor(relative)
-        if relative in self.initial_paths or relative in self.touched_paths:
-            tier = "local"
-            expansion_reason = None
-        elif relative in (self.local_paths | self.dependency_paths) and predecessor:
-            tier = "dependency"
-            expansion_reason = "recorded_dependency_edge"
-            if self.validation_attempt_revision < self.mutation_revision:
-                return self._deny(
-                    tool,
-                    relative,
-                    "A post-mutation validation attempt is required before the harness "
-                    f"widens from {predecessor} to its dependency {relative}.",
-                )
-        elif relative in self.local_paths:
-            return self._deny(
-                tool,
-                relative,
-                "This candidate is not yet unlocked. Start from the initial path, then "
-                "follow a recorded dependency edge after a validation attempt: "
-                + ", ".join(sorted(self.initial_paths)),
-            )
-        elif not absolute.exists():
-            return self._deny(
-                tool,
-                relative,
-                "Minimal-path edit/repair does not admit an unplanned new source file. "
-                "Patch the selected existing source or follow a recorded dependency edge.",
-            )
-        else:
-            candidates = sorted(self.local_paths | self.dependency_paths)
-            return self._deny(
-                tool,
-                relative,
-                "Source path is outside the harness change cone. Start with: "
-                + (
-                    ", ".join(candidates)
-                    if candidates
-                    else "no mechanically supported path"
-                ),
-            )
-
-        if absolute.exists() and relative not in self.observed_paths:
-            return self._deny(
-                tool,
-                relative,
-                "Inspect the exact harness-selected source file before mutating it: "
-                + relative,
-            )
-
-        if (
-            relative not in self.touched_paths
-            and len(self.touched_paths) >= self.max_touched_files
-        ):
-            return self._deny(
-                tool,
-                relative,
-                f"Minimal-path touched-file budget is {self.max_touched_files}; "
-                "finish within the already authorized files.",
-            )
-
-        pairs = self._patch_pairs(tool, tool_input)
-        if (
-            pairs
-            and absolute.exists()
-            and relative in self.preloaded_regions
-            and relative not in self.tool_observed_paths
-        ):
-            snippets = self.preloaded_regions[relative]
-            unseen = [old for old, _new in pairs if not old or not any(old in snippet for snippet in snippets)]
-            if unseen:
-                return self._deny(
-                    tool,
-                    relative,
-                    "Exact patch text falls outside the Harness-preloaded source window. "
-                    "Read only the focused missing line range before widening the patch.",
-                )
-        patch_lines = sum(
-            max(1, effective_patch_line_count(old, new)) for old, new in pairs
-        )
-        if pairs and patch_lines > self.max_patch_lines:
-            return self._deny(
-                tool,
-                relative,
-                f"Patch exceeds the {self.max_patch_lines}-line patch-line budget; "
-                "split it at the target source boundary.",
-                patch_lines=patch_lines,
-            )
-        if pairs and absolute.is_file():
-            content = absolute.read_text(encoding="utf-8", errors="replace")
-            source_lines = content.splitlines(keepends=True)
-            coordinate_start = tool_input.get("_harness_start_line")
-            coordinate_end = tool_input.get("_harness_end_line")
-            coordinate_sha = str(tool_input.get("_harness_source_sha256") or "")
-            css_guarded = any(
-                item.get("mutation_mode") == "target_scoped_css"
-                for item in self.guarded_shared_regions.get(relative, [])
-            )
-            css_candidate = content
-            for old, new in pairs:
-                current_content = css_candidate if css_guarded else content
-                coordinated_span: tuple[int, int] | None = None
-                if (
-                    len(pairs) == 1
-                    and isinstance(coordinate_start, int)
-                    and not isinstance(coordinate_start, bool)
-                    and isinstance(coordinate_end, int)
-                    and not isinstance(coordinate_end, bool)
-                    and 1 <= coordinate_start <= coordinate_end <= len(source_lines)
-                    and coordinate_sha
-                    == hashlib.sha256(content.encode("utf-8")).hexdigest()
-                ):
-                    span_start = sum(
-                        len(line) for line in source_lines[: coordinate_start - 1]
-                    )
-                    span_end = sum(len(line) for line in source_lines[:coordinate_end])
-                    if content[span_start:span_end] == old:
-                        coordinated_span = (span_start, span_end)
-                if not old or (
-                    coordinated_span is None and current_content.count(old) != 1
-                ):
-                    return self._deny(
-                        tool,
-                        relative,
-                        "Minimal-path exact patch must identify one unique source occurrence.",
-                        patch_lines=patch_lines,
-                    )
-                if guarded_shared:
-                    if css_guarded:
-                        next_content = current_content.replace(old, new, 1)
-                        css_error = self.validate_guarded_shared_file(
-                            relative,
-                            before=current_content,
-                            after=next_content,
-                        )
-                        if css_error:
-                            return self._deny(
-                                tool,
-                                relative,
-                                css_error,
-                                patch_lines=patch_lines,
-                            )
-                        css_candidate = next_content
-                    else:
-                        if coordinated_span is not None:
-                            start, end = coordinated_span
-                        else:
-                            start = content.index(old)
-                            end = start + len(old)
-                        contract = self._guarded_contract_for_span(
-                            relative, content, start, end
-                        )
-                        if contract is None:
-                            return self._deny(
-                                tool,
-                                relative,
-                                "Shared source patches must stay wholly inside one harness-owned "
-                                "guarded target-route region.",
-                                patch_lines=patch_lines,
-                            )
-                        if contract.get("mutation_mode") == "additive_target_members":
-                            additive_error = _validate_additive_target_members(
-                                old, new, contract.get("allowed_terms") or []
-                            )
-                            if additive_error:
-                                return self._deny(
-                                    tool,
-                                    relative,
-                                    additive_error,
-                                    patch_lines=patch_lines,
-                                )
-
-        self._record(
-            decision="allow",
-            tool=tool,
-            path=relative,
-            reason="mutation stays inside the smallest mechanically supported cone",
-            scope_tier="guarded_shared_region" if guarded_shared else tier,
-            patch_lines=patch_lines,
-            expansion_reason=expansion_reason,
-        )
+    def validate_guarded_shared_file(self, _relative: str, *, before: str, after: str) -> str | None:
         return None
+
+
+# Backwards import name is intentionally removed from the implementation.

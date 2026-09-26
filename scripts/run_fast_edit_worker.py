@@ -83,35 +83,44 @@ def run(args):
             'await (typeof original === "function" ? original(env) : original); '
             'return {...base, cacheDir:'+json.dumps(str(output/'vite-cache'))+'}; };\n')
         url = f'http://127.0.0.1:{args.port}'
-        # Never attach this job to an unrelated preview occupying its port.
-        import socket
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1', args.port))
-        with (output/'preview.log').open('a') as log:
-            preview = subprocess.Popen(['node',str(vite),'--host','127.0.0.1','--port',str(args.port),
-                '--strictPort','--config',str(config)], cwd=frontend, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        deadline = time.time()+20
-        local_http=urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        while True:
-            if cancelled or os.getppid()!=parent:
-                raise InterruptedError('batch cancelled or supervisor lost')
-            if preview.poll() is not None or time.time()>deadline:
-                raise RuntimeError('preview startup failed; see preview.log')
-            try:
-                request=urllib.request.Request(url,headers={'Accept':'text/html'})
-                with local_http.open(request, timeout=.5) as response:
-                    if response.status==200:
-                        break
-            except OSError:
-                time.sleep(.1)
+        if not getattr(args,'reverse_validate_root',None):
+            # Never attach this job to an unrelated preview occupying its port.
+            import socket
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', args.port))
+            with (output/'preview.log').open('a') as log:
+                preview = subprocess.Popen(['node',str(vite),'--host','127.0.0.1','--port',str(args.port),
+                    '--strictPort','--config',str(config)], cwd=frontend, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            deadline = time.time()+20
+            local_http=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            while True:
+                if cancelled or os.getppid()!=parent:
+                    raise InterruptedError('batch cancelled or supervisor lost')
+                if preview.poll() is not None or time.time()>deadline:
+                    raise RuntimeError('preview startup failed; see preview.log')
+                try:
+                    request=urllib.request.Request(url,headers={'Accept':'text/html'})
+                    with local_http.open(request, timeout=.5) as response:
+                        if response.status==200:
+                            break
+                except OSError:
+                    time.sleep(.1)
         command = [sys.executable,'-u',str(ROOT/'scripts/run_g2_compound_edit.py'),
             '--case',str(args.case.resolve()),'--output',str(output),'--fast-gt','--unattended',
             '--provider-profile',args.provider_profile,'--model',args.model,
-            '--acceptance','lenient','--browser-url',url,'--subtask-timeout',str(int(args.subtask_timeout))]
+            '--acceptance','lenient','--case-timeout',str(int(args.case_timeout))]
+        if getattr(args,'reverse_validate_root',None):
+            command.extend(['--reverse-validate-root',str(args.reverse_validate_root),
+                '--reverse-node',args.reverse_node,'--reverse-playwright',args.reverse_playwright,
+                '--reverse-chromium',args.reverse_chromium,
+                '--reverse-extra-node-modules',str(args.dependencies.resolve())])
+        else:
+            command.extend(['--browser-url',url])
         with (output/'worker.log').open('a') as log:
             worker = subprocess.Popen(command, stdout=log,stderr=subprocess.STDOUT,start_new_session=True,
-                env={**os.environ,'PYTHONPATH':str(ROOT)})
-        deadline = time.time()+45
+                env={**os.environ,'PYTHONPATH':str(ROOT),
+                    'OPENAI_STREAM_LOG':str(output/'provider_stream.jsonl')})
+        deadline = time.time()+args.case_timeout
         while worker.poll() is None:
             if cancelled or os.getppid()!=parent:
                 raise InterruptedError('batch cancelled or supervisor lost')
@@ -122,7 +131,7 @@ def run(args):
                 'subtask_index':state.get('subtask_index'),'deadline':active_deadline})
             if time.time()>=active_deadline:
                 raise TimeoutError(f"process deadline exceeded at subtask {state.get('subtask_index')}")
-            if preview.poll() is not None:
+            if preview is not None and preview.poll() is not None:
                 raise RuntimeError('preview process exited')
             time.sleep(.2)
         if not (output/'result.json').exists():
@@ -154,10 +163,14 @@ if __name__=='__main__':
     parser.add_argument('--port',type=int,required=True)
     parser.add_argument('--model',default='qwen3.7-max')
     parser.add_argument('--provider-profile',default='qwen',choices=['qwen','experimental-luna'])
-    parser.add_argument('--subtask-timeout',type=float,default=180)
+    parser.add_argument('--case-timeout',type=float,default=2400)
+    parser.add_argument('--reverse-validate-root',type=Path)
+    parser.add_argument('--reverse-node',default='node')
+    parser.add_argument('--reverse-playwright')
+    parser.add_argument('--reverse-chromium')
     args=parser.parse_args()
-    if not 0<args.subtask_timeout<=180:
-        parser.error('subtask timeout must be in (0,180]')
+    if not 0<args.case_timeout<=2400:
+        parser.error('case timeout must be in (0,2400]')
     result=run(args)
     print(json.dumps({k:v for k,v in result.items() if k not in {'steps','response','reference'}}),flush=True)
     sys.exit(0 if result['status']=='ok' else 2)

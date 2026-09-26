@@ -382,6 +382,8 @@ async def _execute_typed_assertion(
         )
     elif action == "assert_value":
         actual = await locator.input_value()
+        if actual == 'on' and str(expected).lower() in {'true','false'} and await locator.get_attribute('type') == 'checkbox':
+            raise ActionContractError('checkbox checked state is not its value; use :checked or assert_property(checked)')
         if "snapshot" in step:
             snapshot_name = str(step["snapshot"])
             if snapshot_name not in attribute_snapshots:
@@ -902,6 +904,7 @@ async def collect_browser_evidence(
     screenshot_full_page: bool = False,
     baseline_console_errors: list[str] | None = None,
     lenient_console: bool = False,
+    capture_observations: bool = False,
 ) -> dict[str, Any]:
     from playwright.async_api import async_playwright
     from src.utils.playwright_browser import launch_chromium
@@ -1294,8 +1297,18 @@ async def collect_browser_evidence(
                     step.get("test_precondition") and not step.get("ok")
                     for step in item["steps"]
                 )
-                if any(not step.get('ok') for step in item['steps']):
-                    item['failure_dom'] = (await page.locator('body').inner_html())[:12000]
+                if capture_observations or any(not step.get('ok') for step in item['steps']):
+                    item['failure_dom'] = (await page.locator('body').inner_html())[:6000]
+                    # Small live control inventory also covers widgets near the end of a long page.
+                    item['failure_controls'] = await page.evaluate('''() => {
+                      const rows = [...document.querySelectorAll('button,input,select,textarea,a[href],[role="button"]')]
+                        .filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden')
+                        .map(e => ({tag:e.tagName.toLowerCase(),id:e.id,
+                          type:e.getAttribute('type'),name:e.getAttribute('aria-label'),
+                          placeholder:e.getAttribute('placeholder'),text:(e.innerText||'').trim().slice(0,60)}));
+                      const unique=[...new Map(rows.map(x=>[JSON.stringify(x),x])).values()];
+                      return unique.length<=40 ? unique : [...unique.slice(0,10),...unique.slice(-30)];
+                    }''')
                 check_console_errors = [error for error in console_errors[console_error_start:]
                                         if error not in (baseline_console_errors or [])]
                 if console_warnings[console_warning_start:]:
@@ -1306,7 +1319,11 @@ async def collect_browser_evidence(
                     item["console_errors"] = check_console_errors
                     overlay = page.locator('vite-error-overlay')
                     if await overlay.count():
-                        item['build_error'] = (await overlay.inner_text())[:8000]
+                        item['build_error'] = (await overlay.evaluate(r'''e => {
+                          const root=e.shadowRoot || e;
+                          return [...root.querySelectorAll('.message,.frame')].map(n=>n.textContent).join('\n')
+                            || root.textContent || e.innerText;
+                        }'''))[:8000]
                 contrast_issues = await _severe_contrast_issues(
                     page, visual_sanity_selectors or [], route
                 )

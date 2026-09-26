@@ -472,7 +472,7 @@ def test_atomic_plan_converts_hash_route_filter_restore_to_action_flow():
     ]
 
 
-def test_atomic_plan_keeps_each_reload_check_self_contained():
+def test_atomic_plan_compacts_reload_checks_into_one_generator_hint():
     payload = _atomic_plan()
     payload["checks"] = [
         {
@@ -496,8 +496,8 @@ def test_atomic_plan_keeps_each_reload_check_self_contained():
 
     normalized = normalize_atomic_edit_plan_payload(payload)
 
-    assert normalized["checks"][1]["category"] == "persistence"
-    assert normalized["checks"][1]["actions"] == [
+    assert len(normalized["checks"]) == 1
+    assert normalized["checks"][0]["actions"][-3:] == [
         {"action": "click", "selector": "button"},
         {"action": "reload"},
         {"action": "assert_visible", "selector": "[data-testid='download-history-item']"},
@@ -538,8 +538,10 @@ def test_navigation_presence_check_does_not_erase_later_filter_setup():
 
     normalized = normalize_atomic_edit_plan_payload(payload)
 
-    assert normalized["checks"][1]["actions"][1]["action"] == "select_option"
-    assert normalized["checks"][1]["actions"][2] == {
+    assert len(normalized["checks"]) == 1
+    actions = normalized["checks"][0]["actions"]
+    select_index = next(index for index, action in enumerate(actions) if action["action"] == "select_option")
+    assert actions[select_index + 1] == {
         "action": "assert_hash",
         "value": "#type=Timepiece",
     }
@@ -758,9 +760,9 @@ async def test_planner_corrects_invalid_action_contract_once(tmp_path, monkeypat
     assert len(list(file_comm.dir.glob('rejected_atomic_plan_*.json')))==1
 
 
-def test_split_completion_flow_is_not_limited_to_ten_segments(tmp_path):
+def test_repeated_completion_checks_compact_to_one_generator_hint(tmp_path):
     payload = _atomic_plan()
     original = payload['checks'][0]
     payload['checks'] = [{**original, 'id': f'UI-FLOW-{i}'} for i in range(12)]
     path = write_atomic_edit_plan(tmp_path, payload)
-    assert len(json.loads(path.read_text())['checks']) == 12
+    assert len(json.loads(path.read_text())['checks']) == 1

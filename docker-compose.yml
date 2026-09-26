@@ -12,29 +12,33 @@
 
 services:
   harness:
-    image: web-coding-agent:latest
+    image: webcoding-edit-harness:20260926
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: harness/Dockerfile
+      network: host
 
     # Lifecycle / namespace knobs.
     init: true                 # PID 1 reaper; reaps zombie chromium / vite children
-    ipc: host                  # Chromium recommends host IPC to avoid OOM crashes
+    user: ${HARNESS_UID:-1000}:${HARNESS_GID:-1000}
+    network_mode: host         # physical Docker daemon has no usable docker0 bridge
+    shm_size: 2gb
 
     # OS-level isolation.
     read_only: true            # root FS is immutable; only tmpfs + bind mounts are writable
     tmpfs:
-      - /tmp:exec,size=512m
-      - /home/pwuser/.claude:size=256m  # claude-agent-sdk session jsonl
+      - /tmp:exec,size=2g
+      - /home/pwuser/.cache:size=512m
+      - /home/pwuser/.claude:size=256m
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
 
     # Resource limits (single-host compose accepts these top-level fields).
-    pids_limit: 512
-    mem_limit: 4g
-    cpus: 2.0
+    pids_limit: 2048
+    mem_limit: ${HARNESS_MEMORY_LIMIT:-16g}
+    cpus: ${HARNESS_CPUS:-8.0}
 
     # List form (`- VAR`) forwards a key only when it is set on the host,
     # so unset host env → key absent in container → src/config.py's
@@ -54,6 +58,9 @@ services:
       - OPENAI_WIRE_API
       - HTTP_PROXY
       - HTTPS_PROXY
+      - NO_PROXY
+      - HARNESS_UID
+      - HARNESS_GID
       # Endpoint-shape switch — controls anthropic vs openai-compatible payload.
       - EVALUATOR_VISION_ENDPOINT_TYPE
       # Model overrides.
@@ -72,12 +79,11 @@ services:
     # it after `docker compose run --rm` exits. HARNESS_WORKDIR lets
     # callers swap the host directory per prompt (unset → ./workdir).
     volumes:
-      - ${HARNESS_WORKDIR:-./workdir}:/app/workdir:rw
+      - ${HARNESS_DATA_ROOT:-./workdir}:/data:rw
 
-    # Dev server binds to 127.0.0.1 inside the container
-    # (src/orchestration/runtime.py::HOST); map to host loopback only.
-    ports:
-      - "127.0.0.1:5173:5173"
+    secrets:
+      - njulink_api_key
 
-    # No `command:` — caller appends positional prompt + flags to
-    # `docker compose run harness ...`; ENTRYPOINT from the Dockerfile.
+secrets:
+  njulink_api_key:
+    file: ${NJULINK_KEY_FILE:-/dev/null}

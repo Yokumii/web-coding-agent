@@ -9,7 +9,6 @@ from typing import Any
 
 from src.agents.openai_runner import OpenAIHTTPClient
 from src.config import HarnessConfig
-from src.orchestration.edit_skills import acceptance_recipe
 from src.orchestration.frozen_compound_edit import (
     normalize_frozen_compound_plan,
     write_frozen_compound_plan,
@@ -121,11 +120,11 @@ changes.
 
 
 def _planner_prompt(
-    *, frozen_subtasks: list[dict[str, str]], source_ui_contract: dict[str, Any], skill_rules: dict | None = None
+    *, frozen_subtasks: list[dict[str, str]], source_ui_contract: dict[str, Any]
 ) -> str:
     required_ids = [str(item["id"]) for item in frozen_subtasks]
     return (
-        f"Return exactly {len(frozen_subtasks)} subtask plans. Required IDs in order: "
+        f"Return exactly {len(frozen_subtasks)} subtask plans as one json object. Required IDs in order: "
         + json.dumps(required_ids, ensure_ascii=False)
         + ". A syntactically valid response that omits any ID is invalid. Keep each continuous "
         "check focused, but do not stop before every required ID is present.\n\n"
@@ -133,8 +132,6 @@ def _planner_prompt(
         + json.dumps(frozen_subtasks, ensure_ascii=False, indent=2)
         + "\n\nAccepted source UI contract:\n"
         + json.dumps(source_ui_contract, ensure_ascii=False, separators=(",", ":"))
-        + ("\n\nSelected Skill acceptance recipes (ground one short core causal flow):\n"
-           + json.dumps(skill_rules, ensure_ascii=False) if skill_rules else "")
         + "\n\nPrefer visual_evidence=not_required when typed assertions establish every requirement. Otherwise declare only the unresolved explicit visual requirement for targeted review. Return the complete plan now."
     )
 
@@ -155,8 +152,6 @@ async def plan_frozen_compound_edit(
     prompt = _planner_prompt(
         frozen_subtasks=frozen_subtasks,
         source_ui_contract=source_ui_contract,
-        skill_rules={item["task_type"]: acceptance_recipe(item["task_type"])
-                     for item in frozen_subtasks} if config.edit_skills_enabled else None,
     )
     request_sha = hashlib.sha256((COMPOUND_EDIT_PLANNER_SYSTEM_PROMPT + "\n" + prompt).encode()).hexdigest()
     started = time.monotonic()
@@ -165,6 +160,8 @@ async def plan_frozen_compound_edit(
         {"role": "user", "content": prompt},
     ]
     request_usages = []
+    required_ids = [str(item["id"]) for item in frozen_subtasks]
+    accumulated_subtasks: dict[str, dict[str, Any]] = {}
     initial_visibility = {
         (page["route"], control["selector"]): control.get("initially_visible")
         for page in source_ui_contract.get("pages", [])
@@ -186,7 +183,9 @@ async def plan_frozen_compound_edit(
                 raise ValueError("saved compound planner response belongs to another case/source/model")
         else:
             response = await client.complete(model=config.planner_model, messages=messages,
-                temperature=0, max_tokens=12000, response_format={"type": "json_object"})
+                temperature=0, max_tokens=12000,
+                reasoning_effort="low" if config.openai_wire_api == "responses" else None,
+                response_format={"type": "json_object"})
             saved = {
                 "case_id": case_id, "source_code_sha256": source_code_sha256,
                 "planner_model": config.planner_model, "request_sha256": request_sha,
@@ -198,9 +197,27 @@ async def plan_frozen_compound_edit(
         request_usages.append(saved.get("usage") or {})
         try:
             payload = extract_json_object(text)
+            returned_subtasks = payload.get("subtasks") or []
+            if isinstance(returned_subtasks, list):
+                for item in returned_subtasks:
+                    if isinstance(item, dict) and str(item.get("id") or "") in required_ids:
+                        accumulated_subtasks[str(item["id"])] = item
+            payload["subtasks"] = [
+                accumulated_subtasks[item_id]
+                for item_id in required_ids
+                if item_id in accumulated_subtasks
+            ]
             if config.edit_skills_enabled:
                 for item in payload.get("subtasks") or []:
-                    checks = (item.get("atomic_plan") or {}).get("checks") or []
+                    atomic_plan = item.get("atomic_plan") or {}
+                    visual = atomic_plan.get("visual_evidence")
+                    if visual not in {"required", "conditional", "not_required"}:
+                        if isinstance(visual, str) and visual.strip():
+                            atomic_plan["visual_evidence_reason"] = visual.strip()
+                            atomic_plan["visual_evidence"] = "conditional"
+                        else:
+                            atomic_plan["visual_evidence"] = "not_required"
+                    checks = atomic_plan.get("checks") or []
                     if len(checks) != 1:
                         raise ValueError("Each Skill subtask requires one continuous browser check")
                     actions = checks[0].get("actions") or []
@@ -233,8 +250,17 @@ async def plan_frozen_compound_edit(
                 json.dumps({"attempt": attempt + 1, "error": feedback, "response": response_path.name}, ensure_ascii=False, indent=2) + "\n")
             if attempt == 1:
                 raise
+            missing_ids = [item_id for item_id in required_ids if item_id not in accumulated_subtasks]
+            missing_guidance = (
+                " Return only the missing subtask plans for IDs in this exact order: "
+                + json.dumps(missing_ids, ensure_ascii=False)
+                + ". Existing returned plans are retained and will be merged locally."
+                if missing_ids
+                else " Return the complete corrected bundle."
+            )
             messages += [{"role": "assistant", "content": text}, {"role": "user", "content":
-                "Correct this same acceptance plan using the exact evidence below. Return the complete compact JSON bundle. Do not echo frozen instructions or restart the task. Fix all occurrences of the same defect.\n" + feedback}]
+                "Correct this same acceptance plan using the exact evidence below. Do not echo frozen instructions or restart the task. Fix all occurrences of the same defect."
+                + missing_guidance + "\n" + feedback}]
     usage = {
         "input_tokens": sum(int(item.get("input_tokens", item.get("prompt_tokens", 0)) or 0) for item in request_usages),
         "output_tokens": sum(int(item.get("output_tokens", item.get("completion_tokens", 0)) or 0) for item in request_usages),

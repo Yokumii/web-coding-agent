@@ -57,6 +57,10 @@ class BatchTask:
     sequence_metadata: dict[str, Any] | None = None
 
 
+class _CaseTimeoutError(TimeoutError):
+    pass
+
+
 def _slugify(value: str, max_len: int = 48) -> str:
     value = re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", value.strip().lower()).strip("-.")
     return value[:max_len] or "task"
@@ -525,6 +529,7 @@ async def run_batch(
                             )
                             prior_checks.append(checks)
                             step_records.append(step_record)
+                            record["steps"] = step_records
                             source_frontend = step_workdir / "frontend"
                             source_evaluation = _latest_grade_path(step_workdir)
                         record["steps"] = step_records
@@ -548,7 +553,13 @@ async def run_batch(
                         hidden_oracle_checks=list(task.hidden_oracle_checks),
                     )
 
-                await asyncio.wait_for(execute_case(), timeout=timeout_seconds)
+                case_task = asyncio.create_task(execute_case())
+                try:
+                    await asyncio.wait_for(case_task, timeout=timeout_seconds)
+                except asyncio.TimeoutError as exc:
+                    if case_task.cancelled():
+                        raise _CaseTimeoutError from exc
+                    raise
                 state = _read_state(workdir)
                 if task.edits:
                     steps = record.get("steps") or []
@@ -578,7 +589,7 @@ async def run_batch(
                         "harness returned without a completed verdict; rerun with "
                         "--resume-harness to continue its checkpoint"
                     )
-            except asyncio.TimeoutError:
+            except _CaseTimeoutError:
                 record.update({"status": "timeout", "error": f"case exceeded {timeout_seconds:g}s"})
             except Exception as exc:
                 record.update({"status": "error", "error": f"{type(exc).__name__}: {exc}"})

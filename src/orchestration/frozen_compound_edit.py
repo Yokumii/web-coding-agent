@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -70,6 +71,98 @@ def canonical_plan_sha256(payload: dict[str, Any]) -> str:
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def plan_from_atomic_contracts(
+    *,
+    case_id: str,
+    source_code_sha256: str,
+    frozen_subtasks: list[dict[str, str]],
+    source_ui_contract: dict[str, Any],
+    source_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Bind dataset-owned atomic Edits without asking an LLM to re-plan them."""
+    observed_routes = [
+        str(page.get("route") or "").strip()
+        for page in source_ui_contract.get("pages") or []
+        if isinstance(page, dict) and str(page.get("route") or "").strip()
+    ]
+    inferred_routes: list[str] = []
+    for raw_path in source_paths or []:
+        path = Path(str(raw_path))
+        stem = re.sub(r"(?:page|view|screen)$", "", path.stem, flags=re.I)
+        stem = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", stem).lower()
+        if path.suffix.lower() in {".html", ".htm"}:
+            inferred_routes.append("/" if stem in {"index", "home"} else f"/{stem}")
+        elif path.suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".vue"} and re.search(
+            r"(?:page|view|screen)$", path.stem, re.I
+        ):
+            inferred_routes.append("/" if stem in {"index", "home"} else f"/{stem}")
+    routes = list(dict.fromkeys([*observed_routes, *inferred_routes])) or ["/"]
+
+    def target_route(instruction: str) -> str:
+        lowered = instruction.lower()
+        matches: list[tuple[int, int, str]] = []
+        for route in routes:
+            route_terms = [
+                term
+                for term in re.split(r"[^a-z0-9]+", urlsplit(route).path.lower())
+                if term and term not in {"html", "index"}
+            ]
+            if route_terms and all(term in lowered for term in route_terms):
+                phrase = " ".join(route_terms)
+                explicit_page = int(
+                    any(
+                        marker in lowered
+                        for marker in (
+                            f"{phrase} page",
+                            f"{phrase} route",
+                            f"{phrase} screen",
+                            f"{phrase} view",
+                        )
+                    )
+                )
+                matches.append((explicit_page, len(route_terms), route))
+        if matches:
+            return max(matches, key=lambda item: (item[0], item[1], -routes.index(item[2])))[2]
+        return "/" if "/" in routes else routes[0]
+
+    raw = {
+        "subtasks": [
+            {
+                "id": item["id"],
+                "target_routes": [route := target_route(item["instruction"])],
+                "atomic_plan": {
+                    "goal": item["instruction"],
+                    "source_anchors": [],
+                    "visual_evidence": "not_required",
+                    "visual_evidence_reason": (
+                        "Production acceptance is owned by reverse/validate."
+                    ),
+                    "checks": [
+                        {
+                            "id": f"{item['id']}-runtime",
+                            "task": "Keep the edited page free of fatal runtime errors.",
+                            "expected_result": "The page has no console errors.",
+                            "category": "runtime",
+                            "requirement_id": "REQ-EDIT-001",
+                            "impact_tags": ["atomic-edit"],
+                            "route": route,
+                            "actions": [{"action": "assert_no_console_errors"}],
+                        }
+                    ],
+                },
+            }
+            for item in frozen_subtasks
+        ]
+    }
+    return normalize_frozen_compound_plan(
+        raw,
+        case_id=case_id,
+        source_code_sha256=source_code_sha256,
+        planner_model="dataset-atomic-contract",
+        frozen_subtasks=frozen_subtasks,
+    )
 
 
 def normalize_frozen_compound_plan(
@@ -242,6 +335,7 @@ __all__ = [
     "FrozenCompoundEditPlan",
     "canonical_plan_sha256",
     "normalize_frozen_compound_plan",
+    "plan_from_atomic_contracts",
     "read_frozen_compound_plan",
     "write_frozen_compound_plan",
 ]

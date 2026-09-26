@@ -1,5 +1,7 @@
 .wc-table { font:inherit; color:inherit; }
 .wc-table input,.wc-table button { font:inherit; }
+.wc-table__controls,.wc-table__bulk,.wc-table nav { display:flex; flex-wrap:wrap; gap:.5rem; align-items:center; }
+.wc-table__bulk[hidden] { display:none; }
 .wc-table__scroll { overflow-x:auto; }
 .wc-table table { width:100%; border-collapse:collapse; }
 .wc-table th,.wc-table td { text-align:start; padding:.5rem; border-bottom:1px solid #aaa6; }

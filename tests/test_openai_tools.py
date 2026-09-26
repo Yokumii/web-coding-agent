@@ -5,7 +5,6 @@ import pytest
 from src.agents.openai_tools import OpenAIToolExecutor, openai_tool_schemas
 from src.agents.generator import _validate_generator_outputs
 from src.orchestration.file_comm import FileComm
-from src.orchestration.minimal_path_guidance import MinimalPathPolicy
 
 
 @pytest.mark.anyio
@@ -149,99 +148,6 @@ async def test_command_drops_redundant_stderr_merge(tmp_path: Path):
     tools = OpenAIToolExecutor(workdir=tmp_path, allow_bash=True)
     result = await tools.execute("run_command", {"command": "node --version 2>&1"})
     assert result.ok
-
-
-@pytest.mark.anyio
-async def test_source_mutation_runs_harness_validation_and_unlocks_dependency(
-    tmp_path: Path,
-):
-    import json
-    import subprocess
-
-    frontend = tmp_path / "frontend"
-    frontend.mkdir()
-    (frontend / "app.js").write_text("const page = 'hash';\n", encoding="utf-8")
-    (frontend / "index.html").write_text(
-        '<a href="#/settings">Settings</a>\n', encoding="utf-8"
-    )
-    subprocess.run(
-        ["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "add", "--all"], cwd=frontend, check=True, capture_output=True
-    )
-    subprocess.run(
-        [
-            "git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
-            "commit", "-m", "baseline",
-        ],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    harness = tmp_path / ".harness"
-    harness.mkdir()
-    (harness / "edit_context_round_1.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "edit-context-v1",
-                "source_windows": [
-                    {"path": "frontend/app.js", "content": "const page = 'hash';\n"},
-                    {
-                        "path": "frontend/index.html",
-                        "content": '<a href="#/settings">Settings</a>\n',
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    policy = MinimalPathPolicy.from_plan(
-        tmp_path,
-        {
-            "schema_version": "minimal-path-plan-v4",
-            "round": 1,
-            "source_change_cone": {
-                "initial_paths": ["frontend/app.js"],
-                "local_paths": ["frontend/app.js", "frontend/index.html"],
-                "dependency_paths": [],
-                "protected_paths": [],
-                "dependency_edges": [
-                    {"from": "frontend/app.js", "to": "frontend/index.html"}
-                ],
-            },
-            "route_scope": {
-                "cross_route_shared_paths": [],
-                "off_target_paths": [],
-            },
-            "budgets": {"max_patch_lines": 20, "max_touched_files": 2},
-        },
-    )
-    executor = OpenAIToolExecutor(
-        workdir=tmp_path,
-        allow_bash=True,
-        mutation_policy=policy,
-    )
-
-    first = await executor.execute(
-        "apply_patch",
-        {
-            "path": "frontend/app.js",
-            "old_text": "const page = 'hash';",
-            "new_text": "const page = 'physical';",
-        },
-    )
-    second = await executor.execute(
-        "apply_patch",
-        {
-            "path": "frontend/index.html",
-            "old_text": '<a href="#/settings">Settings</a>',
-            "new_text": '<a href="/settings.html">Settings</a>',
-        },
-    )
-
-    assert first.ok is True
-    assert "Harness validation passed" in first.output
-    assert second.ok is True
-    assert policy.validation_success_revision == policy.mutation_revision == 2
 
 
 @pytest.mark.anyio

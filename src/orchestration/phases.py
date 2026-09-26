@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -18,6 +20,12 @@ from src.agents.evaluator import (
     build_deterministic_failure_grades,
     build_lightweight_browser_grades,
     run_evaluator,
+)
+from src.agents.lightweight_edit_judge import (
+    build_lightweight_grades,
+    capture_runtime_snapshot,
+    judge_edit,
+    _safe_diff,
 )
 from src.agents.design_stage import run_design_stage
 from src.agents.generator import run_generator
@@ -59,6 +67,7 @@ from src.orchestration.edit_card import (
 from src.orchestration.edit_task_contract import read_edit_task_contract
 from src.orchestration.hidden_oracle_checks import read_hidden_oracle_checks
 from src.orchestration.edit_context import ensure_edit_context
+from src.orchestration.integration_contract import build_integration_contract
 from src.orchestration.atomic_edit_plan import (
     normalize_atomic_edit_plan_payload,
     read_atomic_edit_plan,
@@ -85,12 +94,50 @@ from src.orchestration.minimality_runtime import (
 from src.orchestration.minimal_path_guidance import (
     discover_page_routes,
     ensure_minimal_path_plan,
+    post_edit_scope_sanity,
 )
 from src.orchestration.runtime import start_app_stack
 from src.orchestration.sprint_state import SprintState
 from src.prompts.grading import criterion_threshold, evaluation_is_inconclusive
 from src.utils.logger import get_logger
 from src.utils.sdk_session import safe_sdk_session
+
+
+def _current_atomic_repair_context_plan(
+    workdir: Path, harness_dir: Path, plan: dict[str, Any], round_num: int
+) -> dict[str, Any]:
+    """Limit Repair source exposure to files changed by the current atomic Edit."""
+    if round_num <= 1:
+        return plan
+    build_map_path = harness_dir / "round_build_map.json"
+    frontend = workdir / "frontend"
+    if not build_map_path.is_file() or not (frontend / ".git").is_dir():
+        return plan
+    try:
+        build_map = json.loads(build_map_path.read_text(encoding="utf-8"))
+        entries = [
+            value for key, value in sorted(build_map.items(), key=lambda item: int(item[0]))
+            if int(key) < round_num and isinstance(value, dict)
+        ]
+        baseline = str(entries[0].get("source_commit") or "") if entries else ""
+        names = subprocess.run(
+            ["git", "diff", "--name-only", baseline, "HEAD", "--"],
+            cwd=frontend, check=True, text=True, capture_output=True,
+        ).stdout.splitlines()
+        changed = {f"frontend/{name}" for name in names if name.strip()}
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return plan
+    if not changed:
+        return plan
+    filtered = json.loads(json.dumps(plan))
+    cone = filtered.get("source_change_cone") or {}
+    for key in ("initial_paths", "local_paths", "dependency_paths"):
+        cone[key] = [path for path in cone.get(key) or [] if str(path) in changed]
+    cone["hotspots"] = [
+        item for item in cone.get("hotspots") or []
+        if isinstance(item, dict) and str(item.get("path")) in changed
+    ]
+    return filtered if (cone.get("initial_paths") or cone.get("local_paths")) else plan
 
 logger = get_logger(__name__)
 
@@ -298,7 +345,7 @@ def _select_generator_mode(
     if round_num == 1:
         return "generate"
     previous = ctx.file_comm.read_grades(round_num - 1) or {}
-    if previous.get("mode_recommendation") == "repair" and previous.get("sprint") == sprint_num:
+    if previous.get("overall_passed") is False and previous.get("sprint") == sprint_num:
         return "repair"
     if _resume_requests_repair(
         resume_state,
@@ -342,7 +389,7 @@ def _visual_style_recheck_allowed(
         isinstance(check, dict)
         and str(check.get("category", "")).strip().lower()
         in {"appearance", "responsive", "style", "visual"}
-        for check in checks
+        for check in checks or []
     )
 
 
@@ -444,7 +491,7 @@ def _conditional_fragment_recheck_allowed(
         return False
     planned_selectors = {
         str(action.get("selector") or "")
-        for check in checks
+        for check in checks or []
         if isinstance(check, dict)
         for action in check.get("actions") or []
         if isinstance(action, dict)
@@ -494,6 +541,22 @@ async def run_build_phase(
         # Generate run starts using this same frame from sprint two onward.
         app_stack = await start_app_stack(ctx.workdir, ctx.file_comm.dir, ctx.config, round_num)
         try:
+            if (
+                ctx.config.lightweight_edit_production
+                and edit_contract is not None
+                and not (ctx.file_comm.dir / "before.png").exists()
+            ):
+                baseline_runtime = await capture_runtime_snapshot(
+                    app_url=app_stack.frontend_url,
+                    screenshot_path=ctx.file_comm.dir / "before.png",
+                    headless=ctx.config.playwright_headless,
+                    retries=max(0, ctx.config.lightweight_edit_judge_retries),
+                )
+                if baseline_runtime.get("status") == "infrastructure_error":
+                    raise RuntimeError(
+                        "Unable to capture the original Edit screenshot: "
+                        + str(baseline_runtime.get("error") or "unknown browser error")
+                    )
             if needs_global_baseline:
                 snapshot = await capture_baseline(
                     workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
@@ -545,12 +608,13 @@ async def run_build_phase(
                 )
             finally:
                 await app_stack.close()
-    guide_minimal_path = (
+    guide_recommended_scope = (
         ctx.config.minimal_path_guidance_enabled
-        and (incremental_edit or mode == "repair")
+        and
+        (incremental_edit or mode == "repair")
         and frontend_dir.is_dir()
     )
-    if guide_minimal_path:
+    if guide_recommended_scope:
         minimal_path_plan = ensure_minimal_path_plan(
             workdir=ctx.workdir,
             harness_dir=ctx.file_comm.dir,
@@ -560,34 +624,38 @@ async def run_build_phase(
             max_patch_lines=ctx.config.minimal_path_max_patch_lines,
             max_touched_files=ctx.config.minimal_path_max_touched_files,
             eager_dependency_context=ctx.config.edit_frozen_compound_mode,
+            scope_mode=getattr(ctx.config, "minimal_path_mode", "recommended"),
         )
-        if minimal_path_plan.get("status") == "blocked":
-            route_scope = minimal_path_plan.get("route_scope") or {}
-            dom_scope = minimal_path_plan.get("dom_change_cone") or {}
-            raise RuntimeError(
-                "Edit task contract is blocked before source mutation: "
-                f"route_status={route_scope.get('status')}, "
-                f"unresolved={route_scope.get('unresolved_routes') or []}, "
-                f"unexpected_checks={route_scope.get('unexpected_check_routes') or []}, "
-                f"missing_checks={route_scope.get('missing_check_routes') or []}, "
-                f"unresolved_selectors={dom_scope.get('unresolved_fragment_selectors') or []}. "
-                "Correct the planner route contract; do not widen the Edit to another page."
-            )
         atomic_plan = read_atomic_edit_plan(ctx.file_comm.dir) or {}
         atomic_plan = normalize_atomic_edit_plan_payload(
             atomic_plan, instruction_delta=ctx.user_prompt
         )
+        context_plan = (
+            _current_atomic_repair_context_plan(
+                ctx.workdir, ctx.file_comm.dir, minimal_path_plan, round_num
+            )
+            if mode == "repair" and ctx.config.edit_frozen_compound_mode
+            else minimal_path_plan
+        )
         ensure_edit_context(
             workdir=ctx.workdir,
             harness_dir=ctx.file_comm.dir,
-            plan=minimal_path_plan,
+            plan=context_plan,
             round_num=round_num,
             source_anchors=list(atomic_plan.get("source_anchors") or []),
             include_dependency_paths=ctx.config.edit_frozen_compound_mode,
-            full_repair_context=(mode == "repair"),
-            **({"max_total_chars": 250000, "max_file_chars": 250000}
-               if (mode == "repair") or (ctx.file_comm.read_state() or {}).get("supplied_atomic_plan")
+            full_repair_context=False,
+            **({"max_total_chars": 120000, "max_file_chars": 80000}
+               if mode == "repair"
+               else {"max_total_chars": 250000, "max_file_chars": 250000}
+               if (ctx.file_comm.read_state() or {}).get("supplied_atomic_plan")
                else {}),
+        )
+        build_integration_contract(
+            workdir=ctx.workdir,
+            harness_dir=ctx.file_comm.dir,
+            round_num=round_num,
+            plan=minimal_path_plan,
         )
     track_build = (
         (incremental_edit or mode == "repair")
@@ -727,6 +795,317 @@ def _build_verdict(recommendation: str) -> Verdict:
     if recommendation == "generate_next_sprint":
         return Verdict.accepted_review
     return Verdict.failed_review
+
+
+async def _run_lightweight_edit_evaluation(ctx: HarnessContext, round_num: int) -> Verdict:
+    """Run the cheap Edit gate: runtime snapshot, one screenshot, one judge."""
+    sprint_num = ctx.sprint_state.current_target
+    started = time.perf_counter()
+    app_stack = None
+    after = ctx.file_comm.dir / f"after_round_{round_num}.png"
+    before = ctx.file_comm.dir / "before.png"
+    try:
+        app_stack = await start_app_stack(ctx.workdir, ctx.file_comm.dir, ctx.config, round_num)
+        runtime = await capture_runtime_snapshot(
+            app_url=app_stack.frontend_url,
+            screenshot_path=after,
+            headless=ctx.config.playwright_headless,
+            retries=max(0, ctx.config.lightweight_edit_judge_retries),
+        )
+        if runtime.get("status") == "infrastructure_error":
+            raise EvaluationInfrastructureError(str(runtime.get("error") or "browser snapshot failed"))
+        (ctx.file_comm.dir / f"browser_evidence_round_{round_num}.json").write_text(
+            json.dumps({
+                "policy_version": "lightweight-edit-runtime-v1",
+                "checks": [{
+                    "check_id": "RUNTIME-01",
+                    "status": "ok" if runtime.get("status") == "pass" else "action_failed",
+                    "steps": [],
+                    "notes": "Runtime snapshot only; no planner-authored browser checker.",
+                }],
+                "runtime": runtime,
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        diff = _safe_diff(ctx.workdir)
+        judge_error: Exception | None = None
+        for judge_attempt in range(max(0, ctx.config.lightweight_edit_judge_retries) + 1):
+            try:
+                judgement, judge_stats = await judge_edit(
+                    config=ctx.config,
+                    instruction=ctx.user_prompt,
+                    diff=diff,
+                    runtime=runtime,
+                    before=before if before.is_file() else None,
+                    after=after,
+                    round_num=round_num,
+                )
+                break
+            except Exception as exc:
+                judge_error = exc
+                if judge_attempt >= max(0, ctx.config.lightweight_edit_judge_retries):
+                    raise EvaluationInfrastructureError(
+                        f"Lightweight Judge infrastructure failed after {judge_attempt + 1} attempts: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+        else:  # pragma: no cover - loop always breaks or raises
+            raise EvaluationInfrastructureError(str(judge_error or "Lightweight Judge failed"))
+        grades = build_lightweight_grades(
+            round_num=round_num,
+            sprint_num=sprint_num,
+            runtime=runtime,
+            judgement=judgement,
+            before=before if before.is_file() else None,
+            after=after,
+            diff=diff,
+        )
+        if ctx.config.minimal_path_guidance_enabled:
+            grades["scope_sanity"] = post_edit_scope_sanity(
+                workdir=ctx.workdir,
+                harness_dir=ctx.file_comm.dir,
+                round_num=round_num,
+            )
+        if not grades["overall_passed"]:
+            # The normal generator Repair prompt consumes this bounded handoff,
+            # especially when minimal-path mode is enabled.  Without it the
+            # Judge findings would be persisted but not forwarded to the model.
+            packet = write_repair_packet(
+                workdir=ctx.workdir,
+                round_num=round_num,
+                sprint_num=sprint_num,
+                grades=grades,
+            )
+            grades["repair_packet"] = {
+                "status": packet.get("status"),
+                "artifact": f".harness/repair_packet_round_{round_num}.json",
+                "failed_check_ids": [
+                    str(item.get("check_id", "unknown"))
+                    for item in packet.get("failed_checks") or []
+                ],
+            }
+        ctx.file_comm.write_grades(round_num, grades)
+        ctx.file_comm.write_feedback(round_num, render_feedback_from_grades(grades))
+        ctx.file_comm.write_visual_manifest(round_num, {
+            "round": round_num,
+            "app_url": app_stack.frontend_url,
+            "screenshots": [f".harness/{after.name}"] + ([".harness/before.png"] if before.is_file() else []),
+            "notes": "Lightweight Edit runtime snapshot; no browser checker was run.",
+        })
+        ctx.phase_metrics[f"evaluator_r{round_num}"] = judge_stats
+        ctx.cost_tracker.add(f"evaluator_r{round_num}", float(judge_stats.get("cost_usd") or 0.0))
+        passed = bool(grades["overall_passed"])
+        recommendation = "complete" if passed else str(grades.get("mode_recommendation") or "repair")
+        ctx.sprint_state.mark_sprint_outcome(sprint_num, recommendation=recommendation, grades=grades)
+        _checkpoint_transaction(ctx).record_evaluate_completed(
+            sprint_state=ctx.sprint_state,
+            round_num=round_num,
+            sprint_num=sprint_num,
+            recommendation=recommendation,
+        )
+        logger.info("[bold yellow]Lightweight Edit Judge[/] round %s: %s", round_num, "PASS" if passed else recommendation.upper())
+        return Verdict.completed if passed else Verdict.failed_review
+    finally:
+        if app_stack is not None:
+            await app_stack.close()
+
+
+def _reverse_validation_failures(validation: dict[str, Any]) -> list[str]:
+    failures = [str(item) for item in validation.get("reasons") or []]
+    if validation.get("error"):
+        failures.append(str(validation["error"]))
+    for page in validation.get("pages") or []:
+        path = str(page.get("path") or "unknown page")
+        if page.get("navigation_error"):
+            failures.append(f"{path}: navigation error: {page['navigation_error']}")
+        if isinstance(page.get("http_status"), int) and page["http_status"] >= 400:
+            failures.append(f"{path}: HTTP {page['http_status']}")
+        if page.get("blank"):
+            failures.append(f"{path}: rendered page is blank")
+        if page.get("severe_overflow"):
+            failures.append(f"{path}: severe horizontal overflow")
+        failures.extend(f"{path}: page error: {item}" for item in page.get("page_errors") or [])
+        failures.extend(f"{path}: required asset failed: {item}" for item in page.get("essential_failures") or [])
+    return list(dict.fromkeys(item for item in failures if item.strip()))
+
+
+async def _run_reverse_validate_evaluation(ctx: HarnessContext, round_num: int) -> Verdict:
+    """Run only the existing reverse/validate browser policy for this Edit."""
+    sprint_num = ctx.sprint_state.current_target
+    started = time.perf_counter()
+    root = Path(ctx.config.reverse_validate_root).resolve()
+    validator = root / "validate.js"
+    builder = root / "build_vite_project.mjs"
+    frontend = ctx.workdir / "frontend"
+    if not validator.is_file() or not builder.is_file():
+        raise EvaluationInfrastructureError(f"invalid reverse/validate root: {root}")
+
+    marker = frontend / ".generation.json"
+    marker_existed = marker.exists()
+    if not marker_existed:
+        marker.write_text(json.dumps({"edit_mother": True, "query": ctx.user_prompt}, ensure_ascii=False))
+    output = ctx.file_comm.dir / f"reverse_validation_round_{round_num}.jsonl"
+    output.unlink(missing_ok=True)
+    command = [
+        ctx.config.reverse_validate_node,
+        str(validator),
+        "--projects-dir", str(ctx.workdir),
+        "--out", str(output),
+        "--workers", "1",
+        "--limit", "0",
+        "--timeout", "20000",
+        "--project-id", "frontend",
+        "--framework-builder", str(builder),
+        "--build-root", str(ctx.file_comm.dir / "reverse_builds"),
+        "--build-timeout", "90000",
+    ]
+    env = os.environ.copy()
+    if ctx.config.reverse_validate_playwright_module:
+        env["PLAYWRIGHT_MODULE"] = ctx.config.reverse_validate_playwright_module
+    if ctx.config.reverse_validate_chromium:
+        env["CHROMIUM_EXECUTABLE"] = ctx.config.reverse_validate_chromium
+    if ctx.config.reverse_validate_extra_node_modules:
+        env["WEBCODING_EXTRA_NODE_MODULES"] = ctx.config.reverse_validate_extra_node_modules
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=ctx.config.reverse_validate_timeout_seconds
+            )
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise EvaluationInfrastructureError("reverse/validate timed out") from exc
+        if process.returncode:
+            detail = (stderr or stdout).decode(errors="replace")[-3000:]
+            raise EvaluationInfrastructureError(
+                f"reverse/validate exited {process.returncode}: {detail}"
+            )
+    finally:
+        if not marker_existed:
+            marker.unlink(missing_ok=True)
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        raise EvaluationInfrastructureError("reverse/validate returned no result")
+    validation = rows[-1]
+    validation_error = str(validation.get("error") or "")
+    if (
+        "framework_build_failed" in (validation.get("reasons") or [])
+        and (
+            "Cannot resolve validator runtime dependency" in validation_error
+            or "reverse/validate/build_vite_project.mjs" in validation_error
+            and "ERR_MODULE_NOT_FOUND" in validation_error
+        )
+    ):
+        raise EvaluationInfrastructureError(validation_error)
+    passed = validation.get("status") == "accept"
+    failures = _reverse_validation_failures(validation)
+    sprint_context = ctx.sprint_state.sprint_context(sprint_num)
+    feature_id = str(next(iter(sprint_context.get("feature_ids") or []), "reverse-runtime"))
+    checks = [{
+        "check_id": f"REVERSE-{index:02d}",
+        "feature_id": feature_id,
+        "critical": True,
+        "task": ctx.user_prompt,
+        "expected_result": "Every project page builds and renders without fatal runtime failures.",
+        "status": "action_failed",
+        "notes": failure,
+        "steps": [],
+    } for index, failure in enumerate(failures, 1)]
+    if passed:
+        checks = [{
+            "check_id": "REVERSE-01",
+            "feature_id": feature_id,
+            "critical": True,
+            "task": ctx.user_prompt,
+            "expected_result": "Every project page builds and renders without fatal runtime failures.",
+            "status": "ok",
+            "notes": "reverse/validate accepted all rendered pages",
+            "steps": [],
+        }]
+    evidence = {
+        "policy_version": "reverse-validate-v1",
+        "validator": str(validator),
+        "checks": checks,
+        "validation": validation,
+    }
+    (ctx.file_comm.dir / f"browser_evidence_round_{round_num}.json").write_text(
+        json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    grades = {
+        "round": round_num,
+        "sprint": sprint_num,
+        "sprint_passed": passed,
+        "regression_passed": True,
+        "overall_passed": passed,
+        "mode_recommendation": "complete" if passed else "repair",
+        "phase_results": {
+            "render_gate": "pass" if passed else "fail",
+            "ui_functionality": "skipped",
+            "appearance": "skipped",
+            "source_inspection": "skipped",
+        },
+        "criteria": {},
+        "target_exit_criteria_results": [],
+        "ui_checks": [{
+            "feature_id": item["feature_id"],
+            "check_id": item["check_id"],
+            "critical": item["critical"],
+            "task": item["task"],
+            "expected_result": item["expected_result"],
+            "status": "pass" if item["status"] == "ok" else "fail",
+            "notes": item["notes"],
+        } for item in checks],
+        "bugs_found": failures,
+        "regressions_found": [],
+        "missing_features": [],
+        "repair_instructions": [
+            "Repair only the concrete reverse/validate runtime, build, asset, blank-page, or overflow failures above."
+        ] if failures else [],
+        "repair_task_descriptions": [],
+        "evidence_route": {
+            "decision": "reverse_validate_only",
+            "llm_evaluator_called": False,
+            "browser_evidence_ref": f".harness/browser_evidence_round_{round_num}.json",
+        },
+    }
+    if not passed:
+        packet = write_repair_packet(
+            workdir=ctx.workdir,
+            round_num=round_num,
+            sprint_num=sprint_num,
+            grades=grades,
+        )
+        grades["repair_packet"] = {
+            "status": packet.get("status"),
+            "artifact": f".harness/repair_packet_round_{round_num}.json",
+        }
+    ctx.file_comm.write_grades(round_num, grades)
+    ctx.file_comm.write_feedback(round_num, render_feedback_from_grades(grades))
+    stats = AgentRunStats(
+        cost_usd=0.0,
+        duration_ms=0,
+        duration_api_ms=0,
+        token_usage={},
+        usage={"validator": "reverse.validate", "status": validation.get("status")},
+        model_usage={},
+    )
+    _record_phase_stats(ctx, f"evaluator_r{round_num}", stats, started_at=started)
+    recommendation = "complete" if passed else "repair"
+    ctx.sprint_state.mark_sprint_outcome(sprint_num, recommendation=recommendation, grades=grades)
+    _checkpoint_transaction(ctx).record_evaluate_completed(
+        sprint_state=ctx.sprint_state,
+        round_num=round_num,
+        sprint_num=sprint_num,
+        recommendation=recommendation,
+    )
+    logger.info("[bold yellow]reverse/validate[/] round %s: %s", round_num, "PASS" if passed else "REPAIR")
+    return Verdict.completed if passed else Verdict.failed_review
 
 
 def _edit_guard_requires_repair(
@@ -1275,6 +1654,10 @@ async def _capture_independent_visual_evidence(
 
 async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     """执行 evaluator 与视觉复核，推进 sprint 状态并写入检查点。"""
+    if ctx.config.reverse_validate_root and read_edit_task_contract(ctx.workdir) is not None:
+        return await _run_reverse_validate_evaluation(ctx, round_num)
+    if ctx.config.lightweight_edit_production and read_edit_task_contract(ctx.workdir) is not None:
+        return await _run_lightweight_edit_evaluation(ctx, round_num)
     logger.info("[bold yellow]EVALUATE phase")
     sprint_num = ctx.sprint_state.current_target
     sprint_ctx = ctx.sprint_state.sprint_context(sprint_num)
@@ -1332,11 +1715,22 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
                 # as the only acceptance check. The legacy DOM scope guard can
                 # mistake explicitly requested additions for collateral edits.
                 if frozen_validation is None and not ctx.config.lightweight_edit_production:
-                    guard_result = await evaluate_guard(
-                        workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
-                        app_url=app_stack.frontend_url, round_num=round_num,
-                        sprint_num=sprint_num,
-                    )
+                    if (
+                        read_edit_task_contract(ctx.workdir) is not None
+                        and str(getattr(ctx.config, "minimal_path_mode", "recommended")).lower()
+                        == "recommended"
+                    ):
+                        guard_result = post_edit_scope_sanity(
+                            workdir=ctx.workdir,
+                            harness_dir=ctx.file_comm.dir,
+                            round_num=round_num,
+                        )
+                    else:
+                        guard_result = await evaluate_guard(
+                            workdir=ctx.workdir, file_comm=ctx.file_comm, config=ctx.config,
+                            app_url=app_stack.frontend_url, round_num=round_num,
+                            sprint_num=sprint_num,
+                        )
                 edit_card = read_edit_card(ctx.file_comm.dir)
                 try:
                     if edit_card is not None and not ctx.config.lightweight_edit_production:
@@ -1688,7 +2082,16 @@ async def run_evaluate_phase(ctx: HarnessContext, round_num: int) -> Verdict:
     passed = _determine_passed(grades)
 
     if passed:
-        if not ctx.config.minimality_guard_enabled:
+        if (
+            read_edit_task_contract(ctx.workdir) is not None
+            and str(getattr(ctx.config, "minimal_path_mode", "recommended")).lower()
+            == "recommended"
+        ):
+            minimality = {
+                "status": "skipped_by_scope_policy",
+                "reason": "recommended_scope_uses_post_edit_scope_sanity",
+            }
+        elif not ctx.config.minimality_guard_enabled:
             minimality = {"status": "skipped_by_user_policy", "reason": "minimality_guard_disabled"}
         elif not _counterfactual_minimality_is_sound(
             grades,

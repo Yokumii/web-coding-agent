@@ -34,6 +34,8 @@ def write_repair_packet(
     tape = _read_json(tape_ref)
     hidden = _read_json(hidden_ref)
     plan = _read_json(plan_ref)
+    integration_ref = harness / f"integration_contract_round_{round_num}.json"
+    integration = _read_json(integration_ref)
     cone = plan.get("source_change_cone") or {}
     budgets = plan.get("budgets") or cone.get("budgets") or {}
     max_files = max(1, int(budgets.get("max_touched_files", 3)))
@@ -58,6 +60,7 @@ def write_repair_packet(
         "required_actions": list(grades.get("repair_instructions") or []),
         "repair_task_descriptions": list(grades.get("repair_task_descriptions") or []),
         "repair_policy": "all_observed_defects_in_one_call_then_retest",
+        "integration_contract": integration,
         "allowed_source_paths": allowed_paths,
         "budgets": {
             "max_touched_files": max_files,
@@ -70,6 +73,7 @@ def write_repair_packet(
                 (f".harness/accepted_tape_replay_round_{round_num}.json", tape_ref),
                 (f".harness/hidden_oracle_evidence_round_{round_num}.json", hidden_ref),
                 (f".harness/minimal_path_plan_round_{round_num}.json", plan_ref),
+                (f".harness/integration_contract_round_{round_num}.json", integration_ref),
             )
             if path.is_file()
         ],

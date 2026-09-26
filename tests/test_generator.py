@@ -10,11 +10,11 @@ from claude_agent_sdk.types import ResultMessage
 from src.agents.generator import (
     _MAX_ATOMIC_SEMANTIC_ATTEMPTS,
     _control_topology_invariants,
+    _atomic_correction_messages,
     _atomic_executor_eligible,
     _build_generator_prompt,
     _compact_browser_error,
     _checkpoint_interrupted_model_work,
-    _recover_deferred_model_patches,
     _describe_failures,
     _declared_source_functions,
     _is_scope_contract_only_repair,
@@ -22,6 +22,8 @@ from src.agents.generator import (
     _normalize_atomic_patch_response,
     _normalize_atomic_new_files,
     _atomic_new_path_allowed,
+    _failed_atomic_candidate_diff,
+    _failed_atomic_error_source,
     _atomic_transaction_sort_key,
     _normalize_atomic_operations,
     _apply_sha_line_operations,
@@ -30,10 +32,9 @@ from src.agents.generator import (
     _recent_repair_runtime_errors,
     _validate_generator_commits,
     _validate_javascript_syntax,
+    _validate_atomic_candidate_operations,
     _validate_no_external_runtime_dependencies,
-    _validate_minimal_path_final_diff,
     _validate_repair_scope,
-    _validate_generator_runnable_files,
     _trace_confirms_commit,
     _last_replayable_atomic_candidate,
     _unreferenced_near_duplicate_functions,
@@ -44,7 +45,6 @@ from src.agents.generator import (
 )
 from src.config import HarnessConfig
 from src.orchestration.file_comm import FileComm
-from src.orchestration.minimal_path_guidance import MinimalPathPolicy
 from src.prompts.generator import GENERATOR_SYSTEM_PROMPT
 from src.agents._shared import expose_local_claude_skills
 
@@ -72,12 +72,12 @@ def test_frozen_exact_patch_adds_context_around_repeated_search():
     )
 
 
-def test_unplanned_new_path_only_blocks_when_minimality_is_enabled():
+def test_unplanned_new_path_is_not_blocked_by_recommended_scope():
     relaxed = HarnessConfig(minimality_guard_enabled=False)
     strict = HarnessConfig(minimality_guard_enabled=True)
 
     assert _atomic_new_path_allowed(relaxed, "frontend/archive.html", set()) is True
-    assert _atomic_new_path_allowed(strict, "frontend/archive.html", set()) is False
+    assert _atomic_new_path_allowed(strict, "frontend/archive.html", set()) is True
     assert _atomic_new_path_allowed(
         strict, "frontend/archive.html", {"frontend/archive.html"}
     ) is True
@@ -165,6 +165,38 @@ def test_javascript_syntax_check_rejects_broken_esm_js_without_package_type(tmp_
 
     assert ok is False
     assert "SyntaxError" in output
+    assert "app.js:" in output
+    assert "web-coding-syntax-" not in output
+
+
+def test_failed_atomic_candidate_is_preserved_as_diff_and_error_source(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    target = frontend / "app.js"
+    original = "function mount() {\n  return true;\n}\n"
+    target.write_text("function mount() {\n  return true;\n}}\n", encoding="utf-8")
+
+    failed_diff = _failed_atomic_candidate_diff(
+        frontend, {target: original}, set()
+    )
+    failed_source = _failed_atomic_error_source(
+        frontend, "app.js:3\nSyntaxError: Unexpected token '}'", {target}
+    )
+
+    assert "+}}" in failed_diff
+    assert "-}" in failed_diff
+    assert "app.js:3" in failed_source
+    assert "     3 | }}" in failed_source
+
+
+def test_atomic_correction_repairs_previous_candidate_instead_of_regenerating():
+    candidate = '{"operations":[{"op":"replace_lines","path":"app.js"}]}'
+    messages = _atomic_correction_messages(candidate, "app.js:3 SyntaxError")
+
+    assert messages[0] == {"role": "assistant", "content": candidate}
+    assert "Repair the failed candidate above in place" in messages[1]["content"]
+    assert "Keep every correct operation" in messages[1]["content"]
+    assert "regenerate the Edit" in messages[1]["content"]
 
 
 def test_atomic_rejection_feedback_explains_duplicate_declaration_boundary():
@@ -179,7 +211,7 @@ def test_atomic_rejection_feedback_explains_duplicate_declaration_boundary():
     assert "complete original boundary" in feedback
 
 
-def test_last_replayable_atomic_candidate_requires_a_later_local_rejection(tmp_path: Path):
+def test_last_replayable_atomic_candidate_never_replays_a_known_rejection(tmp_path: Path):
     trace = tmp_path / "generator.jsonl"
     trace.write_text(
         '\n'.join(
@@ -192,7 +224,7 @@ def test_last_replayable_atomic_candidate_requires_a_later_local_rejection(tmp_p
         encoding="utf-8",
     )
 
-    assert _last_replayable_atomic_candidate(trace) == '{"operations":[1]}'
+    assert _last_replayable_atomic_candidate(trace) == ""
     with trace.open("a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
@@ -206,171 +238,6 @@ def test_last_replayable_atomic_candidate_requires_a_later_local_rejection(tmp_p
             + "\n"
         )
     assert _last_replayable_atomic_candidate(trace) == ""
-
-
-def test_final_diff_guard_rejects_indirect_protected_page_change(tmp_path: Path):
-    import subprocess
-
-    frontend = tmp_path / "frontend"
-    frontend.mkdir()
-    (frontend / "catalog.js").write_text("catalog before\n")
-    (frontend / "settings.js").write_text("settings before\n")
-    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    baseline = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=frontend, text=True,
-        check=True, capture_output=True,
-    ).stdout.strip()
-    (frontend / "catalog.js").write_text("catalog after\n")
-    (frontend / "settings.js").write_text("settings after\n")
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "feat: edit"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    plan = {
-        "schema_version": "minimal-path-plan-v1",
-        "round": 1,
-        "source_change_cone": {
-            "initial_paths": ["frontend/catalog.js"],
-            "local_paths": ["frontend/catalog.js"],
-            "dependency_paths": [],
-            "protected_paths": ["frontend/settings.js"],
-            "dependency_edges": [],
-        },
-        "route_scope": {
-            "cross_route_shared_paths": [],
-            "off_target_paths": ["frontend/settings.js"],
-        },
-        "budgets": {"max_patch_lines": 20, "max_touched_files": 2},
-    }
-    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
-    policy.touched_paths.add("frontend/catalog.js")
-
-    error = _validate_minimal_path_final_diff(frontend, baseline, policy)
-
-    assert error is not None
-    assert "frontend/settings.js" in error
-    assert "protected multi-page source" in error
-
-
-def test_final_diff_guard_allows_only_guarded_region_in_shared_file(tmp_path: Path):
-    import subprocess
-
-    frontend = tmp_path / "frontend"
-    frontend.mkdir()
-    shared_before = (
-        "/* --- CATALOG MODULE --- */\n"
-        "const Catalog = { render: () => 'old catalog' };\n\n"
-        "/* --- SETTINGS MODULE --- */\n"
-        "const Settings = { render: () => 'old settings' };\n"
-    )
-    (frontend / "app.js").write_text(shared_before)
-    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    baseline = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=frontend, text=True,
-        check=True, capture_output=True,
-    ).stdout.strip()
-    plan = {
-        "schema_version": "minimal-path-plan-v3",
-        "round": 1,
-        "source_change_cone": {
-            "initial_paths": ["frontend/app.js"],
-            "local_paths": ["frontend/app.js"],
-            "dependency_paths": [],
-            "protected_paths": [],
-            "dependency_edges": [],
-            "guarded_shared_regions": [
-                {
-                    "path": "frontend/app.js",
-                    "route": "/catalog.html",
-                    "symbol": "Catalog",
-                    "kind": "object",
-                    "start_line": 1,
-                    "end_line": 2,
-                }
-            ],
-        },
-        "route_scope": {
-            "cross_route_shared_paths": ["frontend/app.js"],
-            "off_target_paths": [],
-        },
-        "budgets": {"max_patch_lines": 20, "max_touched_files": 1},
-    }
-    policy = MinimalPathPolicy.from_plan(tmp_path, plan)
-    policy.touched_paths.add("frontend/app.js")
-
-    (frontend / "app.js").write_text(
-        shared_before.replace("old catalog", "new catalog")
-    )
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "catalog"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    assert _validate_minimal_path_final_diff(frontend, baseline, policy) is None
-
-    (frontend / "app.js").write_text(
-        (frontend / "app.js").read_text().replace("old settings", "changed settings")
-    )
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "settings"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    error = _validate_minimal_path_final_diff(frontend, baseline, policy)
-    assert error is not None and "outside the guarded target-route region" in error
-
-
-def test_final_diff_guard_rejects_uncontracted_asset_change(tmp_path: Path):
-    import subprocess
-
-    frontend = tmp_path / "frontend"
-    frontend.mkdir()
-    (frontend / "catalog.js").write_text("before\n")
-    (frontend / "hero.png").write_bytes(b"before")
-    subprocess.run(["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "seed"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    baseline = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=frontend, text=True,
-        check=True, capture_output=True,
-    ).stdout.strip()
-    (frontend / "hero.png").write_bytes(b"after")
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "feat: image"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    plan = {
-        "schema_version": "minimal-path-plan-v1", "round": 1,
-        "source_change_cone": {
-            "initial_paths": ["frontend/catalog.js"],
-            "local_paths": ["frontend/catalog.js"], "dependency_paths": [],
-            "protected_paths": [], "dependency_edges": [],
-        },
-        "route_scope": {"cross_route_shared_paths": [], "off_target_paths": []},
-        "budgets": {"max_patch_lines": 20, "max_touched_files": 2},
-    }
-
-    error = _validate_minimal_path_final_diff(
-        frontend, baseline, MinimalPathPolicy.from_plan(tmp_path, plan)
-    )
-
-    assert error is not None and "hero.png" in error
-    assert "resource-manifest contract" in error
 
 
 def test_trace_written_frontend_paths_requires_successful_explicit_source_writes(tmp_path: Path):
@@ -434,173 +301,6 @@ def test_interrupted_checkpoint_requires_trace_recorded_validation(tmp_path: Pat
 
 def test_paid_resume_calls_are_disabled_by_default():
     assert HarnessConfig().allow_paid_resume_call is False
-
-
-def test_recovery_replays_only_model_patch_deferred_by_validation_gate(
-    tmp_path: Path,
-):
-    import json
-    import subprocess
-
-    frontend = tmp_path / "frontend"
-    frontend.mkdir()
-    subprocess.run(
-        ["git", "init", "-b", "main"], cwd=frontend, check=True, capture_output=True
-    )
-    subprocess.run(["git", "config", "user.name", "test"], cwd=frontend, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True
-    )
-    (frontend / "app.js").write_text("const route = 'hash';\n", encoding="utf-8")
-    (frontend / "index.html").write_text(
-        '<a href="#/settings">Settings</a>\n', encoding="utf-8"
-    )
-    subprocess.run(["git", "add", "--all"], cwd=frontend, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "chore: baseline"],
-        cwd=frontend, check=True, capture_output=True,
-    )
-    (frontend / "app.js").write_text("const route = 'physical';\n", encoding="utf-8")
-    file_comm = FileComm(tmp_path / ".harness")
-    file_comm.dir.mkdir(exist_ok=True)
-    (file_comm.dir / "edit_scope_round_1.json").write_text(
-        json.dumps({"allowed_root_keys": [], "allow_new_roots": True}),
-        encoding="utf-8",
-    )
-    (file_comm.dir / "edit_context_round_1.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "edit-context-v1",
-                "source_windows": [
-                    {"path": "frontend/app.js", "content": "const route = 'hash';\n"},
-                    {
-                        "path": "frontend/index.html",
-                        "content": '<a href="#/settings">Settings</a>\n',
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-    (file_comm.dir / "minimal_path_plan_round_1.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "minimal-path-plan-v3",
-                "round": 1,
-                "source_change_cone": {
-                    "initial_paths": ["frontend/app.js"],
-                    "local_paths": ["frontend/app.js", "frontend/index.html"],
-                    "dependency_paths": [],
-                    "planned_new_paths": [],
-                    "protected_paths": [],
-                    "dependency_edges": [
-                        {"from": "frontend/app.js", "to": "frontend/index.html"}
-                    ],
-                    "guarded_shared_regions": [],
-                },
-                "route_scope": {
-                    "cross_route_shared_paths": [],
-                    "off_target_paths": [],
-                },
-                "budgets": {"max_patch_lines": 20, "max_touched_files": 2},
-            }
-        ),
-        encoding="utf-8",
-    )
-    trace = file_comm.dir / "traces" / "generator_round_1.jsonl"
-    trace.parent.mkdir(parents=True)
-    deferred_args = {
-        "path": "frontend/index.html",
-        "old_text": '<a href="#/settings">Settings</a>',
-        "new_text": '<a href="/settings.html">Settings</a>',
-    }
-    trace.write_text(
-        "\n".join(
-            [
-                json.dumps({"event": "run_start", "model": "qwen-test"}),
-                json.dumps(
-                    {
-                        "event": "assistant",
-                        "message": {
-                            "tool_calls": [
-                                {
-                                    "function": {
-                                        "name": "apply_patch",
-                                        "arguments": json.dumps(
-                                            {
-                                                "path": "frontend/app.js",
-                                                "old_text": "const route = 'hash';",
-                                                "new_text": "const route = 'physical';",
-                                            }
-                                        ),
-                                    }
-                                }
-                            ]
-                        },
-                    }
-                ),
-                json.dumps(
-                    {"event": "tool", "name": "apply_patch", "ok": True, "output": "patched"}
-                ),
-                json.dumps(
-                    {
-                        "event": "assistant",
-                        "message": {
-                            "tool_calls": [
-                                {
-                                    "function": {
-                                        "name": "apply_patch",
-                                        "arguments": json.dumps(deferred_args),
-                                    }
-                                }
-                            ]
-                        },
-                    }
-                ),
-                json.dumps(
-                    {
-                        "event": "tool",
-                        "name": "apply_patch",
-                        "ok": False,
-                        "output": (
-                            "A post-mutation validation attempt is required before the "
-                            "harness widens from frontend/app.js to its dependency "
-                            "frontend/index.html."
-                        ),
-                    }
-                ),
-                json.dumps(
-                    {
-                        "event": "usage",
-                        "cumulative_usage": {"input_tokens": 100, "output_tokens": 20},
-                        "estimated_cost_usd": 0.001,
-                    }
-                ),
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    recovered = _recover_deferred_model_patches(
-        frontend, file_comm, tmp_path, 1
-    )
-    commit = _checkpoint_interrupted_model_work(
-        frontend, file_comm, tmp_path, 1, "generate"
-    )
-
-    assert recovered == {"index.html"}
-    assert '<a href="/settings.html">' in (frontend / "index.html").read_text()
-    assert commit == subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=frontend, check=True,
-        text=True, capture_output=True,
-    ).stdout.strip()
-    recovery_events = [
-        json.loads(line)
-        for line in trace.read_text(encoding="utf-8").splitlines()
-        if json.loads(line).get("event") == "harness_recovery_patch"
-    ]
-    assert recovery_events[0]["path"] == "frontend/index.html"
 
 
 def test_interrupted_root_generate_checkpoints_trace_written_untracked_files(tmp_path: Path):
@@ -854,7 +554,6 @@ async def test_generator_generate_mode_builds_sprint_scoped_prompt(monkeypatch, 
     assert "Read the planning bundle first" not in captured["prompt"]
     assert ".harness/spec.md" not in captured["prompt"]
     assert ".harness/ui_verification_plan.json" in captured["prompt"]
-    assert "exact stable selector specified" in captured["prompt"]
 
 
 @pytest.mark.anyio
@@ -1770,6 +1469,29 @@ def test_repair_keeps_deduplicated_runtime_error_across_masking_rounds(
     }]
 
 
+def test_repair_reads_fatal_runtime_error_from_lightweight_grade(tmp_path: Path):
+    file_comm = FileComm(tmp_path / ".harness")
+    (file_comm.dir / "grade_round_1.json").write_text(json.dumps({
+        "round": 1,
+        "criteria": {},
+        "overall_passed": False,
+        "runtime_summary": {
+            "fatal_runtime_errors": [
+                "HTTP 404 loading script http://127.0.0.1:19000/main.js"
+            ],
+        },
+    }), encoding="utf-8")
+
+    errors = _recent_repair_runtime_errors(
+        file_comm, before_round=1, lookback_rounds=1
+    )
+
+    assert errors == [{
+        "source_round": 1,
+        "error": "HTTP 404 loading script http://127.0.0.1:19000/main.js",
+    }]
+
+
 def test_browser_error_compaction_retains_actionability_cause():
     error = "TimeoutError: drag_and_drop\n" + "waiting for target\n" * 180 + "fixed toolbar intercepts pointer events"
     compact = _compact_browser_error(error)
@@ -2407,7 +2129,7 @@ def test_repair_prompt_reads_non_minimal_certificate_artifact(tmp_path: Path):
 
     assert "- .harness/minimality_round_1_edit.json" in prompt
     assert "Atom p006 is removable." in prompt
-    assert "failed source did not render" in prompt
+    assert "No scope or patch-size budget applies" in prompt
 
 
 def test_minimal_path_repair_uses_independent_preloaded_short_context(tmp_path: Path):
@@ -2493,7 +2215,8 @@ def test_minimal_path_repair_uses_independent_preloaded_short_context(tmp_path: 
     assert "Harness-selected source context" in prompt
     assert "save.addEventListener" in prompt
     assert "0.7%" in prompt
-    assert "Do not reread planning, grade, or shown code" in prompt
+    assert "Only solve the current Judge issue" in prompt
+    assert "Current atomic Edit diff" in prompt
     assert "Alternative OS changed to Audio Studio Driver" in prompt
     assert "### Failed criteria" not in prompt
     assert '"task":' not in prompt
@@ -2578,12 +2301,9 @@ def test_forward_prompt_consumes_harness_owned_minimal_path_plan(tmp_path: Path)
 
     assert ".harness/minimal_path_plan_round_1.json" in prompt
     assert "harness already materialized" in prompt
-    assert "Existing source overwrites are rejected" in prompt
-    assert "route_scope.target_routes" in prompt
-    assert "guarded_shared_regions" in prompt
-    assert "route_isolation_strategy" in prompt
-    assert "planned_companion_path" in prompt
-    assert "do not wrap or rewrite an accepted page script" in prompt
+    assert "post-edit scope sanity check" in prompt
+    assert "recommended_scope.target_files" in prompt
+    assert "not a file permission system" in prompt
     assert "write `.harness/edit_scope_round_1.json`" not in prompt
 
 
@@ -2749,15 +2469,6 @@ def test_repair_scope_gate_accepts_small_diff(tmp_path: Path):
     assert _validate_repair_scope(
         frontend, baseline, max_files=2, max_changed_lines=120
     ) is None
-
-
-def test_generator_runnable_files_gate_requires_package_json(tmp_path: Path):
-    frontend = tmp_path / "frontend"
-    frontend.mkdir()
-
-    assert "package.json" in _validate_generator_runnable_files(frontend, tmp_path)
-    (frontend / "package.json").write_text('{"scripts":{"dev":"vite"}}')
-    assert _validate_generator_runnable_files(frontend, tmp_path) is None
 
 
 @pytest.mark.anyio
@@ -2991,15 +2702,72 @@ def test_atomic_executor_accepts_nested_exact_patches_and_rejects_conflicting_pa
         _normalize_atomic_patch_response(payload)
 
 
-def test_skill_exact_schema_uses_copy_and_search_replace_without_line_numbers():
+def test_skill_exact_schema_exposes_sha_bound_line_operations_and_exact_fallback():
     from src.agents.generator import _atomic_exact_response_format
     schema=_atomic_exact_response_format('generate')['json_schema']['schema']
     fields=schema['properties']
-    assert fields['operations']['items']['properties']['op']['enum']==['copy_from']
+    variants=fields['operations']['items']['anyOf']
+    assert [item['properties']['op']['enum'][0] for item in variants] == [
+        'copy_from', 'replace_lines', 'insert_after'
+    ]
     assert set(fields['patches']['items']['required'])=={'path','old_text','new_text'}
-    assert fields['operations']['items']['properties']['line_edits']['maxItems']==0
+    assert variants[0]['properties']['line_edits']['maxItems']==0
+    assert 'maxItems' not in fields['operations']
+    assert 'maxItems' not in _atomic_exact_response_format('repair')['json_schema']['schema']['properties']['operations']
     assert schema['additionalProperties'] is False
     assert 'repair_task_descriptions' in _atomic_exact_response_format('repair')['json_schema']['schema']['required']
+
+
+def test_atomic_candidate_rejects_degenerate_operations_before_mutation(tmp_path):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    source = "const ready = true;\nmountCart();\n"
+    target = frontend / "app.js"
+    target.write_text(source)
+    digest = hashlib.sha256(source.encode()).hexdigest()
+
+    def validate(operations):
+        _validate_atomic_candidate_operations(
+            workdir=tmp_path,
+            mode="repair",
+            payload={"operations": operations},
+            operations=_normalize_atomic_operations(
+                {"operations": operations}, {"frontend/app.js": digest}
+            ),
+            patches=[],
+            new_files=[],
+        )
+
+    with pytest.raises(ValueError, match="blank"):
+        validate([{"op": "insert_after", "path": "frontend/app.js", "after_line": 1, "content": "  "}])
+    duplicate = {"op": "insert_after", "path": "frontend/app.js", "after_line": 1, "content": "wire();"}
+    with pytest.raises(ValueError, match="duplicate operation|repeats an insertion point"):
+        validate([duplicate, duplicate])
+    with pytest.raises(ValueError, match="duplicates existing source"):
+        validate([{"op": "insert_after", "path": "frontend/app.js", "after_line": 1, "content": "mountCart();"}])
+    with pytest.raises(ValueError, match="no source change"):
+        validate([{"op": "replace_lines", "path": "frontend/app.js", "start_line": 1,
+                   "end_line": 1, "replacement": "const ready = true;"}])
+
+
+def test_atomic_repair_candidate_only_rejects_obvious_operation_runaway(tmp_path):
+    _validate_atomic_candidate_operations(
+        workdir=tmp_path,
+        mode="repair",
+        payload={},
+        operations=[{"op": "copy_from", "path": f"frontend/{index}.js"} for index in range(13)],
+        patches=[],
+        new_files=[],
+    )
+    with pytest.raises(ValueError, match="runaway"):
+        _validate_atomic_candidate_operations(
+            workdir=tmp_path,
+            mode="repair",
+            payload={},
+            operations=[{"op": "copy_from", "path": f"frontend/{index}.js"} for index in range(129)],
+            patches=[],
+            new_files=[],
+        )
 
 
 def test_exact_patch_recovers_only_unique_whole_line_indentation():

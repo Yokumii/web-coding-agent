@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 from urllib.error import URLError
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 from src.config import HarnessConfig
 from src.utils.logger import get_logger
@@ -380,7 +380,8 @@ def fetch_status_code(url: str) -> int:
         # here can route 127.0.0.1 through a corporate proxy and turn a healthy
         # app into a false startup timeout.
         opener = build_opener(ProxyHandler({}))
-        with opener.open(url, timeout=2) as response:
+        request = Request(url, headers={"Accept": "text/html,*/*"})
+        with opener.open(request, timeout=2) as response:
             return getattr(response, "status", 200)
     except URLError as exc:  # pragma: no cover - thin wrapper around stdlib
         raise RuntimeError(str(exc)) from exc

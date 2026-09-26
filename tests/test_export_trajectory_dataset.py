@@ -141,9 +141,9 @@ def _write_strict_acceptance(
                 "expected_new_fragments": [],
             },
         )
-        (harness / f"minimal_path_ledger_round_{round_num}.jsonl").write_text(
-            '{"decision":"applied","path":"frontend/index.html"}\n'
-            '{"decision":"validation_pass"}\n'
+        _write_json(
+            harness / f"recommended_scope_state_round_{round_num}.json",
+            {"touched_paths": ["frontend/index.html"], "validation_last_ok": True},
         )
         if write_certificates:
             _write_json(
@@ -268,65 +268,19 @@ def test_minimal_path_provenance_preserves_guidance_decisions(tmp_path: Path):
             },
         },
     )
-    (harness / "minimal_path_ledger_round_2.jsonl").write_text(
-        json.dumps(
-            {
-                "decision": "allow",
-                "path": "frontend/App.jsx",
-                "scope_tier": "local",
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "decision": "applied",
-                "path": "frontend/App.jsx",
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "decision": "allow",
-                "path": "frontend/app.css",
-                "scope_tier": "dependency",
-                "expansion_reason": "recorded_dependency_edge",
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "decision": "applied",
-                "path": "frontend/app.css",
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "decision": "validation_pass",
-                "path": None,
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "decision": "deny",
-                "path": "frontend/admin.css",
-                "reason": "outside",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_json(
+        harness / "recommended_scope_state_round_2.json",
+        {
+            "touched_paths": ["frontend/App.jsx", "frontend/app.css"],
+            "validation_last_ok": True,
+        },
     )
 
     provenance = _minimal_path_provenance(harness, 2)
 
-    assert provenance["status"] == "enforced"
-    assert provenance["decision_counts"] == {"allow": 2, "deny": 1}
-    assert provenance["transition_counts"]["applied"] == 2
-    assert provenance["transition_counts"]["validation_pass"] == 1
+    assert provenance["status"] == "advisory"
     assert provenance["initial_paths"] == ["frontend/App.jsx"]
     assert provenance["touched_paths"] == ["frontend/App.jsx", "frontend/app.css"]
-    assert provenance["dependency_expansions"] == ["frontend/app.css"]
     assert provenance["plan_artifact"] == ".harness/minimal_path_plan_round_2.json"
     assert provenance["target_routes"] == ["/catalog"]
     assert provenance["protected_routes"] == ["/settings"]
@@ -368,9 +322,9 @@ def test_evidence_only_checkpoint_reuses_last_matching_mutation_ledger(tmp_path:
                 "expected_new_fragments": [],
             },
         )
-    (harness / "minimal_path_ledger_round_6.jsonl").write_text(
-        '{"decision":"applied","path":"frontend/library.js"}\n'
-        '{"decision":"validation_pass"}\n'
+    _write_json(
+        harness / "recommended_scope_state_round_6.json",
+        {"touched_paths": ["frontend/library.js"], "validation_last_ok": True},
     )
     _write_json(
         harness / "round_build_map.json",

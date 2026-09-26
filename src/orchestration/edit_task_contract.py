@@ -192,7 +192,7 @@ def chain_obligations(contract: dict[str, Any]) -> dict[str, Any]:
     return {
         key: metadata[key] for key in (
             "edit_id", "source_version", "target_version", "depends_on",
-            "requires", "produces", "preserve", "acceptance",
+            "requires", "produces", "preserve", "acceptance", "accepted_state_summary",
         ) if key in metadata
     }
 

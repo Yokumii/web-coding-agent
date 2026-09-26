@@ -68,6 +68,31 @@ def test_data_table_operations_share_one_dataset(page):
     assert page.locator('tbody tr').bounding_box()['width']<=375
 
 
+def test_data_table_optional_filters_edit_selection_and_bulk_action(page):
+    load(page,'data-table')
+    page.evaluate('''() => {window.events=[];window.rows=[
+      {id:'a',name:'Alpha',kind:'Food',delta:2},{id:'b',name:'Beta',kind:'Sleep',delta:-3}];
+      window.component=mountDataTable({container:document.querySelector('#mount'),rows,
+        columns:[{key:'name',label:'Name',filter:'text',editable:true},
+          {key:'kind',label:'Kind',filter:'select',filterOptions:['Food','Sleep']},
+          {key:'delta',label:'Delta',filter:'sign'}],getId:r=>r.id,pageSize:1,pageSizes:[1,2],selectable:true,
+        bulkActions:[{id:'archive',label:'Archive'}],onSelection:ids=>events.push(['selection',ids]),
+        onEdit:change=>{events.push(['edit',change.id,change.value]);rows=rows.map(r=>r.id===change.id?{...r,name:change.value}:r);component.setRows(rows)},
+        onBulkAction:(action,ids)=>events.push(['bulk',action,ids])});}''')
+    page.get_by_label('Filter Kind').select_option('Sleep')
+    expect(page.locator('tbody')).to_contain_text('Beta')
+    page.get_by_label('Filter Kind').select_option('')
+    page.get_by_label('Edit Name for Alpha').click()
+    page.locator('tbody input[type=text]').fill('Updated')
+    page.get_by_role('button',name='Save',exact=True).click()
+    expect(page.locator('tbody')).to_contain_text('Updated')
+    page.get_by_label('Select visible records').check()
+    page.get_by_role('button',name='Archive',exact=True).click()
+    assert page.evaluate("events.some(e=>e[0]==='bulk'&&e[1]==='archive'&&e[2][0]==='a')")
+    page.get_by_label('Rows per page').select_option('2')
+    assert page.evaluate('component.snapshot().pageSize')==2
+
+
 def test_editor_real_selection_serialization_and_safe_paste(page):
     load(page,'rich-text-editor')
     page.evaluate('''() => {const output=document.createElement('input');output.type='hidden';output.id='output';document.body.append(output);
@@ -114,6 +139,23 @@ def test_tree_parent_selection_partial_and_search(page):
     expect(page.get_by_label('Select Beta',exact=True)).to_be_visible()
     page.get_by_label('Search tree').fill('')
     expect(page.get_by_label('Select Beta',exact=True)).to_have_count(0)
+
+
+def test_tree_lazy_children_are_indexed_once_and_locked_nodes_stay_unselected(page):
+    load(page,'tree-view')
+    page.evaluate('''() => {window.focused=[];window.component=mountTreeView({container:document.querySelector('#mount'),
+      nodes:[{id:'root',label:'Root',loadChildren:()=>new Promise(resolve=>window.finishTree=resolve)}],
+      onNodeFocus:node=>focused.push(node.id)});}''')
+    page.get_by_role('button',name='Expand Root',exact=True).click()
+    expect(page.get_by_text('Loading…',exact=True)).to_be_visible()
+    page.evaluate("finishTree([{id:'open',label:'Open'},{id:'locked',label:'Locked',disabled:true}])")
+    expect(page.get_by_label('Select Open',exact=True)).to_be_visible()
+    expect(page.get_by_label('Select Locked',exact=True)).to_be_disabled()
+    page.get_by_label('Select Open',exact=True).check()
+    assert page.evaluate('component.snapshot().selected')==['open']
+    assert page.evaluate('component.snapshot().loaded')==['root']
+    page.get_by_text('Open',exact=True).click()
+    assert page.evaluate('focused.at(-1)')=='open'
 
 
 def test_dashboard_numbers_and_svg_share_samples(page):

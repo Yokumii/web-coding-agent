@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 
 MAX_HELPERS = 3
+API_TIMEOUT = 60
+PROCESS_TIMEOUT = 75
 MAX_CODE = 1800
 CATALOG = 'learned.json'
 
@@ -52,6 +54,20 @@ def validate_helper(helper):
         json.loads(test['expected_json'])
 
 
+def normalize_test_json(helper):
+    """Repair the harmless schema gap where a model returns a plain string result."""
+    for test in helper.get('tests', []):
+        for field in ('args_json', 'expected_json'):
+            value = test.get(field)
+            if not isinstance(value, str):
+                test[field] = json.dumps(value, ensure_ascii=False)
+        try:
+            json.loads(test['expected_json'])
+        except json.JSONDecodeError:
+            test['expected_json'] = json.dumps(test['expected_json'], ensure_ascii=False)
+    return helper
+
+
 def helper_context(folder):
     try:
         helpers=load_helpers(folder)
@@ -82,7 +98,10 @@ def enqueue(*, output, before, after, skill, item, evidence_ref):
         snippet=x['code'][:min(budget,12000)]
         sources.append({'path':x['path'],'code':snippet,'truncated':len(snippet)!=len(x['code'])})
         budget-=len(snippet)
-    packet={'skill':skill,'instruction':item,'source':sources,'evidence_ref':str(evidence_ref)}
+    evidence=Path(evidence_ref)
+    if evidence.is_absolute():
+        evidence=evidence.relative_to(output.resolve())
+    packet={'skill':skill,'instruction':item,'source':sources,'evidence_ref':str(evidence)}
     key=hashlib.sha256(json.dumps(packet,sort_keys=True).encode()).hexdigest()[:20]
     path=output/'rsi_queue'/f'{key}.json'
     save(path,packet)
@@ -115,6 +134,18 @@ async def learn(packet_path, library, config, output):
     from src.agents.openai_runner import OpenAIHTTPClient
     from src.orchestration.edit_skills import EDIT_SKILLS
     packet=json.loads(packet_path.read_text())
+    # Resolve evidence inside the packet's own case, including relocated legacy runs.
+    evidence=Path(packet['evidence_ref'])
+    if evidence.is_absolute():
+        evidence=Path(evidence.parent.name)/evidence.name
+    evidence=(packet_path.resolve().parent.parent/evidence).resolve()
+    evidence.relative_to(packet_path.resolve().parent.parent)
+    checkpoint=json.loads(evidence.read_text())
+    target={x['path']:x['code'] for x in checkpoint['target']}
+    if not checkpoint.get('browser_verified') or any(
+            not target.get(x['path'],'').startswith(x['code']) for x in packet['source']):
+        raise ValueError('RSI packet does not match its accepted browser checkpoint')
+    packet['evidence_ref']=str(evidence)
     skill=packet['skill']
     if skill not in EDIT_SKILLS.values():
         raise ValueError('unknown Skill')
@@ -130,35 +161,35 @@ async def learn(packet_path, library, config, output):
         'required':['action','reason','name','code','usage','tests'],'additionalProperties':False}
     core={p.name:p.read_text() for p in (folder/'references').glob('*.mjs')}
     request={'accepted_edit':packet,'skill':(folder/'SKILL.md').read_text(),
-        'existing_helpers':existing,'core':core}
+        'existing_helpers':existing,'installed_skill_core':core}
     output.mkdir(parents=True,exist_ok=True)
     save(output/'request.json',request)
     metric={'status':'started','usage':None,'model':config.generator_model}
     started=time.monotonic()
     try:
-        response=await OpenAIHTTPClient(config,20).complete(model=config.generator_model,max_tokens=1800,
-            messages=[{'role':'system','content':'''Extract at most ONE genuinely useful, already exercised reusable pure JavaScript function
-from this accepted Edit. Prefer retaining the original function body. Remove business names, labels,
-field/DOM identifiers, storage keys and project-specific data assumptions; use arguments instead.
-Inspect individual new functions, not only the feature as a whole. A pure mapping/calculation used
-by a DOM component can be reusable even when the containing component is not. Such a helper does
-not duplicate the engine merely because that engine consumes its result.
-Standard UI modes and mathematical parameters are not business data. Compare actual existing code:
-sharing a broad feature category is NOT duplication. A small helper supporting additional generic
-options absent from the core is a valid extension; retain the engine and expose the helper separately.
-Do not extract a whole component, clone an existing core API, invent new capabilities, or retain dead code.
-Check existing helpers and core: merge the SAME capability under its existing name, never add an alias
-or duplicate. Existing calls must remain compatible. If already covered, too trivial, unsafe, or uncertain,
-SKIP. At most 3 helpers per Skill; skip a new capability when full. One named function declaration,
-no imports, exports, external dependencies, DOM, storage, network, closure variables or side effects.
-Maximum 60 lines and 1800 characters of code; usage <=240 characters, just signature and integration.
-Provide 2-4 short JSON input/output tests, including edge cases; test JSON is data, never code.
-Return the required schema; skip uses empty name/code/usage and empty tests. Reason one sentence.'''},
+        options = ({'enable_thinking': True, 'thinking_budget': 512}
+            if config.openai_wire_api == 'chat' else {'reasoning_effort': 'low'})
+        response=await OpenAIHTTPClient(config,API_TIMEOUT).complete(model=config.generator_model,max_tokens=1800,
+            messages=[{'role':'system','content':'''Find one small reusable function in accepted_edit.source for this Skill.
+Keep its function body where possible; converting an arrow function to a named function is fine.
+Callbacks used by the component are eligible. Reuse within this UI capability is sufficient:
+remove page/business names, fixed data fields, DOM ids and storage keys, not generic UI parameters.
+Compare only installed_skill_core and existing_helpers for duplicates. The accepted Edit's modified
+copies are new material, not the installed library. Merge the same capability under the existing name.
+Return upsert for one useful helper, or skip if none, already covered, or the 3-helper catalog is full.
+The helper must be a standalone pure function with arguments, without imports, exports, globals,
+DOM, network, storage or external dependencies. Keep <=60 lines/1800 characters and usage <=240 chars.
+The name field is the JavaScript FUNCTION identifier, not the Skill name, and must exactly match
+the function declaration. Function inputs must be JSON-serializable: arrays, objects and primitives.
+Convert an array argument to a Set inside the function if needed; JSON cannot pass a Set or Map.
+Preserve existing call compatibility. Supply 2-4 JSON argument-array/expected-result tests including
+an edge case. Do not invent a new feature or copy a whole component. Skip uses empty strings/tests.
+Reason one short sentence.'''},
                 {'role':'user','content':json.dumps(request,ensure_ascii=False)}],
-            _stream=True,enable_thinking=False,
+            _stream=True,**options,
             response_format={'type':'json_schema','json_schema':{'name':'skill_helper','strict':True,'schema':schema}})
         metric.update(status='completed',usage=response.get('usage'))
-        proposal=json.loads(response['choices'][0]['message']['content'])
+        proposal=normalize_test_json(json.loads(response['choices'][0]['message']['content']))
         save(output/'proposal.json',proposal)
         if proposal['action']=='skip':
             return {'status':'skipped','reason':proposal['reason']}
@@ -183,9 +214,13 @@ Return the required schema; skip uses empty name/code/usage and empty tests. Rea
         if (catalog.read_bytes() if catalog.exists() else None)!=original_bytes:
             raise ValueError('Skill changed concurrently; proposal retained without publishing')
         revision=hashlib.sha256(json.dumps(helpers,sort_keys=True).encode()).hexdigest()
-        save(catalog,{'revision':revision,'helpers':helpers,'source':str(packet_path),
+        prior_catalog = json.loads(original_bytes) if original_bytes else {}
+        save(catalog,{'version':int(prior_catalog.get('version',0))+1,
+            'revision':revision,'previous_revision':prior_catalog.get('revision'),
+            'helpers':helpers,'source':str(packet_path),
             'validation':str(output.resolve()),'evidence_ref':packet['evidence_ref']})
-        return {'status':'published','skill':skill,'helper':helper['name'],'revision':revision}
+        return {'status':'published','skill':skill,'helper':helper['name'],
+            'version':int(prior_catalog.get('version',0))+1,'revision':revision}
     except BaseException as exc:
         metric.update(status='failed',error=f'{type(exc).__name__}: {exc}')
         raise

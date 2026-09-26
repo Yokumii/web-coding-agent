@@ -12,7 +12,6 @@ from src.orchestration.edit_dom_guard import (
     snapshot_semantic_dom,
 )
 from src.orchestration.file_comm import FileComm
-from src.agents.generator import _validate_edit_scope
 
 
 def _snapshot(*items):
@@ -511,73 +510,6 @@ def test_fragment_guard_aligns_legacy_single_route_baseline_with_routed_current(
     assert result["passed"] is True
 
 
-def test_generator_scope_validation_accepts_bounded_repeated_new_fragments(tmp_path):
-    (tmp_path / "seed_manifest.json").write_text("{}")
-    harness = tmp_path / ".harness"
-    harness.mkdir()
-    (harness / "edit_dom_baseline.json").write_text(
-        json.dumps(
-            {
-                "version": 4,
-                "stable": True,
-                "roots": [],
-                "fragments": [],
-                "routes": ["/catalog"],
-            }
-        )
-    )
-    (harness / "edit_scope_round_1.json").write_text(
-        json.dumps(
-            {
-                "allowed_root_keys": [],
-                "allowed_fragment_keys": [],
-                "expected_new_fragments": [
-                    {"route": "/catalog", "selector": ".catalog-item", "max_count": 5}
-                ],
-                "target_routes": ["/catalog"],
-                "protected_routes": [],
-                "allow_new_roots": True,
-            }
-        )
-    )
-
-    assert _validate_edit_scope(tmp_path, 1) is None
-
-
-def test_forward_edit_requires_small_machine_readable_scope(tmp_path):
-    (tmp_path / "seed_manifest.json").write_text("{}")
-    harness = tmp_path / ".harness"
-    harness.mkdir()
-    assert _validate_edit_scope(tmp_path, 1) is not None
-    (harness / "edit_dom_baseline.json").write_text('{"roots":[{"key":"main"}]}')
-    (harness / "edit_scope_round_1.json").write_text(
-        '{"allowed_root_keys":["main"],"allow_new_roots":false}'
-    )
-    assert _validate_edit_scope(tmp_path, 1) is None
-    (harness / "edit_scope_round_1.json").write_text(
-        '{"allowed_root_keys":["frontend"],"allow_new_roots":false}'
-    )
-    assert "unknown baseline roots" in _validate_edit_scope(tmp_path, 1)
-
-
-def test_non_forward_repair_scope_uses_failed_source_baseline(tmp_path):
-    harness = tmp_path / ".harness"
-    harness.mkdir()
-    (harness / "repair_dom_source_round_2.json").write_text(
-        '{"roots":[{"key":"dialog"},{"key":"main"}]}'
-    )
-    (harness / "edit_scope_round_2.json").write_text(
-        '{"allowed_root_keys":["dialog"],"allow_new_roots":false}'
-    )
-
-    assert _validate_edit_scope(
-        tmp_path,
-        2,
-        required=True,
-        baseline_filename="repair_dom_source_round_2.json",
-    ) is None
-
-
 @pytest.mark.anyio
 async def test_guard_prefers_accepted_sprint_baseline_over_failed_repair_snapshot(
     monkeypatch, tmp_path
@@ -619,24 +551,6 @@ async def test_guard_prefers_accepted_sprint_baseline_over_failed_repair_snapsho
     assert result is not None
     assert result["passed"] is True
     assert result["baseline_file"] == ".harness/edit_dom_source_sprint_1.json"
-
-
-def test_harness_owned_scope_can_reference_current_sprint_baseline(tmp_path):
-    (tmp_path / "seed_manifest.json").write_text("{}")
-    harness = tmp_path / ".harness"
-    harness.mkdir()
-    (harness / "edit_dom_baseline.json").write_text(
-        '{"roots":[{"key":"seed-main"}]}'
-    )
-    (harness / "edit_dom_source_sprint_2.json").write_text(
-        '{"roots":[{"key":"accepted-search"}]}'
-    )
-    (harness / "edit_scope_round_2.json").write_text(
-        '{"owner":"harness","baseline":".harness/edit_dom_source_sprint_2.json",'
-        '"allowed_root_keys":["accepted-search"],"allow_new_roots":false}'
-    )
-
-    assert _validate_edit_scope(tmp_path, 2) is None
 
 
 @pytest.mark.anyio
@@ -930,39 +844,6 @@ def test_multi_route_scope_rejects_allowed_root_from_protected_page():
     )
     assert result["passed"] is False
     assert "outside target routes" in result["reason"]
-
-
-def test_generator_accepts_two_roots_for_each_target_route(tmp_path):
-    (tmp_path / "seed_manifest.json").write_text("{}")
-    harness = tmp_path / ".harness"
-    harness.mkdir()
-    roots = [
-        {"key": f"{route}::{name}", "route": route, "fingerprint": name}
-        for route in ("/catalog", "/search")
-        for name in ("main", "dialog")
-    ]
-    (harness / "edit_dom_baseline.json").write_text(
-        json.dumps(
-            {
-                "version": 3,
-                "routes": ["/catalog", "/search", "/settings"],
-                "roots": roots,
-            }
-        )
-    )
-    (harness / "edit_scope_round_1.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "edit-scope-v3",
-                "allowed_root_keys": [root["key"] for root in roots],
-                "allow_new_roots": False,
-                "target_routes": ["/catalog", "/search"],
-                "protected_routes": ["/settings"],
-            }
-        )
-    )
-
-    assert _validate_edit_scope(tmp_path, 1) is None
 
 
 def test_explicit_fragment_budget_preserves_undeclared_siblings():

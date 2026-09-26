@@ -1770,3 +1770,84 @@ async def test_ambiguous_wait_is_contract_error_not_broken_product(tmp_path):
         await runner.cleanup()
     assert result['checks'][0]['status'] == 'invalid_test_contract'
     assert '<article>Alex</article>' in result['checks'][0]['failure_dom']
+
+
+@pytest.mark.anyio
+async def test_failed_selector_includes_real_controls_beyond_dom_excerpt(tmp_path):
+    async def page(_request):
+        return web.Response(text='<p>'+('long page '*1000)+'</p><button id="actual" aria-label="Open basket">Basket</button>',content_type='text/html')
+    app=web.Application();app.router.add_get('/',page)
+    runner=web.AppRunner(app);await runner.setup()
+    site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+    try:
+        result=await collect_browser_evidence(
+            app_url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+            checks=[{'id':'wrong-selector','route':'/','actions':[{'action':'click','selector':'#invented'}]}],
+            output_path=tmp_path/'evidence.json',headless=True,action_timeout_ms=100)
+    finally:await runner.cleanup()
+    check=result['checks'][0]
+    assert check['status']=='action_failed'
+    assert 'actual' not in check['failure_dom']
+    assert any(x['id']=='actual' and x['name']=='Open basket' for x in check['failure_controls'])
+
+
+@pytest.mark.anyio
+async def test_post_generation_observation_captures_controls_without_failure(tmp_path):
+    async def page(_request):
+        return web.Response(text='<button id="open">Open</button>',content_type='text/html')
+    app=web.Application();app.router.add_get('/',page)
+    runner=web.AppRunner(app);await runner.setup()
+    site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+    try:
+        result=await collect_browser_evidence(
+            app_url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+            checks=[{'id':'observe','route':'/','actions':[{'action':'assert_visible','selector':'body'}]}],
+            output_path=tmp_path/'observed.json',headless=True,capture_observations=True)
+    finally:
+        await runner.cleanup()
+    check=result['checks'][0]
+    assert check['status']=='ok'
+    assert any(x['id']=='open' for x in check['failure_controls'])
+
+
+@pytest.mark.anyio
+async def test_checkbox_value_confusion_is_check_error_not_product_failure(tmp_path):
+    async def page(_request):
+        return web.Response(text='<input type="checkbox" id="pick">',content_type='text/html')
+    app=web.Application();app.router.add_get('/',page)
+    runner=web.AppRunner(app);await runner.setup()
+    site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+    try:
+        result=await collect_browser_evidence(
+            app_url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+            checks=[{'id':'wrong-value','route':'/','actions':[
+                {'action':'click','selector':'#pick'},
+                {'action':'assert_value','selector':'#pick','value':'true'}]},
+                {'id':'checked-state','route':'/','actions':[
+                {'action':'click','selector':'#pick'},
+                {'action':'assert_visible','selector':'#pick:checked'}]}],
+            output_path=tmp_path/'checkbox.json',headless=True)
+    finally:
+        await runner.cleanup()
+    assert [c['status'] for c in result['checks']]==['invalid_test_contract','ok']
+
+
+@pytest.mark.anyio
+async def test_vite_shadow_overlay_preserves_actual_compile_error(tmp_path):
+    async def page(_request):
+        return web.Response(text='''<vite-error-overlay></vite-error-overlay><script>
+            document.querySelector('vite-error-overlay').attachShadow({mode:'open'}).innerHTML=
+            '<div class="message">Unable to parse HTML</div><pre class="frame">index.html:35</pre>';
+            </script>''',status=500,content_type='text/html')
+    app=web.Application();app.router.add_get('/',page)
+    runner=web.AppRunner(app);await runner.setup()
+    site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+    try:
+        result=await collect_browser_evidence(
+            app_url=f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+            checks=[{'id':'compile','route':'/','actions':[{'action':'assert_visible','selector':'body'}]}],
+            output_path=tmp_path/'compile.json',headless=True)
+    finally:
+        await runner.cleanup()
+    assert 'Unable to parse HTML' in result['checks'][0]['build_error']
+    assert 'index.html:35' in result['checks'][0]['build_error']

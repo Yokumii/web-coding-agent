@@ -8,6 +8,7 @@ import pytest
 
 from src.orchestration.frozen_compound_edit import (
     normalize_frozen_compound_plan,
+    plan_from_atomic_contracts,
     read_frozen_compound_plan,
     write_frozen_compound_plan,
 )
@@ -50,6 +51,71 @@ def raw_plan(tasks):
             for task in tasks
         ]
     }
+
+
+def test_atomic_contract_plan_bypasses_llm_and_uses_observed_route():
+    tasks = frozen_tasks()
+    tasks[0]["instruction"] = "Add filtering to the resources page."
+
+    result = plan_from_atomic_contracts(
+        case_id="case",
+        source_code_sha256="abc",
+        frozen_subtasks=tasks,
+        source_ui_contract={
+            "pages": [
+                {"route": "/dashboard.html"},
+                {"route": "/"},
+                {"route": "/resources.html"},
+            ]
+        },
+    )
+
+    assert result["planner_model"] == "dataset-atomic-contract"
+    assert result["subtasks"][0]["target_routes"] == ["/resources.html"]
+    assert result["subtasks"][1]["target_routes"] == ["/"]
+    assert result["subtasks"][0]["atomic_plan"]["goal"] == tasks[0]["instruction"]
+    assert result["subtasks"][0]["atomic_plan"]["checks"][0]["actions"] == [
+        {"action": "assert_no_console_errors"}
+    ]
+
+
+def test_atomic_contract_infers_named_spa_route_from_source_page():
+    result = plan_from_atomic_contracts(
+        case_id="case-route",
+        source_code_sha256="a" * 64,
+        frozen_subtasks=[
+            {
+                "id": f"q{index}",
+                "task_type": "Data Table",
+                "instruction": "Enhance the Compare page with a sortable comparison table.",
+            }
+            for index in range(1, 5)
+        ],
+        source_ui_contract={"pages": [{"route": "/"}]},
+        source_paths=["src/pages/HomePage.tsx", "src/pages/ComparePage.tsx"],
+    )
+    assert result["subtasks"][0]["target_routes"] == ["/compare"]
+
+
+def test_atomic_contract_prefers_explicit_page_over_incidental_route_word():
+    instruction = (
+        "Enhance the Compare page with a table that remains usable when the catalog expands."
+    )
+    result = plan_from_atomic_contracts(
+        case_id="case-route-priority",
+        source_code_sha256="b" * 64,
+        frozen_subtasks=[
+            {"id": f"q{index}", "task_type": "Data Table", "instruction": instruction}
+            for index in range(1, 5)
+        ],
+        source_ui_contract={"pages": [{"route": "/"}]},
+        source_paths=[
+            "src/pages/HomePage.tsx",
+            "src/pages/CatalogPage.tsx",
+            "src/pages/ComparePage.tsx",
+        ],
+    )
+    assert result["subtasks"][0]["target_routes"] == ["/compare"]
 
 
 def test_plan_freezes_exact_subtask_order_and_hash(tmp_path):
@@ -321,6 +387,34 @@ def test_planner_corrects_hidden_entry_once_and_reuses_saved_responses(tmp_path,
     assert len(calls)==2 and replay['frozen_plan_sha256']==result['frozen_plan_sha256']
 
 
+def test_planner_repairs_missing_subtasks_without_regenerating_valid_plans(tmp_path, monkeypatch):
+    from src.agents.compound_edit_planner import plan_frozen_compound_edit
+    from src.agents.openai_runner import OpenAIHTTPClient
+    from src.config import HarnessConfig
+    tasks = frozen_tasks()
+    complete_plan = raw_plan(tasks)
+    first = {"subtasks": complete_plan["subtasks"][:-1]}
+    missing = {"subtasks": complete_plan["subtasks"][-1:]}
+    calls = []
+
+    async def complete(self, **kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        payload = first if len(calls) == 1 else missing
+        return {"choices": [{"message": {"content": json.dumps(payload)}}]}
+
+    monkeypatch.setattr(OpenAIHTTPClient, "complete", complete)
+    result = asyncio.run(plan_frozen_compound_edit(
+        config=HarnessConfig(edit_skills_enabled=True, planner_model="gpt-5.6-luna"),
+        case_id="case", source_code_sha256="abc", frozen_subtasks=tasks,
+        source_ui_contract={"pages": []}, output_path=tmp_path / "plan.json",
+    ))
+
+    assert [item["id"] for item in result["plan"]["subtasks"]] == [
+        item["id"] for item in tasks
+    ]
+    assert "Return only the missing subtask plans" in calls[1]["messages"][-1]["content"]
+
+
 def test_planner_rejects_menu_control_hidden_by_an_earlier_entry(tmp_path, monkeypatch):
     from src.agents.compound_edit_planner import plan_frozen_compound_edit
     from src.agents.openai_runner import OpenAIHTTPClient
@@ -342,3 +436,14 @@ def test_planner_rejects_menu_control_hidden_by_an_earlier_entry(tmp_path, monke
     asyncio.run(plan_frozen_compound_edit(**kwargs))
     assert len(calls)==2
     assert 'source entry navigation hides #menu-feature' in calls[1]['messages'][-1]['content']
+
+
+def test_compound_planner_prompt_satisfies_responses_json_format_requirement():
+    from src.agents.compound_edit_planner import _planner_prompt
+
+    prompt = _planner_prompt(
+        frozen_subtasks=frozen_tasks(),
+        source_ui_contract={"pages": []},
+    )
+
+    assert "json" in prompt

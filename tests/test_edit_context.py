@@ -1,5 +1,7 @@
 from pathlib import Path
 import hashlib
+import json
+import subprocess
 
 from src.orchestration.edit_context import (
     _javascript_complete_range,
@@ -7,6 +9,7 @@ from src.orchestration.edit_context import (
     ensure_edit_context,
     render_edit_context,
 )
+from src.orchestration.phases import _current_atomic_repair_context_plan
 
 
 def test_javascript_context_keeps_one_hop_router_and_navigation_functions():
@@ -60,7 +63,7 @@ def test_javascript_context_expands_dangling_function_header_to_boundary():
     ).splitlines(keepends=True)
 
     assert _javascript_complete_range(lines, 1, 2) == (1, 4)
-from src.orchestration.minimal_path_guidance import MinimalPathPolicy
+from src.orchestration.minimal_path_guidance import EditScopeState
 
 
 def _plan() -> dict:
@@ -148,7 +151,7 @@ def test_edit_context_spends_small_overage_to_close_javascript_function(tmp_path
     assert len(window["content"]) > 2_000
 
 
-def test_preloaded_window_allows_exact_patch_but_not_unseen_source(tmp_path: Path):
+def test_preloaded_window_is_context_guidance_not_a_read_gate(tmp_path: Path):
     frontend = tmp_path / "frontend"
     frontend.mkdir()
     source = "".join(f"const line{index} = {index};\n" for index in range(1, 501))
@@ -163,7 +166,7 @@ def test_preloaded_window_allows_exact_patch_but_not_unseen_source(tmp_path: Pat
         max_file_chars=2_000,
         context_lines=5,
     )
-    policy = MinimalPathPolicy(tmp_path, plan)
+    policy = EditScopeState(tmp_path, plan)
 
     assert policy.check(
         "apply_patch",
@@ -173,7 +176,7 @@ def test_preloaded_window_allows_exact_patch_but_not_unseen_source(tmp_path: Pat
             "new_string": "const line250 = 251;",
         },
     ) is None
-    denial = policy.check(
+    guidance_result = policy.check(
         "apply_patch",
         {
             "path": "frontend/app.js",
@@ -181,12 +184,8 @@ def test_preloaded_window_allows_exact_patch_but_not_unseen_source(tmp_path: Pat
             "new_string": "const line10 = 11;",
         },
     )
-    assert denial is not None
-    assert "preloaded" in denial.lower()
+    assert guidance_result is None
 
-    policy.observe_result(
-        "read_file", {"path": "frontend/app.js"}, ok=True, output=source
-    )
     assert policy.check(
         "apply_patch",
         {
@@ -358,3 +357,35 @@ def test_frozen_compound_context_includes_direct_markup_and_style_dependencies(
         "frontend/index.html",
         "frontend/styles.css",
     ]
+
+
+def test_repair_context_plan_excludes_prior_accepted_skill_files(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    harness = tmp_path / ".harness"
+    frontend.mkdir()
+    harness.mkdir()
+    for name in ("index.html", "current.js", "prior.js"):
+        (frontend / name).write_text(f"// {name}\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=frontend, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=frontend, check=True)
+    subprocess.run(["git", "add", "."], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-qm", "baseline"], cwd=frontend, check=True)
+    baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=frontend, text=True).strip()
+    (frontend / "index.html").write_text("<main>current edit</main>\n", encoding="utf-8")
+    (frontend / "current.js").write_text("const current = true;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=frontend, check=True)
+    subprocess.run(["git", "commit", "-qm", "current edit"], cwd=frontend, check=True)
+    (harness / "round_build_map.json").write_text(json.dumps({
+        "1": {"source_commit": baseline},
+    }), encoding="utf-8")
+    plan = _plan()
+    paths = ["frontend/index.html", "frontend/current.js", "frontend/prior.js"]
+    plan["source_change_cone"].update({"initial_paths": paths, "local_paths": paths})
+
+    filtered = _current_atomic_repair_context_plan(tmp_path, harness, plan, 2)
+
+    assert filtered["source_change_cone"]["initial_paths"] == [
+        "frontend/index.html", "frontend/current.js"
+    ]
+    assert plan["source_change_cone"]["initial_paths"] == paths

@@ -199,6 +199,29 @@ async def test_wait_for_http_rejects_404(monkeypatch, tmp_path: Path):
         )
 
 
+def test_fetch_status_code_requests_html_for_vite_spa_fallback(monkeypatch):
+    from src.orchestration import runtime
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Opener:
+        def open(self, request, timeout):
+            assert request.get_header("Accept") == "text/html,*/*"
+            assert timeout == 2
+            return Response()
+
+    monkeypatch.setattr(runtime, "build_opener", lambda *_args: Opener())
+
+    assert runtime.fetch_status_code("http://127.0.0.1:5173/") == 200
+
+
 @pytest.mark.anyio
 async def test_start_app_stack_requires_only_frontend(monkeypatch, tmp_path: Path):
     frontend_dir = tmp_path / "frontend"

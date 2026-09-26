@@ -22,7 +22,37 @@ from scripts.run_batch import BatchTask, EditStep, run_batch
 from scripts.export_trajectory_dataset import apply_patches, code_at_commit, make_patches
 from src.agents.compound_edit_planner import plan_frozen_compound_edit
 from src.config import HarnessConfig
-from src.orchestration.frozen_compound_edit import read_frozen_compound_plan
+from src.orchestration.frozen_compound_edit import (
+    plan_from_atomic_contracts,
+    read_frozen_compound_plan,
+    write_frozen_compound_plan,
+)
+
+
+def _source_observation_url(base_url: str, contract: dict[str, Any]) -> str:
+    route = str(next((page.get("route") for page in contract.get("pages", [])
+                      if page.get("route")), "/"))
+    return base_url.rstrip("/") + "/" + route.lstrip("/")
+
+
+async def _navigate_source_surface(page: Any, target_url: str) -> bool:
+    """Return false when a source route immediately redirects to another surface."""
+    try:
+        await page.goto(target_url, wait_until="domcontentloaded")
+    except Exception as exc:
+        if "interrupted by another navigation" not in str(exc):
+            raise
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            return False
+    expected = urlsplit(target_url)
+    observed = urlsplit(page.url)
+    return (observed.path, observed.query, observed.fragment) == (
+        expected.path,
+        expected.query,
+        expected.fragment,
+    )
 
 
 async def _source_ui_contract(source: Path, evaluation: Path, config: HarnessConfig) -> dict:
@@ -35,13 +65,19 @@ async def _source_ui_contract(source: Path, evaluation: Path, config: HarnessCon
                            cwd=source, log_path=evaluation.parent / "source_observation.log")
     url = f"http://127.0.0.1:{config.frontend_port}"
     try:
-        await wait_for_http(name="source-observation", url=url, managed=server)
+        await wait_for_http(
+            name="source-observation",
+            url=_source_observation_url(url, contract),
+            managed=server,
+        )
         async with async_playwright() as playwright:
             browser = await launch_chromium(playwright, headless=True)
             try:
                 page = await browser.new_page()
                 for surface in contract.get("pages", []):
-                    await page.goto(url + surface["route"], wait_until="domcontentloaded")
+                    if not await _navigate_source_surface(page, url + surface["route"]):
+                        surface["observation_status"] = "redirected"
+                        continue
                     for control in surface.get("controls", []):
                         locator = page.locator(control["selector"])
                         control["initially_visible"] = await locator.count() > 0 and await locator.first.is_visible()
@@ -51,8 +87,12 @@ async def _source_ui_contract(source: Path, evaluation: Path, config: HarnessCon
                     for entry in entries:
                         probe = await browser.new_page()
                         try:
-                            await probe.goto(url + surface["route"], wait_until="domcontentloaded")
-                            await probe.locator(entry["selector"]).first.click(timeout=3000)
+                            if not await _navigate_source_surface(probe, url + surface["route"]):
+                                continue
+                            try:
+                                await probe.locator(entry["selector"]).first.click(timeout=3000)
+                            except Exception:
+                                continue
                             await probe.wait_for_timeout(1000)
                             hidden = []
                             for control in entries:
@@ -166,13 +206,35 @@ def _prepare_source_dependencies(source: Path, evaluation: Path) -> None:
 def _provider_config(args: argparse.Namespace) -> HarnessConfig:
     profile = {}
     if getattr(args, "provider_profile", None):
-        profile_path = Path.home() / ".config/webcoding" / f"{args.provider_profile}.json"
-        if args.provider_profile != "experimental-luna":
+        if args.provider_profile == "njulink-degraded":
+            profile_path = Path.home() / ".config/webcoding/experimental-luna.json"
+        elif args.provider_profile == "experimental-luna":
+            profile_path = Path.home() / ".config/webcoding/experimental-luna.json"
+        elif args.provider_profile == "openai":
+            profile_path = None
+            profile = {
+                "base_url": "https://api.nju-link.com/v1",
+                "wire_api": "responses",
+                "http_headers": {
+                    "x-openai-actor-authorization": "local-image-extension"
+                },
+            }
+        else:
             raise ValueError("Unknown provider profile")
-        profile = json.loads(profile_path.read_text())
-    key = profile.get("bearer_token") or os.environ.get("NJULINK_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if profile_path is not None:
+            profile = json.loads(profile_path.read_text())
+        if args.provider_profile == "njulink-degraded":
+            profile["bearer_token"] = (
+                Path.home() / ".config/webcoding/credentials/njulink-degraded.key"
+            ).read_text().strip()
+    key = (
+        profile.get("bearer_token")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("NJULINK_API_KEY")
+    )
     base = (profile.get("base_url") or os.environ.get("OPENAI_BASE_URL", "https://api.nju-link.com")).rstrip("/")
     model = args.model or profile.get("model") or "gpt-5.6-luna"
+    review_model = getattr(args, "review_model", None) or profile.get("review_model") or model
     wire_api = profile.get("wire_api") or os.environ.get("OPENAI_WIRE_API", "chat")
     if not urlsplit(base).path.strip("/") and wire_api != "responses":
         base += "/v1"
@@ -184,12 +246,12 @@ def _provider_config(args: argparse.Namespace) -> HarnessConfig:
         openai_api_key=key,
         openai_base_url=base,
         openai_wire_api=wire_api,
-        openai_stream_read_retries=2 if args.provider_profile == "experimental-luna" else 0,
+        openai_stream_read_retries=2 if args.provider_profile == "openai" else 0,
         openai_extra_headers=profile.get("http_headers", {}),
         planner_model=model,
         generator_model=model,
-        evaluator_model=model,
-        evaluator_vision_model=model,
+        evaluator_model=review_model,
+        evaluator_vision_model=review_model,
         evaluator_vision_api_key=key,
         evaluator_vision_base_url=base,
         evaluator_vision_endpoint_type="openai",
@@ -203,15 +265,15 @@ def _provider_config(args: argparse.Namespace) -> HarnessConfig:
         planner_budget_usd=budget,
         generator_budget_usd=budget,
         evaluator_budget_usd=budget,
-        # Lightweight production permits one additional evidence-driven Repair:
-        # implementation + at most two repairs, still bounded per case.
-        edit_max_rounds=max(3, getattr(args, "debug_max_rounds", 3)),
+        # Harness counts the initial Generate as round one.  The CLI option is
+        # deliberately expressed as a Repair allowance for production users.
+        edit_max_rounds=1 + int(getattr(args, "debug_max_rounds", 10)),
         edit_full_replay_interval=1,
         edit_replay_all_accepted_checks=False,
         edit_originality_required=False,
         edit_collect_visual_failures_before_repair=False,
         edit_webcompass_defect_checks=False,
-        lightweight_edit_production=True,
+        lightweight_edit_production=False,
         edit_ignore_unstable_source_fragments=True,
         edit_frozen_compound_mode=True,
         edit_skills_enabled=True,
@@ -222,8 +284,21 @@ def _provider_config(args: argparse.Namespace) -> HarnessConfig:
         # frozen current + full historical browser replay for acceptance.
         minimality_guard_enabled=False,
         minimal_path_guidance_enabled=True,
-        minimal_path_max_patch_lines=240,
-        minimal_path_max_touched_files=12,
+        reverse_validate_root=(
+            str(getattr(args, "reverse_validate_root").resolve())
+            if getattr(args, "reverse_validate_root", None) else ""
+        ),
+        reverse_validate_node=getattr(args, "reverse_node", "node"),
+        reverse_validate_playwright_module=getattr(args, "reverse_playwright", None) or "",
+        reverse_validate_chromium=getattr(args, "reverse_chromium", None) or "",
+        reverse_validate_extra_node_modules=(
+            getattr(args, "reverse_extra_node_modules", None)
+            or (
+                str(Path(args.reverse_validate_root).expanduser().resolve() / "node_modules")
+                if getattr(args, "reverse_validate_root", None)
+                else ""
+            )
+        ),
         agent_request_timeout_seconds=args.request_timeout,
     )
 
@@ -306,6 +381,24 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
         ] != subtasks:
             raise ValueError("frozen plan subtask list changed")
         planning = {"plan": frozen_plan, "frozen_plan_sha256": plan_hash, "usage": {}}
+    elif args.production_atomic_contract:
+        frozen_plan = plan_from_atomic_contracts(
+            case_id=case_id,
+            source_code_sha256=source_hash,
+            frozen_subtasks=subtasks,
+            source_ui_contract=await _source_ui_contract(source, evaluation, config),
+            source_paths=[
+                path.relative_to(source).as_posix()
+                for path in source.rglob("*")
+                if path.is_file() and not {"node_modules", ".git"} & set(path.parts)
+            ],
+        )
+        plan_hash = write_frozen_compound_plan(frozen_path, frozen_plan)
+        planning = {
+            "plan": frozen_plan,
+            "frozen_plan_sha256": plan_hash,
+            "usage": {},
+        }
     else:
         planning = await plan_frozen_compound_edit(
             config=config,
@@ -337,6 +430,14 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "acceptance": ["current frozen browser flow and every prior flow pass"],
                 "preserve": [
                     "all unrelated source, content, behavior, routes, and accepted capabilities"
+                ],
+                "accepted_state_summary": [
+                    {
+                        "edit_id": prior["id"],
+                        "task_type": prior["task_type"],
+                        "target_routes": prior["target_routes"],
+                    }
+                    for prior in planned[: index - 1]
                 ],
                 "frozen_plan_sha256": planning["frozen_plan_sha256"],
             },
@@ -393,6 +494,10 @@ async def execute(args: argparse.Namespace) -> dict[str, Any]:
         "cost_usd": record.get("cost_usd", 0),
         "steps": record.get("steps") or [],
     }
+    if record.get("error"):
+        result["error"] = record["error"]
+    if record.get("duration_s") is not None:
+        result["duration_s"] = record["duration_s"]
     if record.get("status") == "ok" and len(planned) < len(subtasks):
         result["status"] = "partial"
         result["completed_prefix"] = len(planned)
@@ -436,20 +541,37 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--case", type=Path, required=True)
     result.add_argument("--fast-gt", action="store_true", help="Native preloaded single-call GT path; no Codex CLI")
     result.add_argument("--unattended", action="store_true", help="Fresh fast GT validation without manual checks or resume")
-    result.add_argument("--subtask-timeout", type=int, default=180)
+    result.add_argument("--subtask-timeout", type=int, help=argparse.SUPPRESS)
     result.add_argument("--browser-url", help="Already running isolated frontend for the current flow")
+    result.add_argument("--reverse-validate-root",type=Path,
+                        help="Use reverse/validate check-and-repair pipeline instead of Harness checks")
+    result.add_argument("--reverse-node",default="node")
+    result.add_argument("--reverse-playwright")
+    result.add_argument("--reverse-chromium")
+    result.add_argument("--reverse-extra-node-modules")
     result.add_argument("--browser-check", type=Path, help="Frozen typed browser flow for a single-step smoke")
     result.add_argument("--output", type=Path, required=True)
     result.add_argument("--model", default=None)
-    result.add_argument("--provider-profile", choices=["experimental-luna", "qwen"])
+    result.add_argument("--review-model", default=None)
+    result.add_argument("--provider-profile", choices=["experimental-luna", "njulink-degraded", "openai", "qwen"])
     result.add_argument("--port", type=int, default=18931)
     result.add_argument("--budget-usd", type=float, default=20.0)
     result.add_argument("--request-timeout", type=int, default=600)
-    result.add_argument("--case-timeout", type=float, default=14400)
+    result.add_argument("--case-timeout", type=float, default=2400)
     result.add_argument("--resume", action="store_true")
+    result.add_argument(
+        "--production-atomic-contract",
+        action="store_true",
+        help="Use dataset atomic Edit contracts directly without the LLM compound planner",
+    )
     result.add_argument("--acceptance", choices=["standard", "lenient"], default="standard")
-    result.add_argument("--debug-max-rounds", type=int, choices=range(3, 9), default=3,
-                        help="Bounded local debugging continuation; lightweight production defaults to implementation plus two repairs")
+    result.add_argument(
+        "--debug-max-rounds",
+        type=int,
+        choices=range(1, 11),
+        default=10,
+        help="Maximum Repair rounds after the initial Generate (default: 10)",
+    )
     result.add_argument("--max-steps", type=int, choices=range(1, 13), help="Bound a first sample; incomplete prefixes are not exported as full GT")
     return result
 
@@ -460,8 +582,10 @@ def main() -> int:
     if args.fast_gt:
         if args.browser_check and args.max_steps != 1:
             raise SystemExit("--browser-check currently requires --max-steps 1")
-        if not 1 <= args.subtask_timeout <= 180:
-            raise SystemExit("--subtask-timeout must be between 1 and 180")
+        if args.subtask_timeout is not None:
+            raise SystemExit("--subtask-timeout was removed; use --case-timeout 2400")
+        if not 1 <= args.case_timeout <= 2400:
+            raise SystemExit("--case-timeout must be between 1 and 2400")
         from src.orchestration.fast_edit_gt import execute as execute_fast
         result = asyncio.run(execute_fast(args))
         print(json.dumps({k:v for k,v in result.items() if k not in {'response','reference'}}, ensure_ascii=False))
